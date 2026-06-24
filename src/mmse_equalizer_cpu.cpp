@@ -13,29 +13,26 @@ namespace mmse::detail {
 
 namespace {
 
-constexpr std::size_t h_index(std::uint32_t tx,
-                              std::uint32_t rx,
-                              std::uint32_t symbol,
+constexpr std::size_t h_index(std::uint32_t tx, std::uint32_t rx, std::uint32_t symbol,
                               std::uint32_t sc) {
-    return (((static_cast<std::size_t>(tx) * kLteNumRxAntV1 + rx) * kLteNumSymbolsNormalCp + symbol) *
+    return (((static_cast<std::size_t>(tx) * kLteNumRxAntV1 + rx) * kLteNumSymbolsNormalCp +
+             symbol) *
             kLteNumSubcarriers20MHz) +
            sc;
 }
 
-constexpr std::size_t crs_table_index(std::uint16_t cell_id,
-                                      std::uint8_t subframe,
-                                      std::uint8_t port,
-                                      std::uint8_t crs_symbol_index,
+constexpr std::size_t crs_table_index(std::uint16_t cell_id, std::uint8_t subframe,
+                                      std::uint8_t port, std::uint8_t crs_symbol_index,
                                       std::uint32_t pilot_index) {
     return ((((static_cast<std::size_t>(cell_id) * 10U + subframe) * kLteNumTxPortsV1 + port) *
-              kLteNumCrsSymbols +
-              crs_symbol_index) *
-             kLteNumPilotTonesPerCrsSymbol) +
-            pilot_index;
+                 kLteNumCrsSymbols +
+             crs_symbol_index) *
+            kLteNumPilotTonesPerCrsSymbol) +
+           pilot_index;
 }
 
 std::array<Complex32, kLteNumCellIds * 10U * kLteNumTxPortsV1 * kLteNumCrsSymbols *
-                         kLteNumPilotTonesPerCrsSymbol>
+                          kLteNumPilotTonesPerCrsSymbol>
     g_crs_table{};
 std::once_flag g_crs_table_once;
 
@@ -49,14 +46,13 @@ inline bool bitmap_has_prb(const ExtractDescriptor& desc, std::uint32_t prb) {
     return (desc.prb_bitmap[word] & (static_cast<std::uint16_t>(1U) << bit)) != 0U;
 }
 
-inline Complex32 grid_at(const PlanarGridViewF32& grid, std::uint32_t rx, std::uint32_t symbol, std::uint32_t sc) {
+inline Complex32 grid_at(const PlanarGridViewF32& grid, std::uint32_t rx, std::uint32_t symbol,
+                         std::uint32_t sc) {
     const std::size_t idx = static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz + sc;
     return {grid.re[rx][idx], grid.im[rx][idx]};
 }
 
-inline void store_out(EqualizerOutputView& out,
-                      std::uint32_t layer,
-                      std::uint32_t re_index,
+inline void store_out(EqualizerOutputView& out, std::uint32_t layer, std::uint32_t re_index,
                       const EqualizedSymbol& value) {
     const std::size_t base = static_cast<std::size_t>(layer) * out.capacity_re_per_layer + re_index;
     out.x_hat_re[base] = value.xhat.re;
@@ -64,20 +60,17 @@ inline void store_out(EqualizerOutputView& out,
     out.sinr[base] = value.gamma;
 }
 
-Complex32 lerp_symbol(std::uint32_t target_symbol,
-                      std::uint32_t left_symbol,
-                      Complex32 left,
-                      std::uint32_t right_symbol,
-                      Complex32 right) {
+Complex32 lerp_symbol(std::uint32_t target_symbol, std::uint32_t left_symbol, Complex32 left,
+                      std::uint32_t right_symbol, Complex32 right) {
     if (left_symbol == right_symbol) {
         return left;
     }
-    const float t =
-        static_cast<float>(target_symbol - left_symbol) / static_cast<float>(right_symbol - left_symbol);
+    const float t = static_cast<float>(target_symbol - left_symbol) /
+                    static_cast<float>(right_symbol - left_symbol);
     return linear_interp(left, right, t);
 }
 
-}  // namespace
+} // namespace
 
 Complex32 cadd(Complex32 a, Complex32 b) {
     return {a.re + b.re, a.im + b.im};
@@ -123,7 +116,8 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
     if (desc.start_symbol >= kLteNumSymbolsNormalCp) {
         return false;
     }
-    if (desc.mod_order != 2U && desc.mod_order != 4U && desc.mod_order != 6U && desc.mod_order != 8U) {
+    if (desc.mod_order != 2U && desc.mod_order != 4U && desc.mod_order != 6U &&
+        desc.mod_order != 8U) {
         return false;
     }
     if (desc.n_prb == 0U || desc.n_prb > kLteNumPrb20MHz) {
@@ -177,9 +171,7 @@ std::uint32_t crs_frequency_offset(std::uint16_t cell_id, std::uint8_t port, std
     return (v + v_shift) % 6U;
 }
 
-std::uint32_t crs_subcarrier(std::uint16_t cell_id,
-                             std::uint8_t port,
-                             std::uint8_t symbol,
+std::uint32_t crs_subcarrier(std::uint16_t cell_id, std::uint8_t port, std::uint8_t symbol,
                              std::uint32_t pilot_index) {
     return 6U * pilot_index + crs_frequency_offset(cell_id, port, symbol);
 }
@@ -193,7 +185,8 @@ bool is_crs_re(std::uint16_t cell_id, std::uint8_t symbol, std::uint32_t sc) {
 }
 
 const Complex32& crs_value(const CrsTableKey& key, std::uint32_t pilot_index) {
-    return g_crs_table[crs_table_index(key.cell_id, key.subframe, key.port, key.crs_symbol_index, pilot_index)];
+    return g_crs_table[crs_table_index(key.cell_id, key.subframe, key.port, key.crs_symbol_index,
+                                       pilot_index)];
 }
 
 void ensure_crs_tables() {
@@ -201,11 +194,13 @@ void ensure_crs_tables() {
         for (std::uint16_t cell_id = 0; cell_id < kLteNumCellIds; ++cell_id) {
             for (std::uint8_t subframe = 0; subframe < 10U; ++subframe) {
                 for (std::uint8_t port = 0; port < kLteNumTxPortsV1; ++port) {
-                    for (std::uint8_t symbol_idx = 0; symbol_idx < kLteNumCrsSymbols; ++symbol_idx) {
+                    for (std::uint8_t symbol_idx = 0; symbol_idx < kLteNumCrsSymbols;
+                         ++symbol_idx) {
                         const std::uint8_t symbol = kCrsSymbols[symbol_idx];
-                        const std::uint32_t c_init =
-                            (1U << 10U) * (7U * (subframe + 1U) + symbol + 1U) * (2U * cell_id + 1U) +
-                            2U * cell_id + 1U;
+                        const std::uint32_t c_init = (1U << 10U) *
+                                                         (7U * (subframe + 1U) + symbol + 1U) *
+                                                         (2U * cell_id + 1U) +
+                                                     2U * cell_id + 1U;
                         std::uint32_t x1 = 0x1U;
                         std::uint32_t x2 = c_init;
                         for (int n = 0; n < 1600; ++n) {
@@ -215,7 +210,8 @@ void ensure_crs_tables() {
                             x1 = (x1 >> 1U) | (x1_new << 30U);
                             x2 = (x2 >> 1U) | (x2_new << 30U);
                         }
-                        for (std::uint32_t pilot = 0; pilot < kLteNumPilotTonesPerCrsSymbol; ++pilot) {
+                        for (std::uint32_t pilot = 0; pilot < kLteNumPilotTonesPerCrsSymbol;
+                             ++pilot) {
                             const std::uint32_t b0 = (x1 ^ x2) & 1U;
                             const std::uint32_t x1_new0 = ((x1 >> 3U) ^ x1) & 1U;
                             const std::uint32_t x2_new0 =
@@ -230,7 +226,8 @@ void ensure_crs_tables() {
                             x2 = (x2 >> 1U) | (x2_new1 << 30U);
 
                             const float scale = 0.7071067811865475F;
-                            g_crs_table[crs_table_index(cell_id, subframe, port, symbol_idx, pilot)] = {
+                            g_crs_table[crs_table_index(cell_id, subframe, port, symbol_idx,
+                                                        pilot)] = {
                                 scale * (b0 == 0U ? 1.0F : -1.0F),
                                 scale * (b1 == 0U ? 1.0F : -1.0F),
                             };
@@ -272,10 +269,8 @@ std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layo
     return layout.n_re;
 }
 
-void estimate_channel(const PlanarGridViewF32& grid,
-                      const ExtractDescriptor& desc,
-                      HGridStorage& h_full,
-                      float& sigma2_estimate) {
+void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
+                      HGridStorage& h_full, float& sigma2_estimate) {
     ensure_crs_tables();
     sigma2_estimate = 0.0F;
     std::uint32_t residual_count = 0U;
@@ -283,7 +278,8 @@ void estimate_channel(const PlanarGridViewF32& grid,
 
     for (std::uint32_t tx = 0; tx < kLteNumTxPortsV1; ++tx) {
         for (std::uint32_t rx = 0; rx < kLteNumRxAntV1; ++rx) {
-            std::array<std::array<Complex32, kLteNumPilotTonesPerCrsSymbol>, kLteNumCrsSymbols> ls{};
+            std::array<std::array<Complex32, kLteNumPilotTonesPerCrsSymbol>, kLteNumCrsSymbols>
+                ls{};
             std::array<std::array<Complex32, kLteNumSubcarriers20MHz>, kLteNumCrsSymbols> freq{};
 
             for (std::uint32_t cs = 0; cs < kLteNumCrsSymbols; ++cs) {
@@ -296,22 +292,30 @@ void estimate_channel(const PlanarGridViewF32& grid,
                 };
 
                 for (std::uint32_t pilot = 0; pilot < kLteNumPilotTonesPerCrsSymbol; ++pilot) {
-                    const std::uint32_t sc = crs_subcarrier(desc.cell_id, static_cast<std::uint8_t>(tx), symbol, pilot);
-                    ls[cs][pilot] = cmul(grid_at(grid, rx, symbol, sc), cconj(crs_value(key, pilot)));
+                    const std::uint32_t sc =
+                        crs_subcarrier(desc.cell_id, static_cast<std::uint8_t>(tx), symbol, pilot);
+                    ls[cs][pilot] =
+                        cmul(grid_at(grid, rx, symbol, sc), cconj(crs_value(key, pilot)));
                 }
 
-                for (std::uint32_t pilot = 1U; pilot + 1U < kLteNumPilotTonesPerCrsSymbol; ++pilot) {
-                    const Complex32 smooth = cscale(cadd(ls[cs][pilot - 1U], ls[cs][pilot + 1U]), 0.5F);
+                for (std::uint32_t pilot = 1U; pilot + 1U < kLteNumPilotTonesPerCrsSymbol;
+                     ++pilot) {
+                    const Complex32 smooth =
+                        cscale(cadd(ls[cs][pilot - 1U], ls[cs][pilot + 1U]), 0.5F);
                     sigma2_estimate += cnorm2(csub(ls[cs][pilot], smooth));
                     ++residual_count;
                 }
 
                 for (std::uint32_t sc = 0; sc < kLteNumSubcarriers20MHz; ++sc) {
-                    const std::uint32_t offset = crs_frequency_offset(desc.cell_id, static_cast<std::uint8_t>(tx), symbol);
+                    const std::uint32_t offset =
+                        crs_frequency_offset(desc.cell_id, static_cast<std::uint8_t>(tx), symbol);
                     const std::uint32_t lower_pilot = (sc < offset) ? 0U : (sc - offset) / 6U;
-                    const std::uint32_t upper_pilot = std::min(lower_pilot + 1U, kLteNumPilotTonesPerCrsSymbol - 1U);
-                    const std::uint32_t left_sc = crs_subcarrier(desc.cell_id, static_cast<std::uint8_t>(tx), symbol, lower_pilot);
-                    const std::uint32_t right_sc = crs_subcarrier(desc.cell_id, static_cast<std::uint8_t>(tx), symbol, upper_pilot);
+                    const std::uint32_t upper_pilot =
+                        std::min(lower_pilot + 1U, kLteNumPilotTonesPerCrsSymbol - 1U);
+                    const std::uint32_t left_sc = crs_subcarrier(
+                        desc.cell_id, static_cast<std::uint8_t>(tx), symbol, lower_pilot);
+                    const std::uint32_t right_sc = crs_subcarrier(
+                        desc.cell_id, static_cast<std::uint8_t>(tx), symbol, upper_pilot);
                     if (left_sc == right_sc) {
                         freq[cs][sc] = ls[cs][lower_pilot];
                     } else if (sc <= left_sc) {
@@ -319,7 +323,8 @@ void estimate_channel(const PlanarGridViewF32& grid,
                     } else if (sc >= right_sc) {
                         freq[cs][sc] = ls[cs][upper_pilot];
                     } else {
-                        const float t = static_cast<float>(sc - left_sc) / static_cast<float>(right_sc - left_sc);
+                        const float t = static_cast<float>(sc - left_sc) /
+                                        static_cast<float>(right_sc - left_sc);
                         freq[cs][sc] = linear_interp(ls[cs][lower_pilot], ls[cs][upper_pilot], t);
                     }
                 }
@@ -336,8 +341,9 @@ void estimate_channel(const PlanarGridViewF32& grid,
                     lower = upper;
                 }
                 for (std::uint32_t sc = 0; sc < kLteNumSubcarriers20MHz; ++sc) {
-                    h_full[h_index(tx, rx, symbol, sc)] = lerp_symbol(
-                        symbol, kCrsSymbols[lower], freq[lower][sc], kCrsSymbols[upper], freq[upper][sc]);
+                    h_full[h_index(tx, rx, symbol, sc)] =
+                        lerp_symbol(symbol, kCrsSymbols[lower], freq[lower][sc], kCrsSymbols[upper],
+                                    freq[upper][sc]);
                 }
             }
         }
@@ -350,22 +356,22 @@ void estimate_channel(const PlanarGridViewF32& grid,
     }
 }
 
-float update_sigma2_state(Sigma2State& state, float sigma2_estimate, const MmseEqualizerCpuConfig& config) {
+float update_sigma2_state(Sigma2State& state, float sigma2_estimate,
+                          const MmseEqualizerCpuConfig& config) {
     sigma2_estimate = std::max(sigma2_estimate, config.sigma2_min);
     if (!state.initialized) {
         state.value = sigma2_estimate;
         state.initialized = true;
         return state.value;
     }
-    state.value = config.sigma2_iir_alpha * state.value + (1.0F - config.sigma2_iir_alpha) * sigma2_estimate;
+    state.value =
+        config.sigma2_iir_alpha * state.value + (1.0F - config.sigma2_iir_alpha) * sigma2_estimate;
     state.value = std::max(state.value, config.sigma2_min);
     return state.value;
 }
 
-void pack_equalizer_inputs(const PlanarGridViewF32& grid,
-                           const HGridStorage& h_full,
-                           const ReLayout& layout,
-                           PackedEqualizerInputs& packed) {
+void pack_equalizer_inputs(const PlanarGridViewF32& grid, const HGridStorage& h_full,
+                           const ReLayout& layout, PackedEqualizerInputs& packed) {
     for (std::uint32_t re = 0; re < layout.n_re; ++re) {
         const std::uint32_t grid_idx = layout.grid_indices[re];
         const std::uint32_t symbol = grid_idx / kLteNumSubcarriers20MHz;
@@ -393,13 +399,8 @@ void pack_equalizer_inputs(const PlanarGridViewF32& grid,
     }
 }
 
-EqualizedSymbol equalize_1x2_scalar(Complex32 h0,
-                                    Complex32 h1,
-                                    Complex32 y0,
-                                    Complex32 y1,
-                                    float sigma2,
-                                    float g_min,
-                                    float gamma_max) {
+EqualizedSymbol equalize_1x2_scalar(Complex32 h0, Complex32 h1, Complex32 y0, Complex32 y1,
+                                    float sigma2, float g_min, float gamma_max) {
     const float denom = cnorm2(h0) + cnorm2(h1) + sigma2;
     const Complex32 weight0 = cscale(cconj(h0), 1.0F / denom);
     const Complex32 weight1 = cscale(cconj(h1), 1.0F / denom);
@@ -411,17 +412,9 @@ EqualizedSymbol equalize_1x2_scalar(Complex32 h0,
     };
 }
 
-EqualizedSymbol equalize_2x2_scalar(Complex32 h00,
-                                    Complex32 h01,
-                                    Complex32 h10,
-                                    Complex32 h11,
-                                    Complex32 y0,
-                                    Complex32 y1,
-                                    float sigma2,
-                                    float det_floor,
-                                    float g_min,
-                                    float gamma_max,
-                                    std::uint8_t layer_index) {
+EqualizedSymbol equalize_2x2_scalar(Complex32 h00, Complex32 h01, Complex32 h10, Complex32 h11,
+                                    Complex32 y0, Complex32 y1, float sigma2, float det_floor,
+                                    float g_min, float gamma_max, std::uint8_t layer_index) {
     const float a11 = cnorm2(h00) + cnorm2(h10) + sigma2;
     const float a22 = cnorm2(h01) + cnorm2(h11) + sigma2;
     const Complex32 a12 = cadd(cmul(cconj(h00), h01), cmul(cconj(h10), h11));
@@ -478,7 +471,7 @@ bool cpu_supports_avx2() {
 #endif
 }
 
-}  // namespace mmse::detail
+} // namespace mmse::detail
 
 namespace mmse {
 
@@ -520,13 +513,32 @@ MmseEqualizerCpuContext::~MmseEqualizerCpuContext() {
 MmseStatus MmseEqualizerCpuContext::init(const MmseEqualizerCpuConfig& config) {
     if (config.worker_count == 0U || config.worker_count > detail::kMaxThreadWorkers ||
         config.g_min <= 0.0F || config.g_min >= 0.5F || config.gamma_max <= 0.0F ||
-        config.det_floor <= 0.0F || config.sigma2_min <= 0.0F ||
-        config.sigma2_iir_alpha < 0.0F || config.sigma2_iir_alpha > 1.0F) {
+        config.det_floor <= 0.0F || config.sigma2_min <= 0.0F || config.sigma2_iir_alpha < 0.0F ||
+        config.sigma2_iir_alpha > 1.0F) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    const bool avx2_supported = detail::cpu_supports_avx2();
+    bool use_avx2 = false;
+    switch (config.backend) {
+    case MmseCpuBackend::kAuto:
+        use_avx2 = avx2_supported;
+        break;
+    case MmseCpuBackend::kScalar:
+        use_avx2 = false;
+        break;
+    case MmseCpuBackend::kAvx2:
+        if (!avx2_supported) {
+            return MmseStatus::kUnsupportedConfig;
+        }
+        use_avx2 = true;
+        break;
+    default:
         return MmseStatus::kInvalidArgument;
     }
 
     impl_->config = config;
-    impl_->use_avx2 = detail::cpu_supports_avx2();
+    impl_->use_avx2 = use_avx2;
     impl_->pool.init(config.worker_count);
     impl_->ranges.resize(config.worker_count);
     impl_->initialized = true;
@@ -543,25 +555,18 @@ std::uint32_t chunk_count(std::uint32_t workers, std::uint32_t total) {
     return std::min(workers, std::max(1U, total));
 }
 
-}  // namespace
+} // namespace
 
-void MmseEqualizerCpuContext::Impl::worker_task(void* raw_ctx, std::uint32_t begin, std::uint32_t end) {
+void MmseEqualizerCpuContext::Impl::worker_task(void* raw_ctx, std::uint32_t begin,
+                                                std::uint32_t end) {
     auto* ctx = static_cast<RunTaskContext*>(raw_ctx);
     auto& impl = *ctx->impl;
     auto& out = *ctx->out;
 
     if (ctx->desc.n_layers == 2U && impl.use_avx2) {
-        detail::equalize_2x2_avx2(impl.packed,
-                                  begin,
-                                  end,
-                                  ctx->sigma2,
-                                  impl.config.det_floor,
-                                  impl.config.g_min,
-                                  impl.config.gamma_max,
-                                  out.x_hat_re,
-                                  out.x_hat_im,
-                                  out.sinr,
-                                  out.x_hat_re + out.capacity_re_per_layer,
+        detail::equalize_2x2_avx2(impl.packed, begin, end, ctx->sigma2, impl.config.det_floor,
+                                  impl.config.g_min, impl.config.gamma_max, out.x_hat_re,
+                                  out.x_hat_im, out.sinr, out.x_hat_re + out.capacity_re_per_layer,
                                   out.x_hat_im + out.capacity_re_per_layer,
                                   out.sinr + out.capacity_re_per_layer);
         return;
@@ -582,36 +587,19 @@ void MmseEqualizerCpuContext::Impl::worker_task(void* raw_ctx, std::uint32_t beg
             continue;
         }
 
-        const EqualizedSymbol eq0 = detail::equalize_2x2_scalar(h00,
-                                                                 h01,
-                                                                 h10,
-                                                                 h11,
-                                                                 y0,
-                                                                 y1,
-                                                                 ctx->sigma2,
-                                                                 impl.config.det_floor,
-                                                                 impl.config.g_min,
-                                                                 impl.config.gamma_max,
-                                                                 0U);
-        const EqualizedSymbol eq1 = detail::equalize_2x2_scalar(h00,
-                                                                 h01,
-                                                                 h10,
-                                                                 h11,
-                                                                 y0,
-                                                                 y1,
-                                                                 ctx->sigma2,
-                                                                 impl.config.det_floor,
-                                                                 impl.config.g_min,
-                                                                 impl.config.gamma_max,
-                                                                 1U);
+        const EqualizedSymbol eq0 = detail::equalize_2x2_scalar(
+            h00, h01, h10, h11, y0, y1, ctx->sigma2, impl.config.det_floor, impl.config.g_min,
+            impl.config.gamma_max, 0U);
+        const EqualizedSymbol eq1 = detail::equalize_2x2_scalar(
+            h00, h01, h10, h11, y0, y1, ctx->sigma2, impl.config.det_floor, impl.config.g_min,
+            impl.config.gamma_max, 1U);
         detail::store_out(out, 0U, i, eq0);
         detail::store_out(out, 1U, i, eq1);
     }
 }
 
 MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
-                                        const ExtractDescriptor& desc,
-                                        EqualizerOutputView& out) {
+                                        const ExtractDescriptor& desc, EqualizerOutputView& out) {
     if (!impl_->initialized) {
         return MmseStatus::kNotInitialized;
     }
@@ -632,8 +620,8 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
 
     float sigma2_estimate = 0.0F;
     detail::estimate_channel(grid, desc, impl_->h_full, sigma2_estimate);
-    const float sigma2 =
-        detail::update_sigma2_state(impl_->sigma2_by_cell[desc.cell_id], sigma2_estimate, impl_->config);
+    const float sigma2 = detail::update_sigma2_state(impl_->sigma2_by_cell[desc.cell_id],
+                                                     sigma2_estimate, impl_->config);
     detail::pack_equalizer_inputs(grid, impl_->h_full, impl_->layout, impl_->packed);
 
     out.n_re_per_layer = n_re;
@@ -660,28 +648,27 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
 
     impl_->pool.parallel_for(
         std::span<const std::pair<std::uint32_t, std::uint32_t>>(impl_->ranges.data(), workers),
-        Impl::worker_task,
-        &worker_ctx);
+        Impl::worker_task, &worker_ctx);
     return MmseStatus::kOk;
 }
 
 const char* to_string(MmseStatus status) {
     switch (status) {
-        case MmseStatus::kOk:
-            return "ok";
-        case MmseStatus::kNotInitialized:
-            return "not_initialized";
-        case MmseStatus::kInvalidArgument:
-            return "invalid_argument";
-        case MmseStatus::kUnsupportedConfig:
-            return "unsupported_config";
-        case MmseStatus::kBufferTooSmall:
-            return "buffer_too_small";
-        case MmseStatus::kInternalError:
-            return "internal_error";
-        default:
-            return "unknown";
+    case MmseStatus::kOk:
+        return "ok";
+    case MmseStatus::kNotInitialized:
+        return "not_initialized";
+    case MmseStatus::kInvalidArgument:
+        return "invalid_argument";
+    case MmseStatus::kUnsupportedConfig:
+        return "unsupported_config";
+    case MmseStatus::kBufferTooSmall:
+        return "buffer_too_small";
+    case MmseStatus::kInternalError:
+        return "internal_error";
+    default:
+        return "unknown";
     }
 }
 
-}  // namespace mmse
+} // namespace mmse

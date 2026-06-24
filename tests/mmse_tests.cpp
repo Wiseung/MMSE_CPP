@@ -12,11 +12,13 @@
 
 using mmse::EqualizerOutputView;
 using mmse::ExtractDescriptor;
+using mmse::MmseCpuBackend;
 using mmse::MmseEqualizerCpuConfig;
 using mmse::MmseEqualizerCpuContext;
 using mmse::MmseStatus;
 using mmse::PlanarGridViewF32;
 using namespace mmse;
+using mmse::detail::Complex32;
 
 namespace {
 
@@ -36,9 +38,27 @@ void expect_near(float lhs, float rhs, float eps, const std::string& message) {
     }
 }
 
+void expect_relative_near(float lhs, float rhs, float rel_tol, float abs_tol,
+                          const std::string& message) {
+    const float abs_err = std::fabs(lhs - rhs);
+    const float scale = std::max(std::fabs(rhs), 1.0F);
+    if (abs_err > std::max(abs_tol, rel_tol * scale)) {
+        throw TestFailure{message + " lhs=" + std::to_string(lhs) + " rhs=" + std::to_string(rhs)};
+    }
+}
+
 struct GridBuffers {
     std::array<std::vector<float>, 2> re;
     std::array<std::vector<float>, 2> im;
+};
+
+struct TwoLayerCase {
+    Complex32 h00;
+    Complex32 h01;
+    Complex32 h10;
+    Complex32 h11;
+    Complex32 x0;
+    Complex32 x1;
 };
 
 GridBuffers make_zero_grid() {
@@ -77,7 +97,19 @@ ExtractDescriptor make_fullband_desc() {
     return desc;
 }
 
-void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor& desc, float data0, float data1) {
+TwoLayerCase make_two_layer_case() {
+    return {
+        .h00 = {0.90F, 0.10F},
+        .h01 = {0.25F, -0.30F},
+        .h10 = {0.10F, 0.35F},
+        .h11 = {1.05F, -0.20F},
+        .x0 = {0.75F, -0.25F},
+        .x1 = {-0.35F, 0.60F},
+    };
+}
+
+void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor& desc, float data0,
+                           float data1) {
     mmse::detail::ensure_crs_tables();
     const std::uint32_t subframe = mmse::detail::subframe_from_descriptor(desc);
     for (std::uint32_t symbol = 0; symbol < kLteNumSymbolsNormalCp; ++symbol) {
@@ -86,32 +118,40 @@ void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor& desc, 
             const bool is_data_symbol = symbol >= desc.start_symbol;
             const bool is_port0_crs =
                 mmse::detail::is_crs_re(desc.cell_id, static_cast<std::uint8_t>(symbol), sc) &&
-                sc % 6U == mmse::detail::crs_frequency_offset(desc.cell_id, 0U, static_cast<std::uint8_t>(symbol));
+                sc % 6U == mmse::detail::crs_frequency_offset(desc.cell_id, 0U,
+                                                              static_cast<std::uint8_t>(symbol));
             const bool is_port1_crs =
                 mmse::detail::is_crs_re(desc.cell_id, static_cast<std::uint8_t>(symbol), sc) &&
-                sc % 6U == mmse::detail::crs_frequency_offset(desc.cell_id, 1U, static_cast<std::uint8_t>(symbol));
+                sc % 6U == mmse::detail::crs_frequency_offset(desc.cell_id, 1U,
+                                                              static_cast<std::uint8_t>(symbol));
             if (is_port0_crs) {
                 const std::uint32_t pilot =
-                    (sc - mmse::detail::crs_frequency_offset(desc.cell_id, 0U, static_cast<std::uint8_t>(symbol))) / 6U;
+                    (sc - mmse::detail::crs_frequency_offset(desc.cell_id, 0U,
+                                                             static_cast<std::uint8_t>(symbol))) /
+                    6U;
                 const auto& crs = mmse::detail::crs_value(
                     {.cell_id = desc.cell_id,
                      .subframe = static_cast<std::uint8_t>(subframe),
                      .port = 0U,
                      .crs_symbol_index = static_cast<std::uint8_t>(
-                         std::find(mmse::detail::kCrsSymbols.begin(), mmse::detail::kCrsSymbols.end(), symbol) -
+                         std::find(mmse::detail::kCrsSymbols.begin(),
+                                   mmse::detail::kCrsSymbols.end(), symbol) -
                          mmse::detail::kCrsSymbols.begin())},
                     pilot);
                 buffers.re[0][idx] = crs.re;
                 buffers.im[0][idx] = crs.im;
             } else if (is_port1_crs) {
                 const std::uint32_t pilot =
-                    (sc - mmse::detail::crs_frequency_offset(desc.cell_id, 1U, static_cast<std::uint8_t>(symbol))) / 6U;
+                    (sc - mmse::detail::crs_frequency_offset(desc.cell_id, 1U,
+                                                             static_cast<std::uint8_t>(symbol))) /
+                    6U;
                 const auto& crs = mmse::detail::crs_value(
                     {.cell_id = desc.cell_id,
                      .subframe = static_cast<std::uint8_t>(subframe),
                      .port = 1U,
                      .crs_symbol_index = static_cast<std::uint8_t>(
-                         std::find(mmse::detail::kCrsSymbols.begin(), mmse::detail::kCrsSymbols.end(), symbol) -
+                         std::find(mmse::detail::kCrsSymbols.begin(),
+                                   mmse::detail::kCrsSymbols.end(), symbol) -
                          mmse::detail::kCrsSymbols.begin())},
                     pilot);
                 buffers.re[1][idx] = crs.re;
@@ -122,6 +162,74 @@ void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor& desc, 
                 buffers.re[1][idx] = data1;
                 buffers.im[1][idx] = 0.0F;
             }
+        }
+    }
+}
+
+void fill_constant_mimo_channel(GridBuffers& buffers, const ExtractDescriptor& desc, Complex32 h00,
+                                Complex32 h01, Complex32 h10, Complex32 h11, Complex32 x0,
+                                Complex32 x1) {
+    mmse::detail::ensure_crs_tables();
+    const std::uint32_t subframe = mmse::detail::subframe_from_descriptor(desc);
+
+    for (std::uint32_t symbol = 0; symbol < kLteNumSymbolsNormalCp; ++symbol) {
+        for (std::uint32_t sc = 0; sc < kLteNumSubcarriers20MHz; ++sc) {
+            const std::size_t idx = static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz + sc;
+            const bool is_data_symbol = symbol >= desc.start_symbol;
+            const bool is_port0_crs =
+                mmse::detail::is_crs_re(desc.cell_id, static_cast<std::uint8_t>(symbol), sc) &&
+                sc % 6U == mmse::detail::crs_frequency_offset(desc.cell_id, 0U,
+                                                              static_cast<std::uint8_t>(symbol));
+            const bool is_port1_crs =
+                mmse::detail::is_crs_re(desc.cell_id, static_cast<std::uint8_t>(symbol), sc) &&
+                sc % 6U == mmse::detail::crs_frequency_offset(desc.cell_id, 1U,
+                                                              static_cast<std::uint8_t>(symbol));
+
+            Complex32 y_rx0{};
+            Complex32 y_rx1{};
+            if (is_port0_crs) {
+                const std::uint32_t pilot =
+                    (sc - mmse::detail::crs_frequency_offset(desc.cell_id, 0U,
+                                                             static_cast<std::uint8_t>(symbol))) /
+                    6U;
+                const auto& crs = mmse::detail::crs_value(
+                    {.cell_id = desc.cell_id,
+                     .subframe = static_cast<std::uint8_t>(subframe),
+                     .port = 0U,
+                     .crs_symbol_index = static_cast<std::uint8_t>(
+                         std::find(mmse::detail::kCrsSymbols.begin(),
+                                   mmse::detail::kCrsSymbols.end(), symbol) -
+                         mmse::detail::kCrsSymbols.begin())},
+                    pilot);
+                y_rx0 = mmse::detail::cmul(h00, crs);
+                y_rx1 = mmse::detail::cmul(h10, crs);
+            } else if (is_port1_crs) {
+                const std::uint32_t pilot =
+                    (sc - mmse::detail::crs_frequency_offset(desc.cell_id, 1U,
+                                                             static_cast<std::uint8_t>(symbol))) /
+                    6U;
+                const auto& crs = mmse::detail::crs_value(
+                    {.cell_id = desc.cell_id,
+                     .subframe = static_cast<std::uint8_t>(subframe),
+                     .port = 1U,
+                     .crs_symbol_index = static_cast<std::uint8_t>(
+                         std::find(mmse::detail::kCrsSymbols.begin(),
+                                   mmse::detail::kCrsSymbols.end(), symbol) -
+                         mmse::detail::kCrsSymbols.begin())},
+                    pilot);
+                y_rx0 = mmse::detail::cmul(h01, crs);
+                y_rx1 = mmse::detail::cmul(h11, crs);
+            } else if (is_data_symbol) {
+                y_rx0 =
+                    mmse::detail::cadd(mmse::detail::cmul(h00, x0), mmse::detail::cmul(h01, x1));
+                y_rx1 =
+                    mmse::detail::cadd(mmse::detail::cmul(h10, x0), mmse::detail::cmul(h11, x1));
+            }
+
+            buffers.re[0][idx] = y_rx0.re;
+            buffers.im[0][idx] = y_rx0.im;
+            buffers.re[1][idx] = y_rx1.re;
+            buffers.im[1][idx] = y_rx1.im;
         }
     }
 }
@@ -141,7 +249,8 @@ void test_reject_invalid_descriptor() {
     std::vector<float> xim(20000U);
     std::vector<float> sinr(20000U);
     EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), 10000U};
-    expect_true(ctx.run(grid, desc, out) == MmseStatus::kUnsupportedConfig, "unsupported descriptor should fail");
+    expect_true(ctx.run(grid, desc, out) == MmseStatus::kUnsupportedConfig,
+                "unsupported descriptor should fail");
 }
 
 void test_buffer_too_small() {
@@ -189,15 +298,20 @@ void test_single_layer_identity_channel_equalization() {
     }
 }
 
-void test_two_layer_outputs_are_finite() {
+void test_two_layer_constant_channel_matches_golden() {
     MmseEqualizerCpuContext ctx;
     MmseEqualizerCpuConfig config{};
     config.worker_count = 1;
+    config.sigma2_min = 1.0e-3F;
+    config.det_floor = 1.0e-6F;
+    config.g_min = 1.0e-4F;
+    config.gamma_max = 1.0e4F;
     expect_true(ctx.init(config) == MmseStatus::kOk, "init must succeed");
 
     auto desc = make_fullband_desc();
     GridBuffers buffers = make_zero_grid();
-    fill_identity_channel(buffers, desc, 1.0F, 2.0F);
+    const TwoLayerCase c = make_two_layer_case();
+    fill_constant_mimo_channel(buffers, desc, c.h00, c.h01, c.h10, c.h11, c.x0, c.x1);
     auto grid = make_grid_view(buffers);
 
     const std::uint32_t cap = 20000U;
@@ -206,10 +320,219 @@ void test_two_layer_outputs_are_finite() {
     std::vector<float> sinr(cap * 2U);
     EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
     expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "two-layer run");
-    expect_true(std::isfinite(out.x_hat_re[0]), "finite layer0");
-    expect_true(std::isfinite(out.x_hat_re[out.capacity_re_per_layer]), "finite layer1");
-    expect_true(std::isfinite(out.sinr[0]), "finite sinr0");
-    expect_true(std::isfinite(out.sinr[out.capacity_re_per_layer]), "finite sinr1");
+    expect_true(out.n_re_per_layer == 14400U, "two-layer RE count");
+
+    const Complex32 y0 =
+        mmse::detail::cadd(mmse::detail::cmul(c.h00, c.x0), mmse::detail::cmul(c.h01, c.x1));
+    const Complex32 y1 =
+        mmse::detail::cadd(mmse::detail::cmul(c.h10, c.x0), mmse::detail::cmul(c.h11, c.x1));
+    mmse::detail::HGridStorage h_full{};
+    float sigma2_estimate = 0.0F;
+    mmse::detail::estimate_channel(grid, desc, h_full, sigma2_estimate);
+    mmse::detail::Sigma2State sigma2_state{};
+    const float sigma2_runtime =
+        mmse::detail::update_sigma2_state(sigma2_state, sigma2_estimate, config);
+
+    const auto golden0 =
+        mmse::detail::equalize_2x2_scalar(c.h00, c.h01, c.h10, c.h11, y0, y1, sigma2_runtime,
+                                          config.det_floor, config.g_min, config.gamma_max, 0U);
+    const auto golden1 =
+        mmse::detail::equalize_2x2_scalar(c.h00, c.h01, c.h10, c.h11, y0, y1, sigma2_runtime,
+                                          config.det_floor, config.g_min, config.gamma_max, 1U);
+
+    float max_x0_re = 0.0F;
+    float max_x0_im = 0.0F;
+    float max_x1_re = 0.0F;
+    float max_x1_im = 0.0F;
+    float max_g0 = 0.0F;
+    float max_g1 = 0.0F;
+    for (std::uint32_t i = 0; i < out.n_re_per_layer; ++i) {
+        max_x0_re = std::max(max_x0_re, std::fabs(out.x_hat_re[i] - golden0.xhat.re));
+        max_x0_im = std::max(max_x0_im, std::fabs(out.x_hat_im[i] - golden0.xhat.im));
+        max_g0 = std::max(max_g0, std::fabs(out.sinr[i] - golden0.gamma));
+
+        const std::size_t layer1 = out.capacity_re_per_layer + i;
+        max_x1_re = std::max(max_x1_re, std::fabs(out.x_hat_re[layer1] - golden1.xhat.re));
+        max_x1_im = std::max(max_x1_im, std::fabs(out.x_hat_im[layer1] - golden1.xhat.im));
+        max_g1 = std::max(max_g1, std::fabs(out.sinr[layer1] - golden1.gamma));
+    }
+
+    expect_true(max_x0_re <= 1.0e-3F, "layer0 real max error");
+    expect_true(max_x0_im <= 1.0e-3F, "layer0 imag max error");
+    expect_true(max_x1_re <= 1.0e-3F, "layer1 real max error");
+    expect_true(max_x1_im <= 1.0e-3F, "layer1 imag max error");
+    if (!(max_g0 <= 6.0e-2F)) {
+        throw TestFailure{"layer0 sinr max error=" + std::to_string(max_g0)};
+    }
+    if (!(max_g1 <= 6.0e-2F)) {
+        throw TestFailure{"layer1 sinr max error=" + std::to_string(max_g1)};
+    }
+}
+
+void test_two_layer_repeated_runs_are_stable() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1;
+    config.sigma2_min = 1.0e-3F;
+    config.det_floor = 1.0e-6F;
+    config.g_min = 1.0e-4F;
+    config.gamma_max = 1.0e4F;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "init must succeed");
+
+    auto desc = make_fullband_desc();
+    GridBuffers buffers = make_zero_grid();
+    const TwoLayerCase c = make_two_layer_case();
+    fill_constant_mimo_channel(buffers, desc, c.h00, c.h01, c.h10, c.h11, c.x0, c.x1);
+    auto grid = make_grid_view(buffers);
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> xre_a(cap * 2U);
+    std::vector<float> xim_a(cap * 2U);
+    std::vector<float> sinr_a(cap * 2U);
+    std::vector<float> xre_b(cap * 2U);
+    std::vector<float> xim_b(cap * 2U);
+    std::vector<float> sinr_b(cap * 2U);
+    EqualizerOutputView out_a{xre_a.data(), xim_a.data(), sinr_a.data(), cap};
+    EqualizerOutputView out_b{xre_b.data(), xim_b.data(), sinr_b.data(), cap};
+
+    expect_true(ctx.run(grid, desc, out_a) == MmseStatus::kOk, "first run");
+    expect_true(ctx.run(grid, desc, out_b) == MmseStatus::kOk, "second run");
+    for (std::uint32_t i = 0; i < out_a.n_re_per_layer * 2U; ++i) {
+        expect_near(xre_a[i], xre_b[i], 1.0e-6F, "stable xhat real");
+        expect_near(xim_a[i], xim_b[i], 1.0e-6F, "stable xhat imag");
+        expect_near(sinr_a[i], sinr_b[i], 1.0e-6F, "stable sinr");
+    }
+}
+
+void test_two_layer_avx2_context_matches_scalar_context() {
+    if (!mmse::detail::cpu_supports_avx2()) {
+        std::cout << "[SKIP] two_layer_avx2_context_matches_scalar_context\n";
+        return;
+    }
+
+    auto desc = make_fullband_desc();
+    GridBuffers buffers = make_zero_grid();
+    const TwoLayerCase c = make_two_layer_case();
+    fill_constant_mimo_channel(buffers, desc, c.h00, c.h01, c.h10, c.h11, c.x0, c.x1);
+    auto grid = make_grid_view(buffers);
+
+    MmseEqualizerCpuConfig scalar_cfg{};
+    scalar_cfg.worker_count = 1;
+    scalar_cfg.sigma2_min = 1.0e-3F;
+    scalar_cfg.det_floor = 1.0e-6F;
+    scalar_cfg.g_min = 1.0e-4F;
+    scalar_cfg.gamma_max = 1.0e4F;
+    scalar_cfg.backend = MmseCpuBackend::kScalar;
+
+    MmseEqualizerCpuConfig avx2_cfg = scalar_cfg;
+    avx2_cfg.backend = MmseCpuBackend::kAvx2;
+
+    MmseEqualizerCpuContext scalar_ctx;
+    MmseEqualizerCpuContext avx2_ctx;
+    expect_true(scalar_ctx.init(scalar_cfg) == MmseStatus::kOk, "scalar ctx init");
+    expect_true(avx2_ctx.init(avx2_cfg) == MmseStatus::kOk, "avx2 ctx init");
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> scalar_re(cap * 2U);
+    std::vector<float> scalar_im(cap * 2U);
+    std::vector<float> scalar_sinr(cap * 2U);
+    std::vector<float> avx2_re(cap * 2U);
+    std::vector<float> avx2_im(cap * 2U);
+    std::vector<float> avx2_sinr(cap * 2U);
+    EqualizerOutputView scalar_out{scalar_re.data(), scalar_im.data(), scalar_sinr.data(), cap};
+    EqualizerOutputView avx2_out{avx2_re.data(), avx2_im.data(), avx2_sinr.data(), cap};
+
+    expect_true(scalar_ctx.run(grid, desc, scalar_out) == MmseStatus::kOk, "scalar ctx run");
+    expect_true(avx2_ctx.run(grid, desc, avx2_out) == MmseStatus::kOk, "avx2 ctx run");
+    expect_true(scalar_out.n_re_per_layer == avx2_out.n_re_per_layer, "matching RE count");
+
+    for (std::uint32_t i = 0; i < scalar_out.n_re_per_layer * 2U; ++i) {
+        expect_near(avx2_re[i], scalar_re[i], 1.0e-5F, "ctx avx2/scalar xhat real");
+        expect_near(avx2_im[i], scalar_im[i], 1.0e-5F, "ctx avx2/scalar xhat imag");
+        expect_near(avx2_sinr[i], scalar_sinr[i], 6.0e-2F, "ctx avx2/scalar sinr");
+    }
+}
+
+void test_two_layer_scalar_golden_matches() {
+    const TwoLayerCase c = make_two_layer_case();
+    const Complex32 y0 =
+        mmse::detail::cadd(mmse::detail::cmul(c.h00, c.x0), mmse::detail::cmul(c.h01, c.x1));
+    const Complex32 y1 =
+        mmse::detail::cadd(mmse::detail::cmul(c.h10, c.x0), mmse::detail::cmul(c.h11, c.x1));
+    const float sigma2 = 1.0e-3F;
+    const float det_floor = 1.0e-6F;
+    const float g_min = 1.0e-4F;
+    const float gamma_max = 1.0e4F;
+
+    const auto eq0 = mmse::detail::equalize_2x2_scalar(c.h00, c.h01, c.h10, c.h11, y0, y1, sigma2,
+                                                       det_floor, g_min, gamma_max, 0U);
+    const auto eq1 = mmse::detail::equalize_2x2_scalar(c.h00, c.h01, c.h10, c.h11, y0, y1, sigma2,
+                                                       det_floor, g_min, gamma_max, 1U);
+
+    expect_near(eq0.xhat.re, c.x0.re, 2.0e-2F, "scalar golden layer0 real");
+    expect_near(eq0.xhat.im, c.x0.im, 2.0e-2F, "scalar golden layer0 imag");
+    expect_near(eq1.xhat.re, c.x1.re, 2.0e-2F, "scalar golden layer1 real");
+    expect_near(eq1.xhat.im, c.x1.im, 2.0e-2F, "scalar golden layer1 imag");
+    expect_true(eq0.gamma > 0.0F, "scalar golden layer0 sinr positive");
+    expect_true(eq1.gamma > 0.0F, "scalar golden layer1 sinr positive");
+}
+
+void test_two_layer_avx2_matches_scalar_kernel() {
+    if (!mmse::detail::cpu_supports_avx2()) {
+        std::cout << "[SKIP] two_layer_avx2_matches_scalar_kernel\n";
+        return;
+    }
+
+    const TwoLayerCase c = make_two_layer_case();
+    const Complex32 y0 =
+        mmse::detail::cadd(mmse::detail::cmul(c.h00, c.x0), mmse::detail::cmul(c.h01, c.x1));
+    const Complex32 y1 =
+        mmse::detail::cadd(mmse::detail::cmul(c.h10, c.x0), mmse::detail::cmul(c.h11, c.x1));
+    constexpr std::uint32_t lanes = 8U;
+    constexpr float sigma2 = 1.0e-3F;
+    constexpr float det_floor = 1.0e-6F;
+    constexpr float g_min = 1.0e-4F;
+    constexpr float gamma_max = 1.0e4F;
+
+    mmse::detail::PackedEqualizerInputs packed{};
+    for (std::uint32_t i = 0; i < lanes; ++i) {
+        packed.h00_re[i] = c.h00.re;
+        packed.h00_im[i] = c.h00.im;
+        packed.h01_re[i] = c.h01.re;
+        packed.h01_im[i] = c.h01.im;
+        packed.h10_re[i] = c.h10.re;
+        packed.h10_im[i] = c.h10.im;
+        packed.h11_re[i] = c.h11.re;
+        packed.h11_im[i] = c.h11.im;
+        packed.y0_re[i] = y0.re;
+        packed.y0_im[i] = y0.im;
+        packed.y1_re[i] = y1.re;
+        packed.y1_im[i] = y1.im;
+    }
+
+    std::array<float, lanes> out_re0{};
+    std::array<float, lanes> out_im0{};
+    std::array<float, lanes> out_sinr0{};
+    std::array<float, lanes> out_re1{};
+    std::array<float, lanes> out_im1{};
+    std::array<float, lanes> out_sinr1{};
+    mmse::detail::equalize_2x2_avx2(packed, 0U, lanes, sigma2, det_floor, g_min, gamma_max,
+                                    out_re0.data(), out_im0.data(), out_sinr0.data(),
+                                    out_re1.data(), out_im1.data(), out_sinr1.data());
+
+    const auto eq0 = mmse::detail::equalize_2x2_scalar(c.h00, c.h01, c.h10, c.h11, y0, y1, sigma2,
+                                                       det_floor, g_min, gamma_max, 0U);
+    const auto eq1 = mmse::detail::equalize_2x2_scalar(c.h00, c.h01, c.h10, c.h11, y0, y1, sigma2,
+                                                       det_floor, g_min, gamma_max, 1U);
+
+    for (std::uint32_t i = 0; i < lanes; ++i) {
+        expect_near(out_re0[i], eq0.xhat.re, 1.0e-5F, "avx2 layer0 real");
+        expect_near(out_im0[i], eq0.xhat.im, 1.0e-5F, "avx2 layer0 imag");
+        expect_near(out_sinr0[i], eq0.gamma, 6.0e-2F, "avx2 layer0 sinr");
+        expect_near(out_re1[i], eq1.xhat.re, 1.0e-5F, "avx2 layer1 real");
+        expect_near(out_im1[i], eq1.xhat.im, 1.0e-5F, "avx2 layer1 imag");
+        expect_near(out_sinr1[i], eq1.gamma, 6.0e-2F, "avx2 layer1 sinr");
+    }
 }
 
 void test_sigma2_state_persists() {
@@ -267,16 +590,24 @@ void test_single_layer_path() {
     expect_near(out.x_hat_re[0], 0.75F, 1.0e-3F, "single-layer xhat");
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     const std::array tests = {
         std::pair{"reject_invalid_descriptor", &test_reject_invalid_descriptor},
         std::pair{"buffer_too_small", &test_buffer_too_small},
-        std::pair{"single_layer_identity_channel_equalization", &test_single_layer_identity_channel_equalization},
+        std::pair{"single_layer_identity_channel_equalization",
+                  &test_single_layer_identity_channel_equalization},
         std::pair{"sigma2_state_persists", &test_sigma2_state_persists},
         std::pair{"single_layer_path", &test_single_layer_path},
-        std::pair{"two_layer_outputs_are_finite", &test_two_layer_outputs_are_finite},
+        std::pair{"two_layer_scalar_golden_matches", &test_two_layer_scalar_golden_matches},
+        std::pair{"two_layer_avx2_matches_scalar_kernel",
+                  &test_two_layer_avx2_matches_scalar_kernel},
+        std::pair{"two_layer_avx2_context_matches_scalar_context",
+                  &test_two_layer_avx2_context_matches_scalar_context},
+        std::pair{"two_layer_constant_channel_matches_golden",
+                  &test_two_layer_constant_channel_matches_golden},
+        std::pair{"two_layer_repeated_runs_are_stable", &test_two_layer_repeated_runs_are_stable},
     };
 
     for (const auto& [name, fn] : tests) {

@@ -15,6 +15,12 @@ enum class MmseStatus : std::uint8_t {
     kInternalError,
 };
 
+enum class MmseCpuBackend : std::uint8_t {
+    kAuto = 0,
+    kScalar,
+    kAvx2,
+};
+
 struct PlanarGridViewF32 {
     std::array<const float*, 2> re{};
     std::array<const float*, 2> im{};
@@ -54,6 +60,7 @@ struct MmseEqualizerCpuConfig {
     float det_floor = 1.0e-6F;
     float g_min = 1.0e-4F;
     float gamma_max = 1.0e4F;
+    MmseCpuBackend backend = MmseCpuBackend::kAuto;
 };
 
-}  // namespace mmse
+} // namespace mmse
