@@ -14,6 +14,11 @@ inline constexpr std::uint32_t kCudaMaxDataRe = kCudaMaxGridRe;
 inline constexpr std::uint32_t kCudaEstimateStubComplexCount =
     kLteNumSymbolsNormalCp * kLteNumTxPortsV1 * kLteNumRxAntV1 * kLteNumSubcarriers20MHz;
 inline constexpr std::uint32_t kCudaEstimateStubFloatCount = 2U * kCudaEstimateStubComplexCount;
+inline constexpr std::uint32_t kCudaValidationSampleCount = 12U;
+inline constexpr std::uint32_t kCudaEqualizeTraceFloatCount = 32U;
+inline constexpr std::uint32_t kCudaScratchHeaderFloatCount = 4U;
+inline constexpr std::uint32_t kCudaScratchFloatCount =
+    kCudaScratchHeaderFloatCount + kCudaValidationSampleCount * kCudaEqualizeTraceFloatCount;
 
 struct CudaDeviceBuffers {
     std::array<void*, 2> grid_re{};
@@ -40,10 +45,13 @@ struct CudaGridMeta {
     std::uint32_t n_layers = 0;
     std::uint32_t n_tx_ports = 0;
     std::uint32_t n_segments = 0;
+    std::uint32_t validation_sample_count = 0;
     float sigma2 = 0.0F;
+    float det_floor = 0.0F;
     float g_min = 0.0F;
     float gamma_max = 0.0F;
     std::uint16_t grid_indices[kCudaMaxDataRe]{};
+    std::uint16_t validation_re_slots[kCudaValidationSampleCount]{};
     std::uint32_t output_slot_by_grid_re[kCudaMaxGridRe]{};
     std::uint32_t prb_segment_offsets[kCudaMaxDataRe + 1]{};
     std::uint16_t prb_bitmap[7]{};
@@ -75,6 +83,9 @@ MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
                                     const std::array<float, 2>& grid_scale,
                                     const CudaGridMeta& grid_meta, std::size_t grid_plane_bytes,
                                     std::uintptr_t stream_handle);
+MmseStatus cuda_copy_grid_meta_h2d_async(const CudaDeviceBuffers& buffers,
+                                         const CudaGridMeta& grid_meta,
+                                         std::uintptr_t stream_handle);
 
 MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers, const float* xhat_re,
                                        const float* xhat_im, const float* sinr,
@@ -83,7 +94,7 @@ MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers, const f
 
 MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
                                      std::uintptr_t stream_handle);
-MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers,
+MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers, std::uint32_t n_valid_re,
                                      std::uint32_t completion_value, std::uintptr_t stream_handle);
 
 MmseStatus cuda_copy_outputs_d2h_async(const CudaDeviceBuffers& buffers, float* xhat_re,

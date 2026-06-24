@@ -64,6 +64,11 @@ MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers&, const std::array<s
     return MmseStatus::kUnsupportedConfig;
 }
 
+MmseStatus cuda_copy_grid_meta_h2d_async(const CudaDeviceBuffers&, const CudaGridMeta&,
+                                         std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
 MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers&, const float*, const float*,
                                        const float*, std::size_t, std::size_t, std::uintptr_t) {
     return MmseStatus::kUnsupportedConfig;
@@ -73,7 +78,8 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers&, std::uintptr_t) {
     return MmseStatus::kUnsupportedConfig;
 }
 
-MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers&, std::uint32_t, std::uintptr_t) {
+MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers&, std::uint32_t, std::uint32_t,
+                                     std::uintptr_t) {
     return MmseStatus::kUnsupportedConfig;
 }
 

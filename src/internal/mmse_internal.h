@@ -28,7 +28,36 @@ struct EqualizedSymbol {
     float gamma = 0.0F;
 };
 
-using HGridStorage = std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>;
+struct Equalize2x2Trace {
+    float a11 = 0.0F;
+    float a22 = 0.0F;
+    Complex32 a12{};
+    float det = 0.0F;
+    float inv_det = 0.0F;
+    float inv11 = 0.0F;
+    float inv22 = 0.0F;
+    Complex32 inv12{};
+    Complex32 inv21{};
+    Complex32 hh00{};
+    Complex32 hh01{};
+    Complex32 hh10{};
+    Complex32 hh11{};
+    Complex32 w00{};
+    Complex32 w01{};
+    Complex32 w10{};
+    Complex32 w11{};
+    Complex32 z0{};
+    Complex32 z1{};
+    float g0 = 0.0F;
+    float g1 = 0.0F;
+    Complex32 xhat0{};
+    Complex32 xhat1{};
+    float gamma0 = 0.0F;
+    float gamma1 = 0.0F;
+};
+
+using HGridStorage =
+    std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>;
 
 struct PackedEqualizerInputs {
     std::array<float, kMaxDataRe> h00_re{};
@@ -59,7 +88,7 @@ struct Sigma2State {
 };
 
 class StaticThreadPool {
-public:
+  public:
     using TaskFn = void (*)(void*, std::uint32_t, std::uint32_t);
 
     StaticThreadPool();
@@ -73,10 +102,9 @@ public:
     std::uint32_t worker_count() const;
 
     void parallel_for(const std::span<const std::pair<std::uint32_t, std::uint32_t>>& ranges,
-                      TaskFn fn,
-                      void* ctx);
+                      TaskFn fn, void* ctx);
 
-private:
+  private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -96,12 +124,13 @@ MmseStatus validate_grid(const PlanarGridViewF32& grid);
 MmseStatus validate_output(const EqualizerOutputView& out);
 std::uint32_t subframe_from_descriptor(const ExtractDescriptor& desc);
 std::uint32_t crs_frequency_offset(std::uint16_t cell_id, std::uint8_t port, std::uint8_t symbol);
-std::uint32_t crs_subcarrier(std::uint16_t cell_id,
-                             std::uint8_t port,
-                             std::uint8_t symbol,
+std::uint32_t crs_subcarrier(std::uint16_t cell_id, std::uint8_t port, std::uint8_t symbol,
                              std::uint32_t pilot_index);
 bool is_crs_re(std::uint16_t cell_id, std::uint8_t symbol, std::uint32_t sc);
 std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layout);
+std::uint32_t build_validation_re_samples(const ReLayout& layout, std::uint32_t start_symbol,
+                                          std::uint32_t n_symbols, std::uint32_t n_subcarriers,
+                                          std::uint32_t* out_re_slots, std::uint32_t max_slots);
 
 Complex32 cadd(Complex32 a, Complex32 b);
 Complex32 csub(Complex32 a, Complex32 b);
@@ -112,53 +141,34 @@ float cnorm2(Complex32 a);
 
 Complex32 linear_interp(Complex32 left, Complex32 right, float t);
 
-void estimate_channel(const PlanarGridViewF32& grid,
-                      const ExtractDescriptor& desc,
-                      std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>& h_full,
-                      float& sigma2_estimate);
+void estimate_channel(
+    const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
+    std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>& h_full,
+    float& sigma2_estimate);
 
-float update_sigma2_state(Sigma2State& state, float sigma2_estimate, const MmseEqualizerCpuConfig& config);
+float update_sigma2_state(Sigma2State& state, float sigma2_estimate,
+                          const MmseEqualizerCpuConfig& config);
 
 void pack_equalizer_inputs(
     const PlanarGridViewF32& grid,
     const std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>& h_full,
-    const ReLayout& layout,
-    PackedEqualizerInputs& packed);
+    const ReLayout& layout, PackedEqualizerInputs& packed);
 
-EqualizedSymbol equalize_2x2_scalar(Complex32 h00,
-                                    Complex32 h01,
-                                    Complex32 h10,
-                                    Complex32 h11,
-                                    Complex32 y0,
-                                    Complex32 y1,
-                                    float sigma2,
-                                    float det_floor,
-                                    float g_min,
-                                    float gamma_max,
-                                    std::uint8_t layer_index);
+EqualizedSymbol equalize_2x2_scalar(Complex32 h00, Complex32 h01, Complex32 h10, Complex32 h11,
+                                    Complex32 y0, Complex32 y1, float sigma2, float det_floor,
+                                    float g_min, float gamma_max, std::uint8_t layer_index);
+Equalize2x2Trace trace_equalize_2x2_scalar(Complex32 h00, Complex32 h01, Complex32 h10,
+                                           Complex32 h11, Complex32 y0, Complex32 y1, float sigma2,
+                                           float det_floor, float g_min, float gamma_max);
 
-EqualizedSymbol equalize_1x2_scalar(Complex32 h0,
-                                    Complex32 h1,
-                                    Complex32 y0,
-                                    Complex32 y1,
-                                    float sigma2,
-                                    float g_min,
-                                    float gamma_max);
+EqualizedSymbol equalize_1x2_scalar(Complex32 h0, Complex32 h1, Complex32 y0, Complex32 y1,
+                                    float sigma2, float g_min, float gamma_max);
 
 bool cpu_supports_avx2();
 
-void equalize_2x2_avx2(const PackedEqualizerInputs& packed,
-                       std::uint32_t begin,
-                       std::uint32_t end,
-                       float sigma2,
-                       float det_floor,
-                       float g_min,
-                       float gamma_max,
-                       float* out_re_layer0,
-                       float* out_im_layer0,
-                       float* out_sinr_layer0,
-                       float* out_re_layer1,
-                       float* out_im_layer1,
-                       float* out_sinr_layer1);
+void equalize_2x2_avx2(const PackedEqualizerInputs& packed, std::uint32_t begin, std::uint32_t end,
+                       float sigma2, float det_floor, float g_min, float gamma_max,
+                       float* out_re_layer0, float* out_im_layer0, float* out_sinr_layer0,
+                       float* out_re_layer1, float* out_im_layer1, float* out_sinr_layer1);
 
-}  // namespace mmse::detail
+} // namespace mmse::detail

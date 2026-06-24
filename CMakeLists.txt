@@ -37,9 +37,11 @@ target_include_directories(mmse_cpp
 target_compile_features(mmse_cpp PUBLIC cxx_std_20)
 
 if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
     target_compile_options(mmse_cpp PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /EHsc>
     )
+    target_link_options(mmse_cpp PRIVATE /NODEFAULTLIB:LIBCMT)
     set_source_files_properties(
         src/mmse_avx2.cpp
         PROPERTIES
@@ -91,6 +93,9 @@ if(MMSE_BUILD_TESTS)
     target_link_libraries(mmse_tests PRIVATE mmse_cpp)
     target_include_directories(mmse_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(mmse_tests PRIVATE MMSE_CUDA_ENABLED=$<BOOL:${MMSE_CUDA_ENABLED}>)
+    if(MSVC)
+        target_link_options(mmse_tests PRIVATE /NODEFAULTLIB:LIBCMT)
+    endif()
     add_test(NAME mmse_tests COMMAND mmse_tests)
     install(TARGETS mmse_tests
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
