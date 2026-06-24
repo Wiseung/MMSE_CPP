@@ -6,7 +6,7 @@
 namespace mmse {
 
 class MmseEqualizerCpuContext {
-public:
+  public:
     MmseEqualizerCpuContext();
     ~MmseEqualizerCpuContext();
 
@@ -14,15 +14,31 @@ public:
     MmseEqualizerCpuContext& operator=(const MmseEqualizerCpuContext&) = delete;
 
     MmseStatus init(const MmseEqualizerCpuConfig& config);
-    MmseStatus run(const PlanarGridViewF32& grid,
-                   const ExtractDescriptor& desc,
+    MmseStatus run(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                    EqualizerOutputView& out);
 
-private:
+  private:
+    struct Impl;
+    Impl* impl_;
+};
+
+class MmseEqualizerGpuContext {
+  public:
+    MmseEqualizerGpuContext();
+    ~MmseEqualizerGpuContext();
+
+    MmseEqualizerGpuContext(const MmseEqualizerGpuContext&) = delete;
+    MmseEqualizerGpuContext& operator=(const MmseEqualizerGpuContext&) = delete;
+
+    MmseStatus init(const MmseEqualizerGpuConfig& config);
+    MmseStatus run(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
+                   EqualizerOutputView& out);
+
+  private:
     struct Impl;
     Impl* impl_;
 };
 
 const char* to_string(MmseStatus status);
 
-}  // namespace mmse
+} // namespace mmse
