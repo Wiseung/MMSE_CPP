@@ -15,6 +15,9 @@ using mmse::ExtractDescriptor;
 using mmse::MmseCpuBackend;
 using mmse::MmseEqualizerCpuConfig;
 using mmse::MmseEqualizerCpuContext;
+using mmse::MmseEqualizerGpuConfig;
+using mmse::MmseEqualizerGpuContext;
+using mmse::MmseGpuBackend;
 using mmse::MmseStatus;
 using mmse::PlanarGridViewF32;
 using namespace mmse;
@@ -590,6 +593,171 @@ void test_single_layer_path() {
     expect_near(out.x_hat_re[0], 0.75F, 1.0e-3F, "single-layer xhat");
 }
 
+void test_gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback() {
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig config{};
+    config.backend = MmseGpuBackend::kCuda;
+#if MMSE_CUDA_ENABLED
+    expect_true(gpu.init(config) == MmseStatus::kOk, "gpu strict cuda init should succeed");
+
+    GridBuffers buffers = make_zero_grid();
+    auto desc = make_fullband_desc();
+    desc.n_layers = 1;
+    fill_identity_channel(buffers, desc, 0.75F, 0.0F);
+    auto grid = make_grid_view(buffers);
+    const std::uint32_t cap = 20000U;
+    std::vector<float> xre(cap);
+    std::vector<float> xim(cap);
+    std::vector<float> sinr(cap);
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
+    expect_true(gpu.run(grid, desc, out) == MmseStatus::kOk,
+                "gpu strict cuda run should succeed via fallback");
+    expect_true(out.n_layers == 1U, "gpu strict cuda fallback layer count");
+    expect_near(out.x_hat_re[0], 0.75F, 1.0e-3F, "gpu strict cuda fallback xhat");
+#else
+    expect_true(gpu.init(config) == MmseStatus::kUnsupportedConfig,
+                "gpu strict cuda init should be unsupported without cuda build");
+#endif
+}
+
+void test_gpu_context_auto_fallback_matches_cpu_context() {
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kAuto;
+    gpu_config.sigma2_min = 1.0e-3F;
+    gpu_config.det_floor = 1.0e-6F;
+    gpu_config.g_min = 1.0e-4F;
+    gpu_config.gamma_max = 1.0e4F;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "gpu auto init should succeed");
+
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1;
+    cpu_config.sigma2_min = gpu_config.sigma2_min;
+    cpu_config.det_floor = gpu_config.det_floor;
+    cpu_config.g_min = gpu_config.g_min;
+    cpu_config.gamma_max = gpu_config.gamma_max;
+    cpu_config.backend = MmseCpuBackend::kAuto;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "cpu auto init should succeed");
+
+    auto desc = make_fullband_desc();
+    GridBuffers buffers = make_zero_grid();
+    const TwoLayerCase c = make_two_layer_case();
+    fill_constant_mimo_channel(buffers, desc, c.h00, c.h01, c.h10, c.h11, c.x0, c.x1);
+    auto grid = make_grid_view(buffers);
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> cpu_re(cap * 2U);
+    std::vector<float> cpu_im(cap * 2U);
+    std::vector<float> cpu_sinr(cap * 2U);
+    std::vector<float> gpu_re(cap * 2U);
+    std::vector<float> gpu_im(cap * 2U);
+    std::vector<float> gpu_sinr(cap * 2U);
+    EqualizerOutputView cpu_out{cpu_re.data(), cpu_im.data(), cpu_sinr.data(), cap};
+    EqualizerOutputView gpu_out{gpu_re.data(), gpu_im.data(), gpu_sinr.data(), cap};
+
+    expect_true(cpu.run(grid, desc, cpu_out) == MmseStatus::kOk, "cpu run");
+    expect_true(gpu.run(grid, desc, gpu_out) == MmseStatus::kOk, "gpu fallback run");
+    expect_true(cpu_out.n_re_per_layer == gpu_out.n_re_per_layer, "cpu/gpu fallback RE count");
+    expect_true(cpu_out.n_layers == gpu_out.n_layers, "cpu/gpu fallback layer count");
+    expect_true(cpu_out.mod_order == gpu_out.mod_order, "cpu/gpu fallback mod order");
+    constexpr std::array<std::uint32_t, 3> kCheckRe = {0U, 17U, 255U};
+    for (std::uint32_t layer = 0; layer < cpu_out.n_layers; ++layer) {
+        for (std::uint32_t re : kCheckRe) {
+            if (re >= cpu_out.n_re_per_layer) {
+                continue;
+            }
+            const std::size_t idx =
+                static_cast<std::size_t>(layer) * cpu_out.capacity_re_per_layer + re;
+            expect_near(gpu_re[idx], cpu_re[idx], 5.0e-2F, "gpu xhat real sample");
+            expect_near(gpu_im[idx], cpu_im[idx], 5.0e-2F, "gpu xhat imag sample");
+            expect_true(gpu_sinr[idx] > 0.0F, "gpu positive sinr sample");
+            expect_true(std::isfinite(gpu_sinr[idx]), "gpu finite sinr sample");
+        }
+    }
+}
+
+void test_gpu_context_cuda_transport_quantization_preserves_small_signal() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kCuda;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "gpu strict cuda init should succeed");
+
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "cpu init should succeed");
+
+    auto desc = make_fullband_desc();
+    desc.n_layers = 1;
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.03125F, 0.0F);
+    auto grid = make_grid_view(buffers);
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> cpu_re(cap);
+    std::vector<float> cpu_im(cap);
+    std::vector<float> cpu_sinr(cap);
+    std::vector<float> gpu_re(cap);
+    std::vector<float> gpu_im(cap);
+    std::vector<float> gpu_sinr(cap);
+    EqualizerOutputView cpu_out{cpu_re.data(), cpu_im.data(), cpu_sinr.data(), cap};
+    EqualizerOutputView gpu_out{gpu_re.data(), gpu_im.data(), gpu_sinr.data(), cap};
+
+    expect_true(cpu.run(grid, desc, cpu_out) == MmseStatus::kOk, "cpu run");
+    expect_true(gpu.run(grid, desc, gpu_out) == MmseStatus::kOk, "gpu run");
+    expect_near(gpu_re[0], cpu_re[0], 1.0e-4F, "gpu quantized transport xhat real");
+    expect_near(gpu_im[0], cpu_im[0], 1.0e-4F, "gpu quantized transport xhat imag");
+#endif
+}
+
+void test_gpu_context_sigma2_state_persists() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig config{};
+    config.backend = MmseGpuBackend::kCuda;
+    config.sigma2_iir_alpha = 0.5F;
+    config.sigma2_min = 1.0e-6F;
+    expect_true(gpu.init(config) == MmseStatus::kOk, "gpu init should succeed");
+
+    auto desc = make_fullband_desc();
+    GridBuffers clean = make_zero_grid();
+    fill_identity_channel(clean, desc, 1.0F, 1.0F);
+    auto clean_grid = make_grid_view(clean);
+
+    GridBuffers noisy = clean;
+    for (std::size_t i = 0; i < noisy.re[0].size(); i += 17U) {
+        noisy.re[0][i] += 0.2F;
+        noisy.im[1][i] -= 0.1F;
+    }
+    auto noisy_grid = make_grid_view(noisy);
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> xre(cap * 2U);
+    std::vector<float> xim(cap * 2U);
+    std::vector<float> sinr(cap * 2U);
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
+
+    expect_true(gpu.run(noisy_grid, desc, out) == MmseStatus::kOk, "gpu noisy run");
+    const float sinr_noisy = out.sinr[0];
+    expect_true(gpu.run(clean_grid, desc, out) == MmseStatus::kOk, "gpu clean run");
+    const float sinr_after = out.sinr[0];
+    (void)sinr_noisy;
+    expect_true(sinr_after < 1.0e6F, "gpu clamped finite sinr");
+    expect_true(sinr_after > 0.0F, "gpu positive sinr after state update");
+#endif
+}
+
+void test_gpu_context_invalid_stream_count_is_rejected() {
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig config{};
+    config.backend = MmseGpuBackend::kAuto;
+    config.stream_count = 0;
+    expect_true(gpu.init(config) == MmseStatus::kInvalidArgument,
+                "gpu init should reject zero stream count");
+}
+
 } // namespace
 
 int main() {
@@ -608,6 +776,15 @@ int main() {
         std::pair{"two_layer_constant_channel_matches_golden",
                   &test_two_layer_constant_channel_matches_golden},
         std::pair{"two_layer_repeated_runs_are_stable", &test_two_layer_repeated_runs_are_stable},
+        std::pair{"gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback",
+                  &test_gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback},
+        std::pair{"gpu_context_auto_fallback_matches_cpu_context",
+                  &test_gpu_context_auto_fallback_matches_cpu_context},
+        std::pair{"gpu_context_cuda_transport_quantization_preserves_small_signal",
+                  &test_gpu_context_cuda_transport_quantization_preserves_small_signal},
+        std::pair{"gpu_context_sigma2_state_persists", &test_gpu_context_sigma2_state_persists},
+        std::pair{"gpu_context_invalid_stream_count_is_rejected",
+                  &test_gpu_context_invalid_stream_count_is_rejected},
     };
 
     for (const auto& [name, fn] : tests) {

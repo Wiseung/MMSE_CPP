@@ -4,9 +4,25 @@ project(MMSE_CPP LANGUAGES CXX)
 
 option(MMSE_BUILD_TESTS "Build MMSE unit tests" ON)
 option(MMSE_BUILD_BENCH "Build MMSE benchmark" ON)
+option(MMSE_ENABLE_CUDA "Enable CUDA backend when toolkit is available" ON)
+
+set(MMSE_CUDA_SOURCES src/mmse_cuda_runtime_stub.cpp)
+set(MMSE_CUDA_ENABLED OFF)
+
+if(MMSE_ENABLE_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        set(MMSE_CUDA_SOURCES src/mmse_cuda_runtime.cu)
+        set(MMSE_CUDA_ENABLED ON)
+    endif()
+endif()
 
 add_library(mmse_cpp
     src/mmse_equalizer_cpu.cpp
+    src/mmse_equalizer_gpu.cpp
+    ${MMSE_CUDA_SOURCES}
     src/mmse_avx2.cpp
     src/thread_pool.cpp
 )
@@ -21,14 +37,18 @@ target_include_directories(mmse_cpp
 target_compile_features(mmse_cpp PUBLIC cxx_std_20)
 
 if(MSVC)
-    target_compile_options(mmse_cpp PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(mmse_cpp PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /EHsc>
+    )
     set_source_files_properties(
         src/mmse_avx2.cpp
         PROPERTIES
         COMPILE_OPTIONS "/arch:AVX2"
     )
 else()
-    target_compile_options(mmse_cpp PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(mmse_cpp PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>
+    )
     set_source_files_properties(
         src/mmse_avx2.cpp
         PROPERTIES
@@ -36,7 +56,17 @@ else()
     )
 endif()
 
+if(MMSE_CUDA_ENABLED)
+    set_target_properties(mmse_cpp PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED YES)
+    set_source_files_properties(
+        src/mmse_cuda_runtime.cu
+        PROPERTIES
+        LANGUAGE CUDA
+    )
+endif()
+
 target_compile_definitions(mmse_cpp PRIVATE NOMINMAX)
+target_compile_definitions(mmse_cpp PRIVATE MMSE_CUDA_ENABLED=$<BOOL:${MMSE_CUDA_ENABLED}>)
 
 include(GNUInstallDirs)
 
@@ -60,6 +90,7 @@ if(MMSE_BUILD_TESTS)
     add_executable(mmse_tests tests/mmse_tests.cpp)
     target_link_libraries(mmse_tests PRIVATE mmse_cpp)
     target_include_directories(mmse_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(mmse_tests PRIVATE MMSE_CUDA_ENABLED=$<BOOL:${MMSE_CUDA_ENABLED}>)
     add_test(NAME mmse_tests COMMAND mmse_tests)
     install(TARGETS mmse_tests
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

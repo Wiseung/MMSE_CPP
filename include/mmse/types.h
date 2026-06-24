@@ -21,6 +21,11 @@ enum class MmseCpuBackend : std::uint8_t {
     kAvx2,
 };
 
+enum class MmseGpuBackend : std::uint8_t {
+    kAuto = 0,
+    kCuda,
+};
+
 struct PlanarGridViewF32 {
     std::array<const float*, 2> re{};
     std::array<const float*, 2> im{};
@@ -61,6 +66,17 @@ struct MmseEqualizerCpuConfig {
     float g_min = 1.0e-4F;
     float gamma_max = 1.0e4F;
     MmseCpuBackend backend = MmseCpuBackend::kAuto;
+};
+
+struct MmseEqualizerGpuConfig {
+    std::uint32_t device_ordinal = 0;
+    std::uint32_t stream_count = 1;
+    float sigma2_iir_alpha = 0.8F;
+    float sigma2_min = 1.0e-4F;
+    float det_floor = 1.0e-6F;
+    float g_min = 1.0e-4F;
+    float gamma_max = 1.0e4F;
+    MmseGpuBackend backend = MmseGpuBackend::kAuto;
 };
 
 } // namespace mmse
