@@ -10,6 +10,31 @@ namespace mmse::detail {
 
 namespace {
 
+struct CudaComplex32 {
+    float re = 0.0F;
+    float im = 0.0F;
+};
+
+__device__ inline CudaComplex32 cadd(CudaComplex32 a, CudaComplex32 b) {
+    return {a.re + b.re, a.im + b.im};
+}
+
+__device__ inline CudaComplex32 cmul(CudaComplex32 a, CudaComplex32 b) {
+    return {a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re};
+}
+
+__device__ inline CudaComplex32 cconj(CudaComplex32 a) {
+    return {a.re, -a.im};
+}
+
+__device__ inline CudaComplex32 cscale(CudaComplex32 a, float s) {
+    return {a.re * s, a.im * s};
+}
+
+__device__ inline float cnorm2(CudaComplex32 a) {
+    return a.re * a.re + a.im * a.im;
+}
+
 MmseStatus map_cuda_error(cudaError_t status) {
     return status == cudaSuccess ? MmseStatus::kOk : MmseStatus::kUnsupportedConfig;
 }
@@ -150,164 +175,185 @@ __global__ void equalize_stub_kernel(const std::int16_t* grid_re0,
                                      float* scratch,
                                      std::uint32_t* completion,
                                      std::uint32_t completion_value) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        if (grid_meta != nullptr && h_estimate != nullptr && xhat_re != nullptr &&
-            xhat_im != nullptr && sinr != nullptr && grid_scale != nullptr) {
-            const float sigma2 = sigma2_in != nullptr ? *sigma2_in : grid_meta->sigma2;
-            const float g_min = grid_meta->g_min;
-            const float gamma_max = grid_meta->gamma_max;
-            for (std::uint32_t re = 0; re < grid_meta->n_valid_re; ++re) {
-                const std::uint32_t grid_idx = grid_meta->grid_indices[re];
-                const std::uint32_t out_slot = grid_meta->output_slot_by_grid_re[grid_idx];
-                const std::uint32_t symbol = grid_idx / grid_meta->n_subcarriers;
-                const std::uint32_t sc = grid_idx % grid_meta->n_subcarriers;
-
-                const float y0_re = static_cast<float>(grid_re0[grid_idx]) * grid_scale[0];
-                const float y0_im = static_cast<float>(grid_im0[grid_idx]) * grid_scale[0];
-                const float y1_re = static_cast<float>(grid_re1[grid_idx]) * grid_scale[1];
-                const float y1_im = static_cast<float>(grid_im1[grid_idx]) * grid_scale[1];
-
-                const std::uint32_t h00_base =
-                    2U * (((0U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + symbol) *
-                              kLteNumSubcarriers20MHz +
-                          sc);
-                const std::uint32_t h01_base =
-                    2U * (((1U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + symbol) *
-                              kLteNumSubcarriers20MHz +
-                          sc);
-                const std::uint32_t h10_base =
-                    2U * (((0U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + symbol) *
-                              kLteNumSubcarriers20MHz +
-                          sc);
-                const std::uint32_t h11_base =
-                    2U * (((1U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + symbol) *
-                              kLteNumSubcarriers20MHz +
-                          sc);
-
-                const float h00_re = h_estimate[h00_base];
-                const float h00_im = h_estimate[h00_base + 1U];
-                const float h10_re = h_estimate[h10_base];
-                const float h10_im = h_estimate[h10_base + 1U];
-
-                if (grid_meta->n_layers == 1U) {
-                    const float denom = h00_re * h00_re + h00_im * h00_im + h10_re * h10_re +
-                                        h10_im * h10_im + sigma2;
-                    const float w0_re = h00_re / denom;
-                    const float w0_im = -h00_im / denom;
-                    const float w1_re = h10_re / denom;
-                    const float w1_im = -h10_im / denom;
-                    const float z0_re =
-                        (w0_re * y0_re - w0_im * y0_im) + (w1_re * y1_re - w1_im * y1_im);
-                    const float z0_im =
-                        (w0_re * y0_im + w0_im * y0_re) + (w1_re * y1_im + w1_im * y1_re);
-                    float g0 =
-                        (h00_re * h00_re + h00_im * h00_im + h10_re * h10_re + h10_im * h10_im) /
-                        denom;
-                    g0 = g0 < g_min ? g_min : (g0 > 1.0F - g_min ? 1.0F - g_min : g0);
-                    xhat_re[out_slot] = z0_re / g0;
-                    xhat_im[out_slot] = z0_im / g0;
-                    float gamma0 = g0 / (1.0F - g0);
-                    gamma0 = gamma0 > gamma_max ? gamma_max : gamma0;
-                    sinr[out_slot] = gamma0;
-                } else {
-                    const float h01_re = h_estimate[h01_base];
-                    const float h01_im = h_estimate[h01_base + 1U];
-                    const float h11_re = h_estimate[h11_base];
-                    const float h11_im = h_estimate[h11_base + 1U];
-
-                    const float a11 = h00_re * h00_re + h00_im * h00_im + h10_re * h10_re +
-                                      h10_im * h10_im + sigma2;
-                    const float a22 = h01_re * h01_re + h01_im * h01_im + h11_re * h11_re +
-                                      h11_im * h11_im + sigma2;
-                    const float a12_re = h00_re * h01_re + h00_im * h01_im + h10_re * h11_re +
-                                         h10_im * h11_im;
-                    const float a12_im = -h00_re * h01_im + h00_im * h01_re - h10_re * h11_im +
-                                         h10_im * h11_re;
-                    float det = a11 * a22 - (a12_re * a12_re + a12_im * a12_im);
-                    det = det < 1.0e-6F ? 1.0e-6F : det;
-                    const float inv_det = 1.0F / det;
-
-                    const float inv11 = a22 * inv_det;
-                    const float inv22 = a11 * inv_det;
-                    const float inv12_re = -a12_re * inv_det;
-                    const float inv12_im = -a12_im * inv_det;
-                    const float inv21_re = inv12_re;
-                    const float inv21_im = -inv12_im;
-
-                    const float hh00_re = h00_re;
-                    const float hh00_im = -h00_im;
-                    const float hh01_re = h10_re;
-                    const float hh01_im = -h10_im;
-                    const float hh10_re = h01_re;
-                    const float hh10_im = -h01_im;
-                    const float hh11_re = h11_re;
-                    const float hh11_im = -h11_im;
-
-                    const float w00_re =
-                        inv11 * hh00_re + (inv12_re * hh10_re - inv12_im * hh10_im);
-                    const float w00_im =
-                        inv11 * hh00_im + (inv12_re * hh10_im + inv12_im * hh10_re);
-                    const float w01_re =
-                        inv11 * hh01_re + (inv12_re * hh11_re - inv12_im * hh11_im);
-                    const float w01_im =
-                        inv11 * hh01_im + (inv12_re * hh11_im + inv12_im * hh11_re);
-                    const float w10_re =
-                        (inv21_re * hh00_re - inv21_im * hh00_im) + inv22 * hh10_re;
-                    const float w10_im =
-                        (inv21_re * hh00_im + inv21_im * hh00_re) + inv22 * hh10_im;
-                    const float w11_re =
-                        (inv21_re * hh01_re - inv21_im * hh01_im) + inv22 * hh11_re;
-                    const float w11_im =
-                        (inv21_re * hh01_im + inv21_im * hh01_re) + inv22 * hh11_im;
-
-                    const float z0_re =
-                        (w00_re * y0_re - w00_im * y0_im) + (w01_re * y1_re - w01_im * y1_im);
-                    const float z0_im =
-                        (w00_re * y0_im + w00_im * y0_re) + (w01_re * y1_im + w01_im * y1_re);
-                    const float z1_re =
-                        (w10_re * y0_re - w10_im * y0_im) + (w11_re * y1_re - w11_im * y1_im);
-                    const float z1_im =
-                        (w10_re * y0_im + w10_im * y0_re) + (w11_re * y1_im + w11_im * y1_re);
-
-                    const float g0_re =
-                        (w00_re * h00_re - w00_im * h00_im) + (w01_re * h10_re - w01_im * h10_im);
-                    const float g1_re =
-                        (w10_re * h01_re - w10_im * h01_im) + (w11_re * h11_re - w11_im * h11_im);
-                    float g0 =
-                        g0_re < g_min ? g_min : (g0_re > 1.0F - g_min ? 1.0F - g_min : g0_re);
-                    float g1 =
-                        g1_re < g_min ? g_min : (g1_re > 1.0F - g_min ? 1.0F - g_min : g1_re);
-
-                    xhat_re[out_slot] = z0_re / g0;
-                    xhat_im[out_slot] = z0_im / g0;
-                    float gamma0 = g0 / (1.0F - g0);
-                    gamma0 = gamma0 > gamma_max ? gamma_max : gamma0;
-                    sinr[out_slot] = gamma0;
-
-                    const std::uint32_t layer1_base = kCudaMaxDataRe + out_slot;
-                    xhat_re[layer1_base] = z1_re / g1;
-                    xhat_im[layer1_base] = z1_im / g1;
-                    float gamma1 = g1 / (1.0F - g1);
-                    gamma1 = gamma1 > gamma_max ? gamma_max : gamma1;
-                    sinr[layer1_base] = gamma1;
-                }
-
-                if (re == 0U && scratch != nullptr) {
-                    scratch[0] = static_cast<float>(out_slot);
-                    scratch[1] = static_cast<float>(symbol);
-                    scratch[2] = static_cast<float>(sc);
-                    scratch[3] = sigma2;
-                }
-            }
-        } else if (scratch != nullptr && h_estimate != nullptr) {
+    if (grid_meta == nullptr || h_estimate == nullptr || xhat_re == nullptr || xhat_im == nullptr ||
+        sinr == nullptr || grid_scale == nullptr) {
+        if (threadIdx.x == 0 && blockIdx.x == 0 && scratch != nullptr && h_estimate != nullptr) {
             scratch[0] = h_estimate[0];
             scratch[1] = h_estimate[1];
             scratch[2] = 0.0F;
             scratch[3] = 0.0F;
         }
-        if (completion != nullptr) {
+        if (threadIdx.x == 0 && blockIdx.x == 0 && completion != nullptr) {
             *completion = completion_value;
         }
+        return;
+    }
+
+    const std::uint32_t re = blockIdx.x * blockDim.x + threadIdx.x;
+    if (re < grid_meta->n_valid_re) {
+        const float sigma2 = sigma2_in != nullptr ? *sigma2_in : grid_meta->sigma2;
+        const float det_floor = grid_meta->det_floor;
+        const float g_min = grid_meta->g_min;
+        const float gamma_max = grid_meta->gamma_max;
+        const std::uint32_t grid_idx = grid_meta->grid_indices[re];
+        const std::uint32_t out_slot = grid_meta->output_slot_by_grid_re[grid_idx];
+        const std::uint32_t symbol = grid_idx / grid_meta->n_subcarriers;
+        const std::uint32_t sc = grid_idx % grid_meta->n_subcarriers;
+
+        const float y0_re = static_cast<float>(grid_re0[grid_idx]) * grid_scale[0];
+        const float y0_im = static_cast<float>(grid_im0[grid_idx]) * grid_scale[0];
+        const float y1_re = static_cast<float>(grid_re1[grid_idx]) * grid_scale[1];
+        const float y1_im = static_cast<float>(grid_im1[grid_idx]) * grid_scale[1];
+
+        const std::uint32_t h00_base =
+            2U * (((0U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + symbol) *
+                      kLteNumSubcarriers20MHz +
+                  sc);
+        const std::uint32_t h01_base =
+            2U * (((1U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + symbol) *
+                      kLteNumSubcarriers20MHz +
+                  sc);
+        const std::uint32_t h10_base =
+            2U * (((0U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + symbol) *
+                      kLteNumSubcarriers20MHz +
+                  sc);
+        const std::uint32_t h11_base =
+            2U * (((1U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + symbol) *
+                      kLteNumSubcarriers20MHz +
+                  sc);
+
+        const float h00_re = h_estimate[h00_base];
+        const float h00_im = h_estimate[h00_base + 1U];
+        const float h10_re = h_estimate[h10_base];
+        const float h10_im = h_estimate[h10_base + 1U];
+
+        if (grid_meta->n_layers == 1U) {
+            const float denom = h00_re * h00_re + h00_im * h00_im + h10_re * h10_re +
+                                h10_im * h10_im + sigma2;
+            const float w0_re = h00_re / denom;
+            const float w0_im = -h00_im / denom;
+            const float w1_re = h10_re / denom;
+            const float w1_im = -h10_im / denom;
+            const float z0_re =
+                (w0_re * y0_re - w0_im * y0_im) + (w1_re * y1_re - w1_im * y1_im);
+            const float z0_im =
+                (w0_re * y0_im + w0_im * y0_re) + (w1_re * y1_im + w1_im * y1_re);
+            float g0 =
+                (h00_re * h00_re + h00_im * h00_im + h10_re * h10_re + h10_im * h10_im) / denom;
+            g0 = g0 < g_min ? g_min : (g0 > 1.0F - g_min ? 1.0F - g_min : g0);
+            xhat_re[out_slot] = z0_re / g0;
+            xhat_im[out_slot] = z0_im / g0;
+            float gamma0 = g0 / (1.0F - g0);
+            gamma0 = gamma0 > gamma_max ? gamma_max : gamma0;
+            sinr[out_slot] = gamma0;
+        } else {
+            const CudaComplex32 h00{h00_re, h00_im};
+            const CudaComplex32 h01{h_estimate[h01_base], h_estimate[h01_base + 1U]};
+            const CudaComplex32 h10{h10_re, h10_im};
+            const CudaComplex32 h11{h_estimate[h11_base], h_estimate[h11_base + 1U]};
+            const CudaComplex32 y0{y0_re, y0_im};
+            const CudaComplex32 y1{y1_re, y1_im};
+
+            const float a11 = cnorm2(h00) + cnorm2(h10) + sigma2;
+            const float a22 = cnorm2(h01) + cnorm2(h11) + sigma2;
+            const CudaComplex32 a12 = cadd(cmul(cconj(h00), h01), cmul(cconj(h10), h11));
+            float det = a11 * a22 - cnorm2(a12);
+            det = det < det_floor ? det_floor : det;
+            const float inv_det = 1.0F / det;
+
+            const float inv11 = a22 * inv_det;
+            const float inv22 = a11 * inv_det;
+            const CudaComplex32 inv12 = cscale(a12, -inv_det);
+            const CudaComplex32 inv21 = cconj(inv12);
+
+            const CudaComplex32 hh00 = cconj(h00);
+            const CudaComplex32 hh01 = cconj(h10);
+            const CudaComplex32 hh10 = cconj(h01);
+            const CudaComplex32 hh11 = cconj(h11);
+
+            const CudaComplex32 w00 = cadd(cscale(hh00, inv11), cmul(inv12, hh10));
+            const CudaComplex32 w01 = cadd(cscale(hh01, inv11), cmul(inv12, hh11));
+            const CudaComplex32 w10 = cadd(cmul(inv21, hh00), cscale(hh10, inv22));
+            const CudaComplex32 w11 = cadd(cmul(inv21, hh01), cscale(hh11, inv22));
+
+            const CudaComplex32 z0 = cadd(cmul(w00, y0), cmul(w01, y1));
+            const CudaComplex32 z1 = cadd(cmul(w10, y0), cmul(w11, y1));
+
+            const float g0_re = cadd(cmul(w00, h00), cmul(w01, h10)).re;
+            const float g1_re = cadd(cmul(w10, h01), cmul(w11, h11)).re;
+            float g0 = g0_re < g_min ? g_min : (g0_re > 1.0F - g_min ? 1.0F - g_min : g0_re);
+            float g1 = g1_re < g_min ? g_min : (g1_re > 1.0F - g_min ? 1.0F - g_min : g1_re);
+
+            xhat_re[out_slot] = z0.re / g0;
+            xhat_im[out_slot] = z0.im / g0;
+            float gamma0 = g0 / (1.0F - g0);
+            gamma0 = gamma0 > gamma_max ? gamma_max : gamma0;
+            sinr[out_slot] = gamma0;
+
+            const std::uint32_t layer1_base = kCudaMaxDataRe + out_slot;
+            xhat_re[layer1_base] = z1.re / g1;
+            xhat_im[layer1_base] = z1.im / g1;
+            float gamma1 = g1 / (1.0F - g1);
+            gamma1 = gamma1 > gamma_max ? gamma_max : gamma1;
+            sinr[layer1_base] = gamma1;
+
+            if (scratch != nullptr) {
+                for (std::uint32_t sample = 0; sample < grid_meta->validation_sample_count;
+                     ++sample) {
+                    if (grid_meta->validation_re_slots[sample] != re) {
+                        continue;
+                    }
+                    const std::uint32_t base =
+                        kCudaScratchHeaderFloatCount + sample * kCudaEqualizeTraceFloatCount;
+                    scratch[base + 0U] = static_cast<float>(re);
+                    scratch[base + 1U] = static_cast<float>(symbol);
+                    scratch[base + 2U] = static_cast<float>(sc);
+                    scratch[base + 3U] = a11;
+                    scratch[base + 4U] = a22;
+                    scratch[base + 5U] = a12.re;
+                    scratch[base + 6U] = a12.im;
+                    scratch[base + 7U] = det;
+                    scratch[base + 8U] = w00.re;
+                    scratch[base + 9U] = w00.im;
+                    scratch[base + 10U] = w01.re;
+                    scratch[base + 11U] = w01.im;
+                    scratch[base + 12U] = w10.re;
+                    scratch[base + 13U] = w10.im;
+                    scratch[base + 14U] = w11.re;
+                    scratch[base + 15U] = w11.im;
+                    scratch[base + 16U] = z0.re;
+                    scratch[base + 17U] = z0.im;
+                    scratch[base + 18U] = z1.re;
+                    scratch[base + 19U] = z1.im;
+                    scratch[base + 20U] = g0;
+                    scratch[base + 21U] = g1;
+                    scratch[base + 22U] = xhat_re[out_slot];
+                    scratch[base + 23U] = xhat_im[out_slot];
+                    scratch[base + 24U] = xhat_re[layer1_base];
+                    scratch[base + 25U] = xhat_im[layer1_base];
+                    scratch[base + 26U] = sinr[out_slot];
+                    scratch[base + 27U] = sinr[layer1_base];
+                    scratch[base + 28U] = y0_re;
+                    scratch[base + 29U] = y0_im;
+                    scratch[base + 30U] = y1_re;
+                    scratch[base + 31U] = y1_im;
+                }
+            }
+        }
+
+        if (re == 0U && scratch != nullptr) {
+            scratch[0] = static_cast<float>(out_slot);
+            scratch[1] = static_cast<float>(symbol);
+            scratch[2] = static_cast<float>(sc);
+            scratch[3] = sigma2;
+        }
+    }
+
+    const bool is_completion_thread =
+        (blockIdx.x == 0 && threadIdx.x == 0) ||
+        (grid_meta->n_valid_re == 0U && blockIdx.x == 0 && threadIdx.x == 0);
+    if (is_completion_thread && completion != nullptr) {
+        *completion = completion_value;
     }
 }
 
@@ -475,6 +521,14 @@ MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
     return MmseStatus::kOk;
 }
 
+MmseStatus cuda_copy_grid_meta_h2d_async(const CudaDeviceBuffers& buffers,
+                                         const CudaGridMeta& grid_meta,
+                                         std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    return map_cuda_error(cudaMemcpyAsync(buffers.grid_meta, &grid_meta, sizeof(grid_meta),
+                                          cudaMemcpyHostToDevice, stream));
+}
+
 MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers,
                                        const float* xhat_re,
                                        const float* xhat_im,
@@ -517,10 +571,14 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
 }
 
 MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers,
+                                     std::uint32_t n_valid_re,
                                      std::uint32_t completion_value,
                                      std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    equalize_stub_kernel<<<1, 1, 0, stream>>>(
+    constexpr std::uint32_t kThreadsPerBlock = 256U;
+    const std::uint32_t blocks = (n_valid_re == 0U) ? 1U : (n_valid_re + kThreadsPerBlock - 1U) /
+                                                       kThreadsPerBlock;
+    equalize_stub_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
         reinterpret_cast<const std::int16_t*>(buffers.grid_re[0]),
         reinterpret_cast<const std::int16_t*>(buffers.grid_re[1]),
         reinterpret_cast<const std::int16_t*>(buffers.grid_im[0]),
@@ -535,7 +593,11 @@ MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers,
         reinterpret_cast<float*>(buffers.scratch),
         reinterpret_cast<std::uint32_t*>(buffers.completion),
         completion_value);
-    return map_cuda_error(cudaGetLastError());
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+        return MmseStatus::kInternalError;
+    }
+    return MmseStatus::kOk;
 }
 
 MmseStatus cuda_copy_outputs_d2h_async(const CudaDeviceBuffers& buffers,

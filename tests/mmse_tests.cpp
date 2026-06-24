@@ -25,6 +25,8 @@ using mmse::detail::Complex32;
 
 namespace {
 
+constexpr std::uint32_t kValidationSampleCount = 12U;
+
 struct TestFailure {
     std::string message;
 };
@@ -47,6 +49,43 @@ void expect_relative_near(float lhs, float rhs, float rel_tol, float abs_tol,
     const float scale = std::max(std::fabs(rhs), 1.0F);
     if (abs_err > std::max(abs_tol, rel_tol * scale)) {
         throw TestFailure{message + " lhs=" + std::to_string(lhs) + " rhs=" + std::to_string(rhs)};
+    }
+}
+
+std::uint32_t build_validation_samples(const ExtractDescriptor& desc,
+                                       const mmse::detail::ReLayout& layout,
+                                       std::array<std::uint32_t, kValidationSampleCount>& samples) {
+    samples.fill(0U);
+    return mmse::detail::build_validation_re_samples(
+        layout, desc.start_symbol, kLteNumSymbolsNormalCp, kLteNumSubcarriers20MHz, samples.data(),
+        static_cast<std::uint32_t>(samples.size()));
+}
+
+void expect_gpu_matches_cpu_samples(const ExtractDescriptor& desc,
+                                    const EqualizerOutputView& gpu_out,
+                                    const EqualizerOutputView& cpu_out,
+                                    const std::string& label_prefix) {
+    mmse::detail::ReLayout layout{};
+    mmse::detail::build_data_re_layout(desc, layout);
+    std::array<std::uint32_t, kValidationSampleCount> samples{};
+    const std::uint32_t sample_count = build_validation_samples(desc, layout, samples);
+    for (std::uint32_t layer = 0; layer < cpu_out.n_layers; ++layer) {
+        for (std::uint32_t sample = 0; sample < sample_count; ++sample) {
+            const std::uint32_t re = samples[sample];
+            if (re >= cpu_out.n_re_per_layer) {
+                continue;
+            }
+            const std::size_t idx =
+                static_cast<std::size_t>(layer) * cpu_out.capacity_re_per_layer + re;
+            const std::string prefix =
+                label_prefix + " layer=" + std::to_string(layer) + " re=" + std::to_string(re);
+            expect_relative_near(gpu_out.x_hat_re[idx], cpu_out.x_hat_re[idx], 5.0e-2F, 1.0e-4F,
+                                 prefix + " xhat real");
+            expect_relative_near(gpu_out.x_hat_im[idx], cpu_out.x_hat_im[idx], 5.0e-2F, 1.0e-4F,
+                                 prefix + " xhat imag");
+            expect_relative_near(gpu_out.sinr[idx], cpu_out.sinr[idx], 7.0e-2F, 1.0e-4F,
+                                 prefix + " sinr");
+        }
     }
 }
 
@@ -661,20 +700,53 @@ void test_gpu_context_auto_fallback_matches_cpu_context() {
     expect_true(cpu_out.n_re_per_layer == gpu_out.n_re_per_layer, "cpu/gpu fallback RE count");
     expect_true(cpu_out.n_layers == gpu_out.n_layers, "cpu/gpu fallback layer count");
     expect_true(cpu_out.mod_order == gpu_out.mod_order, "cpu/gpu fallback mod order");
-    constexpr std::array<std::uint32_t, 3> kCheckRe = {0U, 17U, 255U};
-    for (std::uint32_t layer = 0; layer < cpu_out.n_layers; ++layer) {
-        for (std::uint32_t re : kCheckRe) {
-            if (re >= cpu_out.n_re_per_layer) {
-                continue;
-            }
-            const std::size_t idx =
-                static_cast<std::size_t>(layer) * cpu_out.capacity_re_per_layer + re;
-            expect_near(gpu_re[idx], cpu_re[idx], 5.0e-2F, "gpu xhat real sample");
-            expect_near(gpu_im[idx], cpu_im[idx], 5.0e-2F, "gpu xhat imag sample");
-            expect_true(gpu_sinr[idx] > 0.0F, "gpu positive sinr sample");
-            expect_true(std::isfinite(gpu_sinr[idx]), "gpu finite sinr sample");
-        }
-    }
+    expect_gpu_matches_cpu_samples(desc, gpu_out, cpu_out, "gpu auto fallback");
+}
+
+void test_gpu_context_cuda_two_layer_matches_cpu_context_samples() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kCuda;
+    gpu_config.sigma2_min = 1.0e-3F;
+    gpu_config.det_floor = 1.0e-6F;
+    gpu_config.g_min = 1.0e-4F;
+    gpu_config.gamma_max = 1.0e4F;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "gpu strict cuda init should succeed");
+
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1;
+    cpu_config.sigma2_min = gpu_config.sigma2_min;
+    cpu_config.det_floor = gpu_config.det_floor;
+    cpu_config.g_min = gpu_config.g_min;
+    cpu_config.gamma_max = gpu_config.gamma_max;
+    cpu_config.backend = MmseCpuBackend::kScalar;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "cpu scalar init should succeed");
+
+    auto desc = make_fullband_desc();
+    GridBuffers buffers = make_zero_grid();
+    const TwoLayerCase c = make_two_layer_case();
+    fill_constant_mimo_channel(buffers, desc, c.h00, c.h01, c.h10, c.h11, c.x0, c.x1);
+    auto grid = make_grid_view(buffers);
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> cpu_re(cap * 2U);
+    std::vector<float> cpu_im(cap * 2U);
+    std::vector<float> cpu_sinr(cap * 2U);
+    std::vector<float> gpu_re(cap * 2U);
+    std::vector<float> gpu_im(cap * 2U);
+    std::vector<float> gpu_sinr(cap * 2U);
+    EqualizerOutputView cpu_out{cpu_re.data(), cpu_im.data(), cpu_sinr.data(), cap};
+    EqualizerOutputView gpu_out{gpu_re.data(), gpu_im.data(), gpu_sinr.data(), cap};
+
+    expect_true(cpu.run(grid, desc, cpu_out) == MmseStatus::kOk, "cpu scalar run");
+    expect_true(gpu.run(grid, desc, gpu_out) == MmseStatus::kOk, "gpu strict cuda run");
+    expect_true(cpu_out.n_re_per_layer == gpu_out.n_re_per_layer, "gpu strict RE count");
+    expect_true(cpu_out.n_layers == gpu_out.n_layers, "gpu strict layer count");
+    expect_true(cpu_out.mod_order == gpu_out.mod_order, "gpu strict mod order");
+    expect_gpu_matches_cpu_samples(desc, gpu_out, cpu_out, "gpu strict cuda");
+#endif
 }
 
 void test_gpu_context_cuda_transport_quantization_preserves_small_signal() {
@@ -780,6 +852,8 @@ int main() {
                   &test_gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback},
         std::pair{"gpu_context_auto_fallback_matches_cpu_context",
                   &test_gpu_context_auto_fallback_matches_cpu_context},
+        std::pair{"gpu_context_cuda_two_layer_matches_cpu_context_samples",
+                  &test_gpu_context_cuda_two_layer_matches_cpu_context_samples},
         std::pair{"gpu_context_cuda_transport_quantization_preserves_small_signal",
                   &test_gpu_context_cuda_transport_quantization_preserves_small_signal},
         std::pair{"gpu_context_sigma2_state_persists", &test_gpu_context_sigma2_state_persists},

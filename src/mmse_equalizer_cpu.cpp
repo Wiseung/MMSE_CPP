@@ -269,6 +269,57 @@ std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layo
     return layout.n_re;
 }
 
+std::uint32_t build_validation_re_samples(const ReLayout& layout, std::uint32_t start_symbol,
+                                          std::uint32_t n_symbols, std::uint32_t n_subcarriers,
+                                          std::uint32_t* out_re_slots, std::uint32_t max_slots) {
+    if (out_re_slots == nullptr || max_slots == 0U || layout.n_re == 0U) {
+        return 0U;
+    }
+
+    std::uint32_t count = 0U;
+    const auto try_add = [&](std::uint32_t re_slot) {
+        if (re_slot >= layout.n_re) {
+            return;
+        }
+        for (std::uint32_t i = 0; i < count; ++i) {
+            if (out_re_slots[i] == re_slot) {
+                return;
+            }
+        }
+        if (count < max_slots) {
+            out_re_slots[count++] = re_slot;
+        }
+    };
+
+    try_add(0U);
+    try_add(layout.n_re / 2U);
+    try_add(layout.n_re - 1U);
+
+    if (n_symbols == 0U || n_subcarriers == 0U) {
+        return count;
+    }
+
+    constexpr std::array<std::uint32_t, 3> kSymbolOffsets = {0U, 6U, 12U};
+    constexpr std::array<std::uint32_t, 4> kSubcarrierOffsets = {0U, 127U, 599U, 1199U};
+    for (std::uint32_t symbol_offset : kSymbolOffsets) {
+        const std::uint32_t symbol = start_symbol + symbol_offset;
+        if (symbol >= n_symbols) {
+            continue;
+        }
+        for (std::uint32_t sc : kSubcarrierOffsets) {
+            if (sc >= n_subcarriers) {
+                continue;
+            }
+            const std::uint32_t grid_idx = symbol * n_subcarriers + sc;
+            const std::uint32_t re_slot = layout.output_slot_by_grid_re[grid_idx];
+            if (re_slot != std::numeric_limits<std::uint32_t>::max()) {
+                try_add(re_slot);
+            }
+        }
+    }
+    return count;
+}
+
 void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                       HGridStorage& h_full, float& sigma2_estimate) {
     ensure_crs_tables();
@@ -412,38 +463,52 @@ EqualizedSymbol equalize_1x2_scalar(Complex32 h0, Complex32 h1, Complex32 y0, Co
     };
 }
 
+Equalize2x2Trace trace_equalize_2x2_scalar(Complex32 h00, Complex32 h01, Complex32 h10,
+                                           Complex32 h11, Complex32 y0, Complex32 y1, float sigma2,
+                                           float det_floor, float g_min, float gamma_max) {
+    Equalize2x2Trace trace{};
+    trace.a11 = cnorm2(h00) + cnorm2(h10) + sigma2;
+    trace.a22 = cnorm2(h01) + cnorm2(h11) + sigma2;
+    trace.a12 = cadd(cmul(cconj(h00), h01), cmul(cconj(h10), h11));
+    trace.det = std::max(trace.a11 * trace.a22 - cnorm2(trace.a12), det_floor);
+    trace.inv_det = 1.0F / trace.det;
+
+    trace.inv11 = trace.a22 * trace.inv_det;
+    trace.inv22 = trace.a11 * trace.inv_det;
+    trace.inv12 = cscale(trace.a12, -trace.inv_det);
+    trace.inv21 = cconj(trace.inv12);
+
+    trace.hh00 = cconj(h00);
+    trace.hh01 = cconj(h10);
+    trace.hh10 = cconj(h01);
+    trace.hh11 = cconj(h11);
+
+    trace.w00 = cadd(cscale(trace.hh00, trace.inv11), cmul(trace.inv12, trace.hh10));
+    trace.w01 = cadd(cscale(trace.hh01, trace.inv11), cmul(trace.inv12, trace.hh11));
+    trace.w10 = cadd(cmul(trace.inv21, trace.hh00), cscale(trace.hh10, trace.inv22));
+    trace.w11 = cadd(cmul(trace.inv21, trace.hh01), cscale(trace.hh11, trace.inv22));
+
+    trace.z0 = cadd(cmul(trace.w00, y0), cmul(trace.w01, y1));
+    trace.z1 = cadd(cmul(trace.w10, y0), cmul(trace.w11, y1));
+
+    trace.g0 = clampf(cadd(cmul(trace.w00, h00), cmul(trace.w01, h10)).re, g_min, 1.0F - g_min);
+    trace.g1 = clampf(cadd(cmul(trace.w10, h01), cmul(trace.w11, h11)).re, g_min, 1.0F - g_min);
+
+    trace.xhat0 = cscale(trace.z0, 1.0F / trace.g0);
+    trace.xhat1 = cscale(trace.z1, 1.0F / trace.g1);
+    trace.gamma0 = clampf(trace.g0 / (1.0F - trace.g0), g_min, gamma_max);
+    trace.gamma1 = clampf(trace.g1 / (1.0F - trace.g1), g_min, gamma_max);
+    return trace;
+}
+
 EqualizedSymbol equalize_2x2_scalar(Complex32 h00, Complex32 h01, Complex32 h10, Complex32 h11,
                                     Complex32 y0, Complex32 y1, float sigma2, float det_floor,
                                     float g_min, float gamma_max, std::uint8_t layer_index) {
-    const float a11 = cnorm2(h00) + cnorm2(h10) + sigma2;
-    const float a22 = cnorm2(h01) + cnorm2(h11) + sigma2;
-    const Complex32 a12 = cadd(cmul(cconj(h00), h01), cmul(cconj(h10), h11));
-    const float det = std::max(a11 * a22 - cnorm2(a12), det_floor);
-    const float inv_det = 1.0F / det;
-
-    const float inv11 = a22 * inv_det;
-    const float inv22 = a11 * inv_det;
-    const Complex32 inv12 = cscale(a12, -inv_det);
-    const Complex32 inv21 = cconj(inv12);
-
-    const Complex32 hh00 = cconj(h00);
-    const Complex32 hh01 = cconj(h10);
-    const Complex32 hh10 = cconj(h01);
-    const Complex32 hh11 = cconj(h11);
-
-    const Complex32 w00 = cadd(cscale(hh00, inv11), cmul(inv12, hh10));
-    const Complex32 w01 = cadd(cscale(hh01, inv11), cmul(inv12, hh11));
-    const Complex32 w10 = cadd(cmul(inv21, hh00), cscale(hh10, inv22));
-    const Complex32 w11 = cadd(cmul(inv21, hh01), cscale(hh11, inv22));
-
-    const Complex32 z0 = cadd(cmul(w00, y0), cmul(w01, y1));
-    const Complex32 z1 = cadd(cmul(w10, y0), cmul(w11, y1));
-
-    const float g0 = clampf(cadd(cmul(w00, h00), cmul(w01, h10)).re, g_min, 1.0F - g_min);
-    const float g1 = clampf(cadd(cmul(w10, h01), cmul(w11, h11)).re, g_min, 1.0F - g_min);
-
-    const Complex32 xhat = (layer_index == 0U) ? cscale(z0, 1.0F / g0) : cscale(z1, 1.0F / g1);
-    const float gamma = (layer_index == 0U) ? g0 / (1.0F - g0) : g1 / (1.0F - g1);
+    const Equalize2x2Trace trace =
+        trace_equalize_2x2_scalar(h00, h01, h10, h11, y0, y1, sigma2, det_floor, g_min, gamma_max);
+    const Complex32 xhat = (layer_index == 0U) ? trace.xhat0 : trace.xhat1;
+    const float gamma =
+        (layer_index == 0U) ? trace.g0 / (1.0F - trace.g0) : trace.g1 / (1.0F - trace.g1);
     return {.xhat = xhat, .gamma = clampf(gamma, g_min, gamma_max)};
 }
 

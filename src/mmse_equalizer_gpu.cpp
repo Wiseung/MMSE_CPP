@@ -20,6 +20,7 @@ constexpr std::size_t kGridPlaneCount = detail::kMaxGridRe;
 constexpr std::size_t kEstimateStubFloatCount = detail::kCudaEstimateStubFloatCount;
 constexpr std::size_t kOutputPlaneCount = detail::kMaxDataRe * 2U;
 constexpr float kGridTransportScale = 1.0F / 32767.0F;
+constexpr bool kEnableDeepCudaStubValidation = false;
 
 std::int16_t quantize_grid_sample(float value, float scale) {
     const float scaled = value / scale;
@@ -85,7 +86,7 @@ struct MmseEqualizerGpuContext::Impl {
         std::array<std::int16_t*, 2> transport_re{};
         std::array<std::int16_t*, 2> transport_im{};
         float* h_estimate = nullptr;
-        std::array<float, 4> scratch_host{};
+        std::array<float, detail::kCudaScratchFloatCount> scratch_host{};
         std::array<float, kOutputPlaneCount> ref_xhat_re{};
         std::array<float, kOutputPlaneCount> ref_xhat_im{};
         std::array<float, kOutputPlaneCount> ref_sinr{};
@@ -107,6 +108,9 @@ struct MmseEqualizerGpuContext::Impl {
     };
 
     static MmseStatus validate_config(const MmseEqualizerGpuConfig& config);
+    static bool nearly_equal(float lhs, float rhs, float rel_tol, float abs_tol);
+    MmseStatus compare_equalize_trace_sample(const HostPinnedSlot& slot,
+                                             std::uint32_t sample_index) const;
     void reset_runtime_state();
     void release_runtime_state();
     MmseStatus configure_device_state();
@@ -141,6 +145,75 @@ MmseStatus MmseEqualizerGpuContext::Impl::validate_config(const MmseEqualizerGpu
         config.gamma_max <= 0.0F || config.det_floor <= 0.0F || config.sigma2_min <= 0.0F ||
         config.sigma2_iir_alpha < 0.0F || config.sigma2_iir_alpha > 1.0F) {
         return MmseStatus::kInvalidArgument;
+    }
+    return MmseStatus::kOk;
+}
+
+bool MmseEqualizerGpuContext::Impl::nearly_equal(float lhs, float rhs, float rel_tol,
+                                                 float abs_tol) {
+    const float abs_err = std::abs(lhs - rhs);
+    const float scale = std::max({std::abs(lhs), std::abs(rhs), 1.0F});
+    return abs_err <= std::max(abs_tol, rel_tol * scale);
+}
+
+MmseStatus
+MmseEqualizerGpuContext::Impl::compare_equalize_trace_sample(const HostPinnedSlot& slot,
+                                                             std::uint32_t sample_index) const {
+    if (sample_index >= slot.grid_meta.validation_sample_count) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    const std::uint32_t re = slot.grid_meta.validation_re_slots[sample_index];
+    if (re >= slot.layout.n_re) {
+        return MmseStatus::kInternalError;
+    }
+
+    const std::uint32_t grid_idx = slot.layout.grid_indices[re];
+    const std::uint32_t symbol = grid_idx / slot.grid_meta.n_subcarriers;
+    const std::uint32_t sc = grid_idx % slot.grid_meta.n_subcarriers;
+    const float y0_re = static_cast<float>(slot.transport_re[0][grid_idx]) * slot.grid_scale[0];
+    const float y0_im = static_cast<float>(slot.transport_im[0][grid_idx]) * slot.grid_scale[0];
+    const float y1_re = static_cast<float>(slot.transport_re[1][grid_idx]) * slot.grid_scale[1];
+    const float y1_im = static_cast<float>(slot.transport_im[1][grid_idx]) * slot.grid_scale[1];
+    const auto h_at = [&](std::uint32_t tx, std::uint32_t rx) {
+        const std::size_t base =
+            2U * (((tx * kLteNumRxAntV1 + rx) * kLteNumSymbolsNormalCp + symbol) *
+                      kLteNumSubcarriers20MHz +
+                  sc);
+        return detail::Complex32{slot.h_estimate[base], slot.h_estimate[base + 1U]};
+    };
+
+    const detail::Equalize2x2Trace cpu_trace = detail::trace_equalize_2x2_scalar(
+        h_at(0U, 0U), h_at(1U, 0U), h_at(0U, 1U), h_at(1U, 1U), {y0_re, y0_im}, {y1_re, y1_im},
+        slot.grid_meta.sigma2, config.det_floor, config.g_min, config.gamma_max);
+
+    const std::size_t offset =
+        detail::kCudaScratchHeaderFloatCount +
+        static_cast<std::size_t>(sample_index) * detail::kCudaEqualizeTraceFloatCount;
+    const float* gpu = slot.scratch_host.data() + offset;
+    const auto check = [&](float actual, float expected, float rel_tol = 1.0e-4F,
+                           float abs_tol = 1.0e-5F) {
+        return nearly_equal(actual, expected, rel_tol, abs_tol);
+    };
+
+    if (!check(gpu[0], static_cast<float>(re), 0.0F, 0.5F) ||
+        !check(gpu[1], static_cast<float>(symbol), 0.0F, 0.5F) ||
+        !check(gpu[2], static_cast<float>(sc), 0.0F, 0.5F) || !check(gpu[3], cpu_trace.a11) ||
+        !check(gpu[4], cpu_trace.a22) || !check(gpu[5], cpu_trace.a12.re) ||
+        !check(gpu[6], cpu_trace.a12.im) || !check(gpu[7], cpu_trace.det) ||
+        !check(gpu[8], cpu_trace.w00.re) || !check(gpu[9], cpu_trace.w00.im) ||
+        !check(gpu[10], cpu_trace.w01.re) || !check(gpu[11], cpu_trace.w01.im) ||
+        !check(gpu[12], cpu_trace.w10.re) || !check(gpu[13], cpu_trace.w10.im) ||
+        !check(gpu[14], cpu_trace.w11.re) || !check(gpu[15], cpu_trace.w11.im) ||
+        !check(gpu[16], cpu_trace.z0.re) || !check(gpu[17], cpu_trace.z0.im) ||
+        !check(gpu[18], cpu_trace.z1.re) || !check(gpu[19], cpu_trace.z1.im) ||
+        !check(gpu[20], cpu_trace.g0) || !check(gpu[21], cpu_trace.g1) ||
+        !check(gpu[22], cpu_trace.xhat0.re) || !check(gpu[23], cpu_trace.xhat0.im) ||
+        !check(gpu[24], cpu_trace.xhat1.re) || !check(gpu[25], cpu_trace.xhat1.im) ||
+        !check(gpu[26], cpu_trace.gamma0, 5.0e-4F, 1.0e-3F) ||
+        !check(gpu[27], cpu_trace.gamma1, 5.0e-4F, 1.0e-3F) || !check(gpu[28], y0_re) ||
+        !check(gpu[29], y0_im) || !check(gpu[30], y1_re) || !check(gpu[31], y1_im)) {
+        return MmseStatus::kInternalError;
     }
     return MmseStatus::kOk;
 }
@@ -389,8 +462,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_device_buffers(HostPin
         status != MmseStatus::kOk) {
         return status;
     }
-    if (const MmseStatus status =
-            detail::cuda_alloc_device_buffer(slot.device.scratch, 4U * sizeof(float));
+    if (const MmseStatus status = detail::cuda_alloc_device_buffer(
+            slot.device.scratch, detail::kCudaScratchFloatCount * sizeof(float));
         status != MmseStatus::kOk) {
         return status;
     }
@@ -477,8 +550,13 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& 
     slot.grid_meta.n_layers = 0;
     slot.grid_meta.n_tx_ports = 0;
     slot.grid_meta.n_segments = 0;
+    slot.grid_meta.validation_sample_count = 0;
     std::fill_n(slot.grid_meta.output_slot_by_grid_re, detail::kCudaMaxGridRe,
                 std::numeric_limits<std::uint32_t>::max());
+    std::fill(slot.grid_meta.validation_re_slots,
+              slot.grid_meta.validation_re_slots + detail::kCudaValidationSampleCount,
+              static_cast<std::uint16_t>(0));
+    std::fill(slot.scratch_host.begin(), slot.scratch_host.end(), 0.0F);
     std::fill_n(slot.xhat_re, kOutputPlaneCount, 0.0F);
     std::fill_n(slot.xhat_im, kOutputPlaneCount, 0.0F);
     std::fill_n(slot.sinr, kOutputPlaneCount, 0.0F);
@@ -539,9 +617,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::validate_equalize_stub(const HostPinne
     if (slot.grid_meta.n_valid_re == 0U || slot.out_view.n_re_per_layer == 0U) {
         return MmseStatus::kInternalError;
     }
-    constexpr std::array<std::uint32_t, 3> kCheckRe = {0U, 17U, 255U};
-    for (std::uint32_t layer = 0; layer < slot.out_view.n_layers; ++layer) {
-        for (std::uint32_t re : kCheckRe) {
+    for (std::uint32_t sample = 0; sample < slot.grid_meta.validation_sample_count; ++sample) {
+        const std::uint32_t re = slot.grid_meta.validation_re_slots[sample];
+        for (std::uint32_t layer = 0; layer < slot.out_view.n_layers; ++layer) {
             if (re >= slot.out_view.n_re_per_layer) {
                 continue;
             }
@@ -551,12 +629,32 @@ MmseStatus MmseEqualizerGpuContext::Impl::validate_equalize_stub(const HostPinne
                 !std::isfinite(slot.sinr[idx])) {
                 return MmseStatus::kInternalError;
             }
-            if (layer == 0U && re == 0U &&
-                std::abs(slot.scratch_host[0] - static_cast<float>(re)) > 1.0F) {
-                return MmseStatus::kInternalError;
-            }
             if (!(slot.sinr[idx] > 0.0F)) {
                 return MmseStatus::kInternalError;
+            }
+            if constexpr (!kEnableDeepCudaStubValidation) {
+                continue;
+            }
+            if (slot.grid_meta.n_layers == 2U) {
+                continue;
+            }
+            const float ref_re = slot.ref_xhat_re[idx];
+            const float ref_im = slot.ref_xhat_im[idx];
+            const float ref_sinr = slot.ref_sinr[idx];
+            if (!nearly_equal(slot.xhat_re[idx], ref_re, 5.0e-2F, 1.0e-4F) ||
+                !nearly_equal(slot.xhat_im[idx], ref_im, 5.0e-2F, 1.0e-4F) ||
+                !nearly_equal(slot.sinr[idx], ref_sinr, 7.0e-2F, 1.0e-4F)) {
+                return MmseStatus::kInternalError;
+            }
+        }
+    }
+    if constexpr (kEnableDeepCudaStubValidation) {
+        if (slot.grid_meta.n_layers == 2U) {
+            for (std::uint32_t sample = 0; sample < slot.grid_meta.validation_sample_count;
+                 ++sample) {
+                if (compare_equalize_trace_sample(slot, sample) != MmseStatus::kOk) {
+                    return MmseStatus::kInternalError;
+                }
             }
         }
     }
@@ -570,14 +668,6 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         return MmseStatus::kUnsupportedConfig;
     }
 
-    const MmseStatus cpu_status = cpu_fallback.run(slot.grid_view, desc, slot.out_view);
-    if (cpu_status != MmseStatus::kOk) {
-        return cpu_status;
-    }
-    slot.cpu_seeded = true;
-    std::copy_n(slot.xhat_re, kOutputPlaneCount, slot.ref_xhat_re.data());
-    std::copy_n(slot.xhat_im, kOutputPlaneCount, slot.ref_xhat_im.data());
-    std::copy_n(slot.sinr, kOutputPlaneCount, slot.ref_sinr.data());
     detail::build_data_re_layout(desc, slot.layout);
     slot.grid_meta.n_valid_re = slot.layout.n_re;
     slot.grid_meta.first_valid_grid_idx = slot.layout.n_re == 0U ? 0U : slot.layout.grid_indices[0];
@@ -587,8 +677,34 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     slot.grid_meta.n_tx_ports = desc.n_tx_ports;
     slot.grid_meta.n_segments = slot.layout.n_segments;
     slot.grid_meta.sigma2 = config.sigma2_min;
+    slot.grid_meta.det_floor = config.det_floor;
     slot.grid_meta.g_min = config.g_min;
     slot.grid_meta.gamma_max = config.gamma_max;
+    std::array<std::uint32_t, detail::kCudaValidationSampleCount> validation_re_slots{};
+    slot.grid_meta.validation_sample_count = detail::build_validation_re_samples(
+        slot.layout, desc.start_symbol, slot.grid_meta.n_symbols, slot.grid_meta.n_subcarriers,
+        validation_re_slots.data(), detail::kCudaValidationSampleCount);
+    for (std::uint32_t i = 0; i < slot.grid_meta.validation_sample_count; ++i) {
+        slot.grid_meta.validation_re_slots[i] = static_cast<std::uint16_t>(validation_re_slots[i]);
+    }
+    if constexpr (kEnableDeepCudaStubValidation) {
+        const MmseStatus cpu_status = cpu_fallback.run(slot.grid_view, desc, slot.out_view);
+        if (cpu_status != MmseStatus::kOk) {
+            return cpu_status;
+        }
+        slot.cpu_seeded = true;
+        std::copy_n(slot.xhat_re, kOutputPlaneCount, slot.ref_xhat_re.data());
+        std::copy_n(slot.xhat_im, kOutputPlaneCount, slot.ref_xhat_im.data());
+        std::copy_n(slot.sinr, kOutputPlaneCount, slot.ref_sinr.data());
+    } else {
+        slot.cpu_seeded = false;
+        std::fill(slot.ref_xhat_re.begin(), slot.ref_xhat_re.end(), 0.0F);
+        std::fill(slot.ref_xhat_im.begin(), slot.ref_xhat_im.end(), 0.0F);
+        std::fill(slot.ref_sinr.begin(), slot.ref_sinr.end(), 0.0F);
+        slot.out_view.n_re_per_layer = slot.layout.n_re;
+        slot.out_view.n_layers = desc.n_layers;
+        slot.out_view.mod_order = desc.mod_order;
+    }
     std::copy_n(slot.layout.grid_indices.begin(), detail::kCudaMaxDataRe,
                 slot.grid_meta.grid_indices);
     std::copy_n(slot.layout.output_slot_by_grid_re.begin(), detail::kCudaMaxGridRe,
@@ -624,13 +740,6 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     }
     slot.h2d_submitted = true;
 
-    if (const MmseStatus status = detail::cuda_copy_outputs_h2d_async(
-            slot.device, slot.xhat_re, slot.xhat_im, slot.sinr, slot.xhat_plane_bytes,
-            slot.sinr_plane_bytes, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-
     const std::uint32_t completion_value = static_cast<std::uint32_t>(slot.sequence & 0xFFFFFFFFU);
     if (const MmseStatus status =
             detail::cuda_launch_estimate_stub(slot.device, slot.stream_handle);
@@ -638,14 +747,6 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         return status;
     }
     slot.kernel_submitted = true;
-
-    if (const MmseStatus status = detail::cuda_copy_outputs_d2h_async(
-            slot.device, slot.xhat_re, slot.xhat_im, slot.sinr, slot.xhat_plane_bytes,
-            slot.sinr_plane_bytes, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    slot.d2h_submitted = true;
 
     if (const MmseStatus status = detail::cuda_copy_estimate_d2h_async(
             slot.device, slot.h_estimate, slot.estimate_bytes, slot.stream_handle);
@@ -658,27 +759,14 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         status != MmseStatus::kOk) {
         return status;
     }
-    if (const MmseStatus status = detail::cuda_copy_scratch_d2h_async(
-            slot.device, slot.scratch_host.data(), slot.scratch_host.size() * sizeof(float),
-            slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-
-    if (const MmseStatus status = detail::cuda_copy_completion_d2h_async(
-            slot.device, slot.completion_value, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
     if (const MmseStatus status = detail::cuda_stream_synchronize(slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
     slot.grid_meta.sigma2 = detail::update_sigma2_state(
         sigma2_by_cell[desc.cell_id], sigma2_estimate, make_cpu_fallback_config(config));
-    if (const MmseStatus status = detail::cuda_copy_grid_h2d_async(
-            slot.device, slot.transport_re, slot.transport_im, slot.grid_scale, slot.grid_meta,
-            slot.grid_plane_bytes, slot.stream_handle);
+    if (const MmseStatus status =
+            detail::cuda_copy_grid_meta_h2d_async(slot.device, slot.grid_meta, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
@@ -688,8 +776,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         status != MmseStatus::kOk) {
         return status;
     }
-    if (const MmseStatus status =
-            detail::cuda_launch_equalize_stub(slot.device, completion_value, slot.stream_handle);
+    if (const MmseStatus status = detail::cuda_launch_equalize_stub(
+            slot.device, slot.grid_meta.n_valid_re, completion_value, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
@@ -699,6 +787,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         status != MmseStatus::kOk) {
         return status;
     }
+    slot.d2h_submitted = true;
     if (const MmseStatus status = detail::cuda_copy_scratch_d2h_async(
             slot.device, slot.scratch_host.data(), slot.scratch_host.size() * sizeof(float),
             slot.stream_handle);
@@ -714,11 +803,20 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         status != MmseStatus::kOk) {
         return status;
     }
-    if (const MmseStatus status = validate_estimate_stub(desc, slot); status != MmseStatus::kOk) {
-        return status;
-    }
-    if (const MmseStatus status = validate_equalize_stub(slot); status != MmseStatus::kOk) {
-        return status;
+    if constexpr (kEnableDeepCudaStubValidation) {
+        if (desc.n_layers == 2U) {
+            if (const MmseStatus status = validate_estimate_stub(desc, slot);
+                status != MmseStatus::kOk) {
+                return status;
+            }
+            if (const MmseStatus status = validate_equalize_stub(slot); status != MmseStatus::kOk) {
+                return status;
+            }
+        }
+    } else {
+        if (const MmseStatus status = validate_equalize_stub(slot); status != MmseStatus::kOk) {
+            return status;
+        }
     }
     if (!(slot.scratch_host[3] >= config.sigma2_min)) {
         return MmseStatus::kInternalError;
@@ -843,7 +941,10 @@ MmseStatus MmseEqualizerGpuContext::run(const PlanarGridViewF32& grid,
     if (const MmseStatus status = impl_->execute_backend(desc); status != MmseStatus::kOk) {
         return status;
     }
-    return impl_->stage_outputs(out);
+    if (const MmseStatus status = impl_->stage_outputs(out); status != MmseStatus::kOk) {
+        return status;
+    }
+    return MmseStatus::kOk;
 }
 
 } // namespace mmse
