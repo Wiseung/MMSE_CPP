@@ -38,6 +38,22 @@ endif()
 
 target_compile_definitions(mmse_cpp PRIVATE NOMINMAX)
 
+include(GNUInstallDirs)
+
+install(TARGETS mmse_cpp
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+install(FILES README.md
+    DESTINATION .
+)
+
 if(MMSE_BUILD_TESTS)
     enable_testing()
 
@@ -45,10 +61,16 @@ if(MMSE_BUILD_TESTS)
     target_link_libraries(mmse_tests PRIVATE mmse_cpp)
     target_include_directories(mmse_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME mmse_tests COMMAND mmse_tests)
+    install(TARGETS mmse_tests
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
 endif()
 
 if(MMSE_BUILD_BENCH)
     add_executable(mmse_bench bench/mmse_bench.cpp)
     target_link_libraries(mmse_bench PRIVATE mmse_cpp)
     target_include_directories(mmse_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    install(TARGETS mmse_bench
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
 endif()
