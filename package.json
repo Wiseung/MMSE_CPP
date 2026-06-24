@@ -1,0 +1,25 @@
+{
+  "name": "mmse-cpp",
+  "private": true,
+  "packageManager": "npm@11.3.0",
+  "scripts": {
+    "prepare": "husky",
+    "precommit:staged": "lint-staged",
+    "precommit:verify": "python scripts/precommit_smoke.py",
+    "format:cpp": "python scripts/run_clang_format.py --all",
+    "format:docs": "prettier --write \"**/*.{md,json,yml,yaml}\""
+  },
+  "lint-staged": {
+    "*.{c,cc,cpp,cxx,h,hpp,hh}": [
+      "python scripts/run_clang_format.py"
+    ],
+    "*.{md,json,yml,yaml}": [
+      "prettier --write"
+    ]
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.6",
+    "prettier": "^3.6.2"
+  }
+}

@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+set -e
+
+npm run precommit:staged
+python scripts/precommit_smoke.py
