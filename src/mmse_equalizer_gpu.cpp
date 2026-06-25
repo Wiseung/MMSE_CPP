@@ -65,6 +65,7 @@ struct MmseEqualizerGpuContext::Impl {
         std::uint32_t stream_ordinal = 0;
         std::uintptr_t stream_handle = 0;
         std::uintptr_t gpu_event_stream_start = 0;
+        std::uintptr_t gpu_event_residual_done = 0;
         std::uintptr_t gpu_event_estimate_done = 0;
         std::uintptr_t gpu_event_equalize_done = 0;
         std::uintptr_t gpu_event_stream_done = 0;
@@ -259,6 +260,7 @@ void MmseEqualizerGpuContext::Impl::release_runtime_state() {
         detail::cuda_free_device_buffer(slot.device.sinr);
         detail::cuda_free_device_buffer(slot.device.completion);
         detail::cuda_destroy_event(slot.gpu_event_stream_start);
+        detail::cuda_destroy_event(slot.gpu_event_residual_done);
         detail::cuda_destroy_event(slot.gpu_event_estimate_done);
         detail::cuda_destroy_event(slot.gpu_event_equalize_done);
         detail::cuda_destroy_event(slot.gpu_event_stream_done);
@@ -275,6 +277,7 @@ void MmseEqualizerGpuContext::Impl::release_runtime_state() {
         slot.stream_ordinal = 0;
         slot.stream_handle = 0;
         slot.gpu_event_stream_start = 0;
+        slot.gpu_event_residual_done = 0;
         slot.gpu_event_estimate_done = 0;
         slot.gpu_event_equalize_done = 0;
         slot.gpu_event_stream_done = 0;
@@ -500,6 +503,10 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_device_buffers(HostPin
         status != MmseStatus::kOk) {
         return status;
     }
+    if (const MmseStatus status = detail::cuda_create_event(slot.gpu_event_residual_done);
+        status != MmseStatus::kOk) {
+        return status;
+    }
     if (const MmseStatus status = detail::cuda_create_event(slot.gpu_event_estimate_done);
         status != MmseStatus::kOk) {
         return status;
@@ -707,6 +714,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     last_host_profile.completion_d2h_us = 0.0;
     last_host_profile.final_sync_us = 0.0;
     last_host_profile.estimate_gpu_us = 0.0;
+    last_host_profile.estimate_residual_gpu_us = 0.0;
+    last_host_profile.estimate_channel_gpu_us = 0.0;
     last_host_profile.equalize_gpu_us = 0.0;
     last_host_profile.stream_gpu_us = 0.0;
 
@@ -812,8 +821,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
 
     const std::uint32_t completion_value = static_cast<std::uint32_t>(slot.sequence & 0xFFFFFFFFU);
     const Clock::time_point estimate_launch_start = Clock::now();
-    if (const MmseStatus status =
-            detail::cuda_launch_estimate_stub(slot.device, slot.stream_handle);
+    if (const MmseStatus status = detail::cuda_launch_estimate_stub(slot.device, slot.stream_handle,
+                                                                    slot.gpu_event_residual_done);
         status != MmseStatus::kOk) {
         return status;
     }
@@ -907,6 +916,10 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         return status;
     }
     last_host_profile.final_sync_us = elapsed_us(final_sync_start, Clock::now());
+    (void)detail::cuda_event_elapsed_us(slot.gpu_event_stream_start, slot.gpu_event_residual_done,
+                                        last_host_profile.estimate_residual_gpu_us);
+    (void)detail::cuda_event_elapsed_us(slot.gpu_event_residual_done, slot.gpu_event_estimate_done,
+                                        last_host_profile.estimate_channel_gpu_us);
     (void)detail::cuda_event_elapsed_us(slot.gpu_event_stream_start, slot.gpu_event_estimate_done,
                                         last_host_profile.estimate_gpu_us);
     (void)detail::cuda_event_elapsed_us(slot.gpu_event_estimate_done, slot.gpu_event_equalize_done,

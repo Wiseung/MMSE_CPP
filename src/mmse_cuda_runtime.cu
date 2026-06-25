@@ -728,7 +728,8 @@ MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers,
 }
 
 MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
-                                     std::uintptr_t stream_handle) {
+                                     std::uintptr_t stream_handle,
+                                     std::uintptr_t residual_done_event_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     if (buffers.h_estimate == nullptr || buffers.scratch == nullptr) {
         return MmseStatus::kInternalError;
@@ -759,6 +760,13 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
         residual_count);
     if (const cudaError_t residual_status = cudaGetLastError(); residual_status != cudaSuccess) {
         return map_cuda_error(residual_status);
+    }
+    if (residual_done_event_handle != 0U) {
+        if (const cudaError_t status =
+                cudaEventRecord(reinterpret_cast<cudaEvent_t>(residual_done_event_handle), stream);
+            status != cudaSuccess) {
+            return map_cuda_error(status);
+        }
     }
 
     const std::uint32_t total_h = kLteNumTxPortsV1 * kLteNumRxAntV1 * kLteNumSymbolsNormalCp *

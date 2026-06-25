@@ -97,6 +97,8 @@ struct HostPhaseSummary {
     double output_stage_us = 0.0;
     double total_host_us = 0.0;
     double estimate_gpu_us = 0.0;
+    double estimate_residual_gpu_us = 0.0;
+    double estimate_channel_gpu_us = 0.0;
     double equalize_gpu_us = 0.0;
     double stream_gpu_us = 0.0;
 };
@@ -367,6 +369,8 @@ TimedRun run_subframe_window(MmseEqualizerGpuContext& ctx, const std::vector<Sub
             host_summary->output_stage_us += snapshot.output_stage_us;
             host_summary->total_host_us += snapshot.total_host_us;
             host_summary->estimate_gpu_us += snapshot.estimate_gpu_us;
+            host_summary->estimate_residual_gpu_us += snapshot.estimate_residual_gpu_us;
+            host_summary->estimate_channel_gpu_us += snapshot.estimate_channel_gpu_us;
             host_summary->equalize_gpu_us += snapshot.equalize_gpu_us;
             host_summary->stream_gpu_us += snapshot.stream_gpu_us;
         }
@@ -781,6 +785,10 @@ int main(int argc, char** argv) {
               << '\n';
     std::cout << "host.phase.estimate_gpu_us=" << (host_phase_10ms.estimate_gpu_us / host_divisor)
               << '\n';
+    std::cout << "host.phase.estimate_residual_gpu_us="
+              << (host_phase_10ms.estimate_residual_gpu_us / host_divisor) << '\n';
+    std::cout << "host.phase.estimate_channel_gpu_us="
+              << (host_phase_10ms.estimate_channel_gpu_us / host_divisor) << '\n';
     std::cout << "host.phase.equalize_gpu_us=" << (host_phase_10ms.equalize_gpu_us / host_divisor)
               << '\n';
     std::cout << "host.phase.stream_gpu_us=" << (host_phase_10ms.stream_gpu_us / host_divisor)

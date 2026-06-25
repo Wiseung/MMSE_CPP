@@ -91,7 +91,7 @@ MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers&, const float*, c
     return MmseStatus::kUnsupportedConfig;
 }
 
-MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers&, std::uintptr_t) {
+MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers&, std::uintptr_t, std::uintptr_t) {
     return MmseStatus::kUnsupportedConfig;
 }
 

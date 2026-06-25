@@ -132,8 +132,8 @@ MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers, const f
                                        std::size_t xhat_plane_bytes, std::size_t sinr_plane_bytes,
                                        std::uintptr_t stream_handle);
 
-MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
-                                     std::uintptr_t stream_handle);
+MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers, std::uintptr_t stream_handle,
+                                     std::uintptr_t residual_done_event_handle = 0);
 MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers, std::uint32_t n_valid_re,
                                      std::uint32_t completion_value, std::uintptr_t stream_handle);
 
