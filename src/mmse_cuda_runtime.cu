@@ -298,6 +298,18 @@ __global__ void finalize_sigma2_kernel(const CudaGridMeta* grid_meta,
     }
 }
 
+__global__ void zero_estimate_accumulators_kernel(float* sigma2_accum_out,
+                                                  std::uint32_t* residual_count_out) {
+    if (threadIdx.x == 0U && blockIdx.x == 0U) {
+        if (sigma2_accum_out != nullptr) {
+            *sigma2_accum_out = 0.0F;
+        }
+        if (residual_count_out != nullptr) {
+            *residual_count_out = 0U;
+        }
+    }
+}
+
 __global__ void equalize_stub_kernel(const float* grid_re0,
                                      const float* grid_re1,
                                      const float* grid_im0,
@@ -734,20 +746,12 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
     if (buffers.h_estimate == nullptr || buffers.scratch == nullptr) {
         return MmseStatus::kInternalError;
     }
-    float zero_sigma2 = 0.0F;
-    std::uint32_t zero_count = 0U;
     float* sigma2_accum = reinterpret_cast<float*>(buffers.scratch);
     std::uint32_t* residual_count =
         reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::byte*>(buffers.scratch) + sizeof(float));
-    if (const cudaError_t status =
-            cudaMemcpyAsync(sigma2_accum, &zero_sigma2, sizeof(zero_sigma2), cudaMemcpyHostToDevice, stream);
-        status != cudaSuccess) {
-        return map_cuda_error(status);
-    }
-    if (const cudaError_t status =
-            cudaMemcpyAsync(residual_count, &zero_count, sizeof(zero_count), cudaMemcpyHostToDevice, stream);
-        status != cudaSuccess) {
-        return map_cuda_error(status);
+    zero_estimate_accumulators_kernel<<<1, 1, 0, stream>>>(sigma2_accum, residual_count);
+    if (const cudaError_t zero_status = cudaGetLastError(); zero_status != cudaSuccess) {
+        return map_cuda_error(zero_status);
     }
 
     estimate_residual_kernel<<<kEstimateResidualBlocks, kEstimateThreadsPerBlock, 0, stream>>>(
