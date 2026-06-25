@@ -949,6 +949,72 @@ void test_gpu_context_device_owned_sigma2_state_persists() {
 #endif
 }
 
+void test_gpu_context_device_owned_sigma2_tracks_cell_id() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext host_gpu;
+    MmseEqualizerGpuContext device_gpu;
+
+    MmseEqualizerGpuConfig host_cfg{};
+    host_cfg.backend = MmseGpuBackend::kCuda;
+    host_cfg.sigma2_iir_alpha = 0.5F;
+    host_cfg.sigma2_min = 1.0e-6F;
+    host_cfg.sigma2_ownership = MmseGpuSigma2Ownership::kHostOwnedIir;
+    host_cfg.validation_policy = MmseGpuValidationPolicy::kReleaseSanity;
+
+    MmseEqualizerGpuConfig device_cfg = host_cfg;
+    device_cfg.sigma2_ownership = MmseGpuSigma2Ownership::kDeviceOwnedState;
+
+    expect_true(host_gpu.init(host_cfg) == MmseStatus::kOk, "host-owned multi-cell init");
+    expect_true(device_gpu.init(device_cfg) == MmseStatus::kOk, "device-owned multi-cell init");
+
+    auto desc0 = make_fullband_desc();
+    auto desc1 = make_fullband_desc();
+    desc1.cell_id = 1U;
+
+    GridBuffers clean0 = make_zero_grid();
+    fill_identity_channel(clean0, desc0, 1.0F, 1.0F);
+    auto clean_grid0 = make_grid_view(clean0);
+
+    GridBuffers noisy0 = clean0;
+    for (std::size_t i = 0; i < noisy0.re[0].size(); i += 17U) {
+        noisy0.re[0][i] += 0.2F;
+        noisy0.im[1][i] -= 0.1F;
+    }
+    auto noisy_grid0 = make_grid_view(noisy0);
+
+    GridBuffers clean1 = make_zero_grid();
+    fill_identity_channel(clean1, desc1, 1.0F, 1.0F);
+    auto clean_grid1 = make_grid_view(clean1);
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> host_re(cap * 2U);
+    std::vector<float> host_im(cap * 2U);
+    std::vector<float> host_sinr(cap * 2U);
+    std::vector<float> device_re(cap * 2U);
+    std::vector<float> device_im(cap * 2U);
+    std::vector<float> device_sinr(cap * 2U);
+    EqualizerOutputView host_out{host_re.data(), host_im.data(), host_sinr.data(), cap};
+    EqualizerOutputView device_out{device_re.data(), device_im.data(), device_sinr.data(), cap};
+
+    expect_true(host_gpu.run(noisy_grid0, desc0, host_out) == MmseStatus::kOk,
+                "host-owned noisy cell0");
+    expect_true(device_gpu.run(noisy_grid0, desc0, device_out) == MmseStatus::kOk,
+                "device-owned noisy cell0");
+
+    expect_true(host_gpu.run(clean_grid1, desc1, host_out) == MmseStatus::kOk,
+                "host-owned clean cell1");
+    expect_true(device_gpu.run(clean_grid1, desc1, device_out) == MmseStatus::kOk,
+                "device-owned clean cell1");
+    expect_gpu_matches_cpu_samples(desc1, device_out, host_out, "device-owned cell1");
+
+    expect_true(host_gpu.run(clean_grid0, desc0, host_out) == MmseStatus::kOk,
+                "host-owned clean cell0");
+    expect_true(device_gpu.run(clean_grid0, desc0, device_out) == MmseStatus::kOk,
+                "device-owned clean cell0");
+    expect_gpu_matches_cpu_samples(desc0, device_out, host_out, "device-owned cell0");
+#endif
+}
+
 void test_gpu_context_invalid_stream_count_is_rejected() {
     MmseEqualizerGpuContext gpu;
     MmseEqualizerGpuConfig config{};
@@ -991,6 +1057,8 @@ int main() {
                   &test_gpu_context_host_owned_and_device_owned_sigma2_match_samples},
         std::pair{"gpu_context_device_owned_sigma2_state_persists",
                   &test_gpu_context_device_owned_sigma2_state_persists},
+        std::pair{"gpu_context_device_owned_sigma2_tracks_cell_id",
+                  &test_gpu_context_device_owned_sigma2_tracks_cell_id},
         std::pair{"gpu_context_invalid_stream_count_is_rejected",
                   &test_gpu_context_invalid_stream_count_is_rejected},
     };

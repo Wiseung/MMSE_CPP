@@ -57,7 +57,6 @@ struct MmseEqualizerGpuContext::Impl {
         std::uint32_t active_device_ordinal = 0;
         bool selection_ready = false;
         bool cuda_runtime_available = false;
-        bool sigma2_state_seeded = false;
         std::vector<StreamState> streams{};
     };
 
@@ -321,7 +320,6 @@ MmseStatus MmseEqualizerGpuContext::Impl::configure_device_state() {
     device.active_device_ordinal = config.device_ordinal;
     device.selection_ready = true;
     device.cuda_runtime_available = false;
-    device.sigma2_state_seeded = false;
     device.streams.clear();
 
     const bool request_cuda_runtime = (config.backend == MmseGpuBackend::kCuda);
@@ -766,13 +764,14 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     last_host_profile.grid_h2d_us = elapsed_us(grid_h2d_start, Clock::now());
     slot.h2d_submitted = true;
 
-    if (use_device_owned_sigma2(config) && !device.sigma2_state_seeded) {
-        if (const MmseStatus status = detail::cuda_copy_sigma2_h2d_async(
-                slot.device, config.sigma2_min, slot.stream_handle);
+    if (use_device_owned_sigma2(config)) {
+        const detail::Sigma2State& sigma2_state = sigma2_by_cell[desc.cell_id];
+        const float sigma2_seed = sigma2_state.initialized ? sigma2_state.value : 0.0F;
+        if (const MmseStatus status =
+                detail::cuda_copy_sigma2_h2d_async(slot.device, sigma2_seed, slot.stream_handle);
             status != MmseStatus::kOk) {
             return status;
         }
-        device.sigma2_state_seeded = true;
     }
 
     const std::uint32_t completion_value = static_cast<std::uint32_t>(slot.sequence & 0xFFFFFFFFU);
@@ -859,6 +858,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     last_host_profile.final_sync_us = elapsed_us(final_sync_start, Clock::now());
     if (use_device_owned_sigma2(config)) {
         slot.grid_meta.sigma2 = slot.scratch_host[3];
+        detail::Sigma2State& sigma2_state = sigma2_by_cell[desc.cell_id];
+        sigma2_state.value = slot.grid_meta.sigma2;
+        sigma2_state.initialized = true;
     }
 
     if (deep_validation_enabled()) {
