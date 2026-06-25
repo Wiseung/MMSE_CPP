@@ -749,7 +749,54 @@ void test_gpu_context_cuda_two_layer_matches_cpu_context_samples() {
 #endif
 }
 
-void test_gpu_context_cuda_transport_quantization_preserves_small_signal() {
+void test_gpu_context_cuda_two_layer_deep_trace_matches_cpu_context_samples() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kCuda;
+    gpu_config.sigma2_min = 1.0e-3F;
+    gpu_config.det_floor = 1.0e-6F;
+    gpu_config.g_min = 1.0e-4F;
+    gpu_config.gamma_max = 1.0e4F;
+    gpu_config.validation_policy = MmseGpuValidationPolicy::kTestDeepTrace;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "gpu deep-trace cuda init should succeed");
+
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1;
+    cpu_config.sigma2_min = gpu_config.sigma2_min;
+    cpu_config.det_floor = gpu_config.det_floor;
+    cpu_config.g_min = gpu_config.g_min;
+    cpu_config.gamma_max = gpu_config.gamma_max;
+    cpu_config.backend = MmseCpuBackend::kScalar;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "cpu scalar init should succeed");
+
+    auto desc = make_fullband_desc();
+    GridBuffers buffers = make_zero_grid();
+    const TwoLayerCase c = make_two_layer_case();
+    fill_constant_mimo_channel(buffers, desc, c.h00, c.h01, c.h10, c.h11, c.x0, c.x1);
+    auto grid = make_grid_view(buffers);
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> cpu_re(cap * 2U);
+    std::vector<float> cpu_im(cap * 2U);
+    std::vector<float> cpu_sinr(cap * 2U);
+    std::vector<float> gpu_re(cap * 2U);
+    std::vector<float> gpu_im(cap * 2U);
+    std::vector<float> gpu_sinr(cap * 2U);
+    EqualizerOutputView cpu_out{cpu_re.data(), cpu_im.data(), cpu_sinr.data(), cap};
+    EqualizerOutputView gpu_out{gpu_re.data(), gpu_im.data(), gpu_sinr.data(), cap};
+
+    expect_true(cpu.run(grid, desc, cpu_out) == MmseStatus::kOk, "cpu scalar run");
+    expect_true(gpu.run(grid, desc, gpu_out) == MmseStatus::kOk, "gpu deep-trace cuda run");
+    expect_true(cpu_out.n_re_per_layer == gpu_out.n_re_per_layer, "gpu deep-trace RE count");
+    expect_true(cpu_out.n_layers == gpu_out.n_layers, "gpu deep-trace layer count");
+    expect_true(cpu_out.mod_order == gpu_out.mod_order, "gpu deep-trace mod order");
+    expect_gpu_matches_cpu_samples(desc, gpu_out, cpu_out, "gpu deep-trace cuda");
+#endif
+}
+
+void test_gpu_context_cuda_float_transport_preserves_small_signal() {
 #if MMSE_CUDA_ENABLED
     MmseEqualizerGpuContext gpu;
     MmseEqualizerGpuConfig gpu_config{};
@@ -779,8 +826,8 @@ void test_gpu_context_cuda_transport_quantization_preserves_small_signal() {
 
     expect_true(cpu.run(grid, desc, cpu_out) == MmseStatus::kOk, "cpu run");
     expect_true(gpu.run(grid, desc, gpu_out) == MmseStatus::kOk, "gpu run");
-    expect_near(gpu_re[0], cpu_re[0], 1.0e-4F, "gpu quantized transport xhat real");
-    expect_near(gpu_im[0], cpu_im[0], 1.0e-4F, "gpu quantized transport xhat imag");
+    expect_near(gpu_re[0], cpu_re[0], 1.0e-4F, "gpu float transport xhat real");
+    expect_near(gpu_im[0], cpu_im[0], 1.0e-4F, "gpu float transport xhat imag");
 #endif
 }
 
@@ -821,6 +868,87 @@ void test_gpu_context_sigma2_state_persists() {
 #endif
 }
 
+void test_gpu_context_host_owned_and_device_owned_sigma2_match_samples() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuConfig host_cfg{};
+    host_cfg.backend = MmseGpuBackend::kCuda;
+    host_cfg.sigma2_min = 1.0e-3F;
+    host_cfg.det_floor = 1.0e-6F;
+    host_cfg.g_min = 1.0e-4F;
+    host_cfg.gamma_max = 1.0e4F;
+    host_cfg.sigma2_ownership = MmseGpuSigma2Ownership::kHostOwnedIir;
+    host_cfg.validation_policy = MmseGpuValidationPolicy::kReleaseSanity;
+
+    MmseEqualizerGpuConfig device_cfg = host_cfg;
+    device_cfg.sigma2_ownership = MmseGpuSigma2Ownership::kDeviceOwnedState;
+
+    MmseEqualizerGpuContext host_gpu;
+    MmseEqualizerGpuContext device_gpu;
+    expect_true(host_gpu.init(host_cfg) == MmseStatus::kOk, "host-owned gpu init");
+    expect_true(device_gpu.init(device_cfg) == MmseStatus::kOk, "device-owned gpu init");
+
+    auto desc = make_fullband_desc();
+    GridBuffers buffers = make_zero_grid();
+    const TwoLayerCase c = make_two_layer_case();
+    fill_constant_mimo_channel(buffers, desc, c.h00, c.h01, c.h10, c.h11, c.x0, c.x1);
+    auto grid = make_grid_view(buffers);
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> host_re(cap * 2U);
+    std::vector<float> host_im(cap * 2U);
+    std::vector<float> host_sinr(cap * 2U);
+    std::vector<float> device_re(cap * 2U);
+    std::vector<float> device_im(cap * 2U);
+    std::vector<float> device_sinr(cap * 2U);
+    EqualizerOutputView host_out{host_re.data(), host_im.data(), host_sinr.data(), cap};
+    EqualizerOutputView device_out{device_re.data(), device_im.data(), device_sinr.data(), cap};
+
+    expect_true(host_gpu.run(grid, desc, host_out) == MmseStatus::kOk, "host-owned gpu run");
+    expect_true(device_gpu.run(grid, desc, device_out) == MmseStatus::kOk, "device-owned gpu run");
+    expect_true(host_out.n_re_per_layer == device_out.n_re_per_layer, "ownership RE count");
+    expect_true(host_out.n_layers == device_out.n_layers, "ownership layer count");
+    expect_gpu_matches_cpu_samples(desc, device_out, host_out, "sigma2 ownership compare");
+#endif
+}
+
+void test_gpu_context_device_owned_sigma2_state_persists() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig config{};
+    config.backend = MmseGpuBackend::kCuda;
+    config.sigma2_iir_alpha = 0.5F;
+    config.sigma2_min = 1.0e-6F;
+    config.sigma2_ownership = MmseGpuSigma2Ownership::kDeviceOwnedState;
+    config.validation_policy = MmseGpuValidationPolicy::kReleaseSanity;
+    expect_true(gpu.init(config) == MmseStatus::kOk, "device-owned sigma2 init should succeed");
+
+    auto desc = make_fullband_desc();
+    GridBuffers clean = make_zero_grid();
+    fill_identity_channel(clean, desc, 1.0F, 1.0F);
+    auto clean_grid = make_grid_view(clean);
+
+    GridBuffers noisy = clean;
+    for (std::size_t i = 0; i < noisy.re[0].size(); i += 17U) {
+        noisy.re[0][i] += 0.2F;
+        noisy.im[1][i] -= 0.1F;
+    }
+    auto noisy_grid = make_grid_view(noisy);
+
+    const std::uint32_t cap = 20000U;
+    std::vector<float> xre(cap * 2U);
+    std::vector<float> xim(cap * 2U);
+    std::vector<float> sinr(cap * 2U);
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
+
+    expect_true(gpu.run(noisy_grid, desc, out) == MmseStatus::kOk, "device-owned noisy run");
+    const float sinr_noisy = out.sinr[0];
+    expect_true(gpu.run(clean_grid, desc, out) == MmseStatus::kOk, "device-owned clean run");
+    const float sinr_after = out.sinr[0];
+    expect_true(sinr_after < 1.0e6F, "device-owned clamped finite sinr");
+    expect_true(sinr_after > sinr_noisy, "device-owned cleaner second pass should improve sinr");
+#endif
+}
+
 void test_gpu_context_invalid_stream_count_is_rejected() {
     MmseEqualizerGpuContext gpu;
     MmseEqualizerGpuConfig config{};
@@ -854,9 +982,15 @@ int main() {
                   &test_gpu_context_auto_fallback_matches_cpu_context},
         std::pair{"gpu_context_cuda_two_layer_matches_cpu_context_samples",
                   &test_gpu_context_cuda_two_layer_matches_cpu_context_samples},
-        std::pair{"gpu_context_cuda_transport_quantization_preserves_small_signal",
-                  &test_gpu_context_cuda_transport_quantization_preserves_small_signal},
+        std::pair{"gpu_context_cuda_two_layer_deep_trace_matches_cpu_context_samples",
+                  &test_gpu_context_cuda_two_layer_deep_trace_matches_cpu_context_samples},
+        std::pair{"gpu_context_cuda_float_transport_preserves_small_signal",
+                  &test_gpu_context_cuda_float_transport_preserves_small_signal},
         std::pair{"gpu_context_sigma2_state_persists", &test_gpu_context_sigma2_state_persists},
+        std::pair{"gpu_context_host_owned_and_device_owned_sigma2_match_samples",
+                  &test_gpu_context_host_owned_and_device_owned_sigma2_match_samples},
+        std::pair{"gpu_context_device_owned_sigma2_state_persists",
+                  &test_gpu_context_device_owned_sigma2_state_persists},
         std::pair{"gpu_context_invalid_stream_count_is_rejected",
                   &test_gpu_context_invalid_stream_count_is_rejected},
     };

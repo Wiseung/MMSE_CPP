@@ -17,13 +17,12 @@ inline constexpr std::uint32_t kCudaEstimateStubFloatCount = 2U * kCudaEstimateS
 inline constexpr std::uint32_t kCudaValidationSampleCount = 12U;
 inline constexpr std::uint32_t kCudaEqualizeTraceFloatCount = 32U;
 inline constexpr std::uint32_t kCudaScratchHeaderFloatCount = 4U;
-inline constexpr std::uint32_t kCudaScratchFloatCount =
+inline constexpr std::uint32_t kCudaScratchTraceFloatCount =
     kCudaScratchHeaderFloatCount + kCudaValidationSampleCount * kCudaEqualizeTraceFloatCount;
 
 struct CudaDeviceBuffers {
     std::array<void*, 2> grid_re{};
     std::array<void*, 2> grid_im{};
-    void* grid_scale = nullptr;
     void* grid_meta = nullptr;
     void* sigma2 = nullptr;
     void* scratch = nullptr;
@@ -45,13 +44,16 @@ struct CudaGridMeta {
     std::uint32_t n_layers = 0;
     std::uint32_t n_tx_ports = 0;
     std::uint32_t n_segments = 0;
-    std::uint32_t validation_sample_count = 0;
+    std::uint32_t spot_check_sample_count = 0;
+    std::uint32_t trace_sample_count = 0;
+    std::uint32_t sigma2_device_owned = 0;
     float sigma2 = 0.0F;
+    float sigma2_iir_alpha = 0.0F;
     float det_floor = 0.0F;
     float g_min = 0.0F;
     float gamma_max = 0.0F;
     std::uint16_t grid_indices[kCudaMaxDataRe]{};
-    std::uint16_t validation_re_slots[kCudaValidationSampleCount]{};
+    std::uint16_t spot_check_re_slots[kCudaValidationSampleCount]{};
     std::uint32_t output_slot_by_grid_re[kCudaMaxGridRe]{};
     std::uint32_t prb_segment_offsets[kCudaMaxDataRe + 1]{};
     std::uint16_t prb_bitmap[7]{};
@@ -61,31 +63,64 @@ struct CudaGridMeta {
     float crs_pilot_im[kLteNumTxPortsV1][kLteNumCrsSymbols][kLteNumPilotTonesPerCrsSymbol]{};
 };
 
+struct CudaDeviceInfo {
+    std::array<char, 128> name{};
+    std::uint32_t major = 0;
+    std::uint32_t minor = 0;
+    std::uint32_t multi_processor_count = 0;
+    std::uint32_t warp_size = 0;
+    std::uint32_t max_threads_per_block = 0;
+    std::uint32_t max_threads_per_multiprocessor = 0;
+    std::uint32_t regs_per_block = 0;
+    std::uint32_t regs_per_multiprocessor = 0;
+    std::size_t shared_mem_per_block = 0;
+    std::size_t shared_mem_per_multiprocessor = 0;
+    std::size_t total_global_mem = 0;
+    std::size_t l2_cache_size = 0;
+};
+
+struct CudaKernelResourceInfo {
+    std::array<char, 64> name{};
+    std::int32_t block_size = 0;
+    std::int32_t max_threads_per_block = 0;
+    std::int32_t num_regs = 0;
+    std::size_t static_shared_bytes = 0;
+    std::size_t local_bytes = 0;
+    std::size_t const_bytes = 0;
+    std::int32_t binary_version = 0;
+    std::int32_t ptx_version = 0;
+    std::int32_t max_blocks_per_multiprocessor = 0;
+    float theoretical_occupancy = 0.0F;
+};
+
 bool cuda_backend_compiled();
 
 MmseStatus cuda_select_device(std::uint32_t device_ordinal, bool& runtime_available);
 MmseStatus cuda_create_stream(std::uintptr_t& stream_handle);
 void cuda_destroy_stream(std::uintptr_t stream_handle);
+MmseStatus cuda_query_device_info(std::uint32_t device_ordinal, CudaDeviceInfo& info);
+MmseStatus cuda_query_current_memory_info(std::size_t& free_bytes, std::size_t& total_bytes);
+MmseStatus cuda_query_estimate_kernel_resources(CudaKernelResourceInfo& info);
+MmseStatus cuda_query_equalize_kernel_resources(std::int32_t block_size,
+                                                CudaKernelResourceInfo& info);
 
 MmseStatus cuda_alloc_host_f32(float*& ptr, std::size_t count, bool request_pinned,
                                bool& pinned_allocation);
 void cuda_free_host_f32(float* ptr, bool pinned_allocation);
-MmseStatus cuda_alloc_host_i16(std::int16_t*& ptr, std::size_t count, bool request_pinned,
-                               bool& pinned_allocation);
-void cuda_free_host_i16(std::int16_t* ptr, bool pinned_allocation);
 
 MmseStatus cuda_alloc_device_buffer(void*& ptr, std::size_t bytes);
 void cuda_free_device_buffer(void* ptr);
 
 MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
-                                    const std::array<std::int16_t*, 2>& re,
-                                    const std::array<std::int16_t*, 2>& im,
-                                    const std::array<float, 2>& grid_scale,
-                                    const CudaGridMeta& grid_meta, std::size_t grid_plane_bytes,
-                                    std::uintptr_t stream_handle);
+                                    const std::array<float*, 2>& re,
+                                    const std::array<float*, 2>& im, const CudaGridMeta& grid_meta,
+                                    std::size_t grid_plane_bytes, std::uintptr_t stream_handle);
 MmseStatus cuda_copy_grid_meta_h2d_async(const CudaDeviceBuffers& buffers,
                                          const CudaGridMeta& grid_meta,
                                          std::uintptr_t stream_handle);
+
+MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers& buffers, float sigma2,
+                                      std::uintptr_t stream_handle);
 
 MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers, const float* xhat_re,
                                        const float* xhat_im, const float* sinr,
