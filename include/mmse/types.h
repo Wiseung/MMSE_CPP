@@ -26,6 +26,16 @@ enum class MmseGpuBackend : std::uint8_t {
     kCuda,
 };
 
+enum class MmseGpuSigma2Ownership : std::uint8_t {
+    kHostOwnedIir = 0,
+    kDeviceOwnedState,
+};
+
+enum class MmseGpuValidationPolicy : std::uint8_t {
+    kReleaseSanity = 0,
+    kTestDeepTrace,
+};
+
 struct PlanarGridViewF32 {
     std::array<const float*, 2> re{};
     std::array<const float*, 2> im{};
@@ -77,6 +87,27 @@ struct MmseEqualizerGpuConfig {
     float g_min = 1.0e-4F;
     float gamma_max = 1.0e4F;
     MmseGpuBackend backend = MmseGpuBackend::kAuto;
+    MmseGpuSigma2Ownership sigma2_ownership = MmseGpuSigma2Ownership::kHostOwnedIir;
+    MmseGpuValidationPolicy validation_policy = MmseGpuValidationPolicy::kReleaseSanity;
+};
+
+struct MmseGpuHostProfileSnapshot {
+    double quantize_us = 0.0;
+    double layout_build_us = 0.0;
+    double grid_meta_pack_us = 0.0;
+    double grid_h2d_us = 0.0;
+    double estimate_launch_us = 0.0;
+    double sigma2_d2h_us = 0.0;
+    double sigma2_mid_sync_us = 0.0;
+    double sigma2_host_update_us = 0.0;
+    double sigma2_h2d_us = 0.0;
+    double equalize_launch_us = 0.0;
+    double outputs_d2h_us = 0.0;
+    double scratch_d2h_us = 0.0;
+    double completion_d2h_us = 0.0;
+    double final_sync_us = 0.0;
+    double output_stage_us = 0.0;
+    double total_host_us = 0.0;
 };
 
 } // namespace mmse

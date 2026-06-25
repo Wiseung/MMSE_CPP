@@ -109,4 +109,16 @@ if(MMSE_BUILD_BENCH)
     install(TARGETS mmse_bench
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
+
+    add_executable(mmse_cuda_profile bench/mmse_cuda_profile.cpp)
+    target_link_libraries(mmse_cuda_profile PRIVATE mmse_cpp)
+    target_include_directories(mmse_cuda_profile PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(mmse_cuda_profile PRIVATE MMSE_CUDA_ENABLED=$<BOOL:${MMSE_CUDA_ENABLED}>)
+    if(MSVC)
+        target_link_libraries(mmse_cuda_profile PRIVATE Psapi)
+        target_link_options(mmse_cuda_profile PRIVATE /NODEFAULTLIB:LIBCMT)
+    endif()
+    install(TARGETS mmse_cuda_profile
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
 endif()

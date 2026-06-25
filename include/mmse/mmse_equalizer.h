@@ -33,6 +33,7 @@ class MmseEqualizerGpuContext {
     MmseStatus init(const MmseEqualizerGpuConfig& config);
     MmseStatus run(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                    EqualizerOutputView& out);
+    MmseGpuHostProfileSnapshot last_host_profile() const;
 
   private:
     struct Impl;

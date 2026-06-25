@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,14 +20,6 @@ constexpr std::uint32_t kPinnedRingSlotCount = 3U;
 constexpr std::size_t kGridPlaneCount = detail::kMaxGridRe;
 constexpr std::size_t kEstimateStubFloatCount = detail::kCudaEstimateStubFloatCount;
 constexpr std::size_t kOutputPlaneCount = detail::kMaxDataRe * 2U;
-constexpr float kGridTransportScale = 1.0F / 32767.0F;
-constexpr bool kEnableDeepCudaStubValidation = false;
-
-std::int16_t quantize_grid_sample(float value, float scale) {
-    const float scaled = value / scale;
-    const float clamped = std::clamp(scaled, -32767.0F, 32767.0F);
-    return static_cast<std::int16_t>(clamped >= 0.0F ? clamped + 0.5F : clamped - 0.5F);
-}
 
 MmseEqualizerCpuConfig make_cpu_fallback_config(const MmseEqualizerGpuConfig& config) {
     MmseEqualizerCpuConfig cpu{};
@@ -40,9 +33,19 @@ MmseEqualizerCpuConfig make_cpu_fallback_config(const MmseEqualizerGpuConfig& co
     return cpu;
 }
 
+bool use_deep_validation(const MmseEqualizerGpuConfig& config) {
+    return config.validation_policy == MmseGpuValidationPolicy::kTestDeepTrace;
+}
+
+bool use_device_owned_sigma2(const MmseEqualizerGpuConfig& config) {
+    return config.sigma2_ownership == MmseGpuSigma2Ownership::kDeviceOwnedState;
+}
+
 } // namespace
 
 struct MmseEqualizerGpuContext::Impl {
+    using Clock = std::chrono::steady_clock;
+
     struct StreamState {
         std::uint32_t ordinal = 0;
         std::uintptr_t handle = 0;
@@ -54,6 +57,7 @@ struct MmseEqualizerGpuContext::Impl {
         std::uint32_t active_device_ordinal = 0;
         bool selection_ready = false;
         bool cuda_runtime_available = false;
+        bool sigma2_state_seeded = false;
         std::vector<StreamState> streams{};
     };
 
@@ -78,15 +82,12 @@ struct MmseEqualizerGpuContext::Impl {
         std::size_t estimate_bytes = 0;
         std::size_t xhat_plane_bytes = 0;
         std::size_t sinr_plane_bytes = 0;
-        std::array<float, 2> grid_scale = {kGridTransportScale, kGridTransportScale};
         detail::CudaGridMeta grid_meta{};
         detail::ReLayout layout{};
-        std::array<float*, 2> staging_re{};
-        std::array<float*, 2> staging_im{};
-        std::array<std::int16_t*, 2> transport_re{};
-        std::array<std::int16_t*, 2> transport_im{};
+        std::array<float*, 2> transport_re{};
+        std::array<float*, 2> transport_im{};
         float* h_estimate = nullptr;
-        std::array<float, detail::kCudaScratchFloatCount> scratch_host{};
+        std::array<float, detail::kCudaScratchTraceFloatCount> scratch_host{};
         std::array<float, kOutputPlaneCount> ref_xhat_re{};
         std::array<float, kOutputPlaneCount> ref_xhat_im{};
         std::array<float, kOutputPlaneCount> ref_sinr{};
@@ -111,6 +112,8 @@ struct MmseEqualizerGpuContext::Impl {
     static bool nearly_equal(float lhs, float rhs, float rel_tol, float abs_tol);
     MmseStatus compare_equalize_trace_sample(const HostPinnedSlot& slot,
                                              std::uint32_t sample_index) const;
+    bool deep_validation_enabled() const;
+    std::size_t scratch_float_count() const;
     void reset_runtime_state();
     void release_runtime_state();
     MmseStatus configure_device_state();
@@ -124,6 +127,7 @@ struct MmseEqualizerGpuContext::Impl {
     MmseStatus execute_backend(const ExtractDescriptor& desc);
     MmseStatus execute_cuda_transport_stub(const ExtractDescriptor& desc, HostPinnedSlot& slot);
     MmseStatus stage_outputs(EqualizerOutputView& out) const;
+    static double elapsed_us(const Clock::time_point& start, const Clock::time_point& end);
 
     MmseEqualizerGpuConfig config{};
     bool initialized = false;
@@ -132,6 +136,7 @@ struct MmseEqualizerGpuContext::Impl {
     std::array<detail::Sigma2State, kLteNumCellIds> sigma2_by_cell{};
     MmseEqualizerCpuContext cpu_fallback{};
     StagingBuffers buffers{};
+    MmseGpuHostProfileSnapshot last_host_profile{};
 };
 
 MmseEqualizerGpuContext::MmseEqualizerGpuContext() : impl_(new Impl()) {}
@@ -156,14 +161,32 @@ bool MmseEqualizerGpuContext::Impl::nearly_equal(float lhs, float rhs, float rel
     return abs_err <= std::max(abs_tol, rel_tol * scale);
 }
 
+bool MmseEqualizerGpuContext::Impl::deep_validation_enabled() const {
+    return use_deep_validation(config);
+}
+
+double MmseEqualizerGpuContext::Impl::elapsed_us(const Clock::time_point& start,
+                                                 const Clock::time_point& end) {
+    return std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(end - start)
+        .count();
+}
+
+std::size_t MmseEqualizerGpuContext::Impl::scratch_float_count() const {
+    return deep_validation_enabled() ? detail::kCudaScratchTraceFloatCount
+                                     : detail::kCudaScratchHeaderFloatCount;
+}
+
 MmseStatus
 MmseEqualizerGpuContext::Impl::compare_equalize_trace_sample(const HostPinnedSlot& slot,
                                                              std::uint32_t sample_index) const {
-    if (sample_index >= slot.grid_meta.validation_sample_count) {
+    if (slot.h_estimate == nullptr) {
+        return MmseStatus::kInternalError;
+    }
+    if (sample_index >= slot.grid_meta.trace_sample_count) {
         return MmseStatus::kInvalidArgument;
     }
 
-    const std::uint32_t re = slot.grid_meta.validation_re_slots[sample_index];
+    const std::uint32_t re = slot.grid_meta.spot_check_re_slots[sample_index];
     if (re >= slot.layout.n_re) {
         return MmseStatus::kInternalError;
     }
@@ -171,10 +194,10 @@ MmseEqualizerGpuContext::Impl::compare_equalize_trace_sample(const HostPinnedSlo
     const std::uint32_t grid_idx = slot.layout.grid_indices[re];
     const std::uint32_t symbol = grid_idx / slot.grid_meta.n_subcarriers;
     const std::uint32_t sc = grid_idx % slot.grid_meta.n_subcarriers;
-    const float y0_re = static_cast<float>(slot.transport_re[0][grid_idx]) * slot.grid_scale[0];
-    const float y0_im = static_cast<float>(slot.transport_im[0][grid_idx]) * slot.grid_scale[0];
-    const float y1_re = static_cast<float>(slot.transport_re[1][grid_idx]) * slot.grid_scale[1];
-    const float y1_im = static_cast<float>(slot.transport_im[1][grid_idx]) * slot.grid_scale[1];
+    const float y0_re = slot.transport_re[0][grid_idx];
+    const float y0_im = slot.transport_im[0][grid_idx];
+    const float y1_re = slot.transport_re[1][grid_idx];
+    const float y1_im = slot.transport_im[1][grid_idx];
     const auto h_at = [&](std::uint32_t tx, std::uint32_t rx) {
         const std::size_t base =
             2U * (((tx * kLteNumRxAntV1 + rx) * kLteNumSymbolsNormalCp + symbol) *
@@ -224,7 +247,6 @@ void MmseEqualizerGpuContext::Impl::release_runtime_state() {
         detail::cuda_free_device_buffer(slot.device.grid_re[1]);
         detail::cuda_free_device_buffer(slot.device.grid_im[0]);
         detail::cuda_free_device_buffer(slot.device.grid_im[1]);
-        detail::cuda_free_device_buffer(slot.device.grid_scale);
         detail::cuda_free_device_buffer(slot.device.grid_meta);
         detail::cuda_free_device_buffer(slot.device.sigma2);
         detail::cuda_free_device_buffer(slot.device.scratch);
@@ -234,14 +256,10 @@ void MmseEqualizerGpuContext::Impl::release_runtime_state() {
         detail::cuda_free_device_buffer(slot.device.sinr);
         detail::cuda_free_device_buffer(slot.device.completion);
 
-        detail::cuda_free_host_f32(slot.staging_re[0], false);
-        detail::cuda_free_host_f32(slot.staging_re[1], false);
-        detail::cuda_free_host_f32(slot.staging_im[0], false);
-        detail::cuda_free_host_f32(slot.staging_im[1], false);
-        detail::cuda_free_host_i16(slot.transport_re[0], slot.host_grid_is_pinned);
-        detail::cuda_free_host_i16(slot.transport_re[1], slot.host_grid_is_pinned);
-        detail::cuda_free_host_i16(slot.transport_im[0], slot.host_grid_is_pinned);
-        detail::cuda_free_host_i16(slot.transport_im[1], slot.host_grid_is_pinned);
+        detail::cuda_free_host_f32(slot.transport_re[0], slot.host_grid_is_pinned);
+        detail::cuda_free_host_f32(slot.transport_re[1], slot.host_grid_is_pinned);
+        detail::cuda_free_host_f32(slot.transport_im[0], slot.host_grid_is_pinned);
+        detail::cuda_free_host_f32(slot.transport_im[1], slot.host_grid_is_pinned);
         detail::cuda_free_host_f32(slot.h_estimate, slot.host_output_is_pinned);
         detail::cuda_free_host_f32(slot.xhat_re, slot.host_output_is_pinned);
         detail::cuda_free_host_f32(slot.xhat_im, slot.host_output_is_pinned);
@@ -266,11 +284,8 @@ void MmseEqualizerGpuContext::Impl::release_runtime_state() {
         slot.estimate_bytes = 0;
         slot.xhat_plane_bytes = 0;
         slot.sinr_plane_bytes = 0;
-        slot.grid_scale = {kGridTransportScale, kGridTransportScale};
         slot.grid_meta = {};
         slot.layout = {};
-        slot.staging_re = {};
-        slot.staging_im = {};
         slot.transport_re = {};
         slot.transport_im = {};
         slot.h_estimate = nullptr;
@@ -306,6 +321,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::configure_device_state() {
     device.active_device_ordinal = config.device_ordinal;
     device.selection_ready = true;
     device.cuda_runtime_available = false;
+    device.sigma2_state_seeded = false;
     device.streams.clear();
 
     const bool request_cuda_runtime = (config.backend == MmseGpuBackend::kCuda);
@@ -343,50 +359,33 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_storage(HostPinnedSlot
     bool grid_pinned = false;
     bool output_pinned = false;
     if (const MmseStatus status =
-            detail::cuda_alloc_host_f32(slot.staging_re[0], kGridPlaneCount, false, grid_pinned);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    if (const MmseStatus status =
-            detail::cuda_alloc_host_f32(slot.staging_re[1], kGridPlaneCount, false, grid_pinned);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    if (const MmseStatus status =
-            detail::cuda_alloc_host_f32(slot.staging_im[0], kGridPlaneCount, false, grid_pinned);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    if (const MmseStatus status =
-            detail::cuda_alloc_host_f32(slot.staging_im[1], kGridPlaneCount, false, grid_pinned);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    if (const MmseStatus status =
-            detail::cuda_alloc_host_i16(slot.transport_re[0], kGridPlaneCount, true, grid_pinned);
+            detail::cuda_alloc_host_f32(slot.transport_re[0], kGridPlaneCount, true, grid_pinned);
         status != MmseStatus::kOk) {
         return status;
     }
     slot.host_grid_is_pinned = grid_pinned;
     if (const MmseStatus status =
-            detail::cuda_alloc_host_i16(slot.transport_re[1], kGridPlaneCount, true, grid_pinned);
+            detail::cuda_alloc_host_f32(slot.transport_re[1], kGridPlaneCount, true, grid_pinned);
         status != MmseStatus::kOk) {
         return status;
     }
     if (const MmseStatus status =
-            detail::cuda_alloc_host_i16(slot.transport_im[0], kGridPlaneCount, true, grid_pinned);
+            detail::cuda_alloc_host_f32(slot.transport_im[0], kGridPlaneCount, true, grid_pinned);
         status != MmseStatus::kOk) {
         return status;
     }
     if (const MmseStatus status =
-            detail::cuda_alloc_host_i16(slot.transport_im[1], kGridPlaneCount, true, grid_pinned);
+            detail::cuda_alloc_host_f32(slot.transport_im[1], kGridPlaneCount, true, grid_pinned);
         status != MmseStatus::kOk) {
         return status;
     }
-    if (const MmseStatus status = detail::cuda_alloc_host_f32(
-            slot.h_estimate, kEstimateStubFloatCount, true, output_pinned);
-        status != MmseStatus::kOk) {
-        return status;
+    if (deep_validation_enabled()) {
+        if (const MmseStatus status = detail::cuda_alloc_host_f32(
+                slot.h_estimate, kEstimateStubFloatCount, true, output_pinned);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        slot.host_output_is_pinned = output_pinned;
     }
     if (const MmseStatus status =
             detail::cuda_alloc_host_f32(slot.xhat_re, kOutputPlaneCount, true, output_pinned);
@@ -405,8 +404,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_storage(HostPinnedSlot
         return status;
     }
 
-    slot.grid_view.re = {slot.staging_re[0], slot.staging_re[1]};
-    slot.grid_view.im = {slot.staging_im[0], slot.staging_im[1]};
+    slot.grid_view.re = {slot.transport_re[0], slot.transport_re[1]};
+    slot.grid_view.im = {slot.transport_im[0], slot.transport_im[1]};
     slot.grid_view.n_rx_ant = kLteNumRxAntV1;
     slot.grid_view.n_symbols = kLteNumSymbolsNormalCp;
     slot.grid_view.n_subcarriers = kLteNumSubcarriers20MHz;
@@ -447,11 +446,6 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_device_buffers(HostPin
         status != MmseStatus::kOk) {
         return status;
     }
-    if (const MmseStatus status = detail::cuda_alloc_device_buffer(
-            slot.device.grid_scale, slot.grid_scale.size() * sizeof(float));
-        status != MmseStatus::kOk) {
-        return status;
-    }
     if (const MmseStatus status =
             detail::cuda_alloc_device_buffer(slot.device.grid_meta, sizeof(slot.grid_meta));
         status != MmseStatus::kOk) {
@@ -463,12 +457,12 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_device_buffers(HostPin
         return status;
     }
     if (const MmseStatus status = detail::cuda_alloc_device_buffer(
-            slot.device.scratch, detail::kCudaScratchFloatCount * sizeof(float));
+            slot.device.scratch, scratch_float_count() * sizeof(float));
         status != MmseStatus::kOk) {
         return status;
     }
-    if (const MmseStatus status =
-            detail::cuda_alloc_device_buffer(slot.device.h_estimate, slot.estimate_bytes);
+    if (const MmseStatus status = detail::cuda_alloc_device_buffer(
+            slot.device.h_estimate, kEstimateStubFloatCount * sizeof(float));
         status != MmseStatus::kOk) {
         return status;
     }
@@ -507,7 +501,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::configure_staging_buffers() {
         slot.stream_ordinal = device.streams.empty() ? 0U : slot_index % config.stream_count;
         slot.stream_handle =
             device.streams.empty() ? 0U : device.streams[slot.stream_ordinal].handle;
-        slot.grid_plane_bytes = kGridPlaneCount * sizeof(std::int16_t);
+        slot.grid_plane_bytes = kGridPlaneCount * sizeof(float);
         slot.estimate_bytes = kEstimateStubFloatCount * sizeof(float);
         slot.xhat_plane_bytes = kOutputPlaneCount * sizeof(float);
         slot.sinr_plane_bytes = kOutputPlaneCount * sizeof(float);
@@ -529,16 +523,12 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& 
     }
 
     auto& slot = buffers.slots[buffers.next_stage_slot];
+    const Clock::time_point transport_start = Clock::now();
     for (std::uint32_t rx = 0; rx < kLteNumRxAntV1; ++rx) {
-        std::copy_n(grid.re[rx], detail::kMaxGridRe, slot.staging_re[rx]);
-        std::copy_n(grid.im[rx], detail::kMaxGridRe, slot.staging_im[rx]);
-        for (std::size_t i = 0; i < kGridPlaneCount; ++i) {
-            slot.transport_re[rx][i] =
-                quantize_grid_sample(slot.staging_re[rx][i], slot.grid_scale[rx]);
-            slot.transport_im[rx][i] =
-                quantize_grid_sample(slot.staging_im[rx][i], slot.grid_scale[rx]);
-        }
+        std::copy_n(grid.re[rx], detail::kMaxGridRe, slot.transport_re[rx]);
+        std::copy_n(grid.im[rx], detail::kMaxGridRe, slot.transport_im[rx]);
     }
+    last_host_profile.quantize_us = elapsed_us(transport_start, Clock::now());
     slot.layout = {};
     slot.grid_meta.n_rx_ant = grid.n_rx_ant;
     slot.grid_meta.n_symbols = grid.n_symbols;
@@ -550,13 +540,16 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& 
     slot.grid_meta.n_layers = 0;
     slot.grid_meta.n_tx_ports = 0;
     slot.grid_meta.n_segments = 0;
-    slot.grid_meta.validation_sample_count = 0;
+    slot.grid_meta.spot_check_sample_count = 0;
+    slot.grid_meta.trace_sample_count = 0;
+    slot.grid_meta.sigma2_device_owned = 0U;
+    slot.grid_meta.sigma2_iir_alpha = config.sigma2_iir_alpha;
     std::fill_n(slot.grid_meta.output_slot_by_grid_re, detail::kCudaMaxGridRe,
                 std::numeric_limits<std::uint32_t>::max());
-    std::fill(slot.grid_meta.validation_re_slots,
-              slot.grid_meta.validation_re_slots + detail::kCudaValidationSampleCount,
+    std::fill(slot.grid_meta.spot_check_re_slots,
+              slot.grid_meta.spot_check_re_slots + detail::kCudaValidationSampleCount,
               static_cast<std::uint16_t>(0));
-    std::fill(slot.scratch_host.begin(), slot.scratch_host.end(), 0.0F);
+    std::fill_n(slot.scratch_host.data(), scratch_float_count(), 0.0F);
     std::fill_n(slot.xhat_re, kOutputPlaneCount, 0.0F);
     std::fill_n(slot.xhat_im, kOutputPlaneCount, 0.0F);
     std::fill_n(slot.sinr, kOutputPlaneCount, 0.0F);
@@ -580,6 +573,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& 
 
 MmseStatus MmseEqualizerGpuContext::Impl::validate_estimate_stub(const ExtractDescriptor& desc,
                                                                  const HostPinnedSlot& slot) const {
+    if (slot.h_estimate == nullptr) {
+        return MmseStatus::kInternalError;
+    }
     detail::HGridStorage h_full{};
     float sigma2_estimate = 0.0F;
     detail::estimate_channel(slot.grid_view, desc, h_full, sigma2_estimate);
@@ -617,8 +613,10 @@ MmseStatus MmseEqualizerGpuContext::Impl::validate_equalize_stub(const HostPinne
     if (slot.grid_meta.n_valid_re == 0U || slot.out_view.n_re_per_layer == 0U) {
         return MmseStatus::kInternalError;
     }
-    for (std::uint32_t sample = 0; sample < slot.grid_meta.validation_sample_count; ++sample) {
-        const std::uint32_t re = slot.grid_meta.validation_re_slots[sample];
+
+    // Release policy keeps lightweight output spot-checks on sampled REs.
+    for (std::uint32_t sample = 0; sample < slot.grid_meta.spot_check_sample_count; ++sample) {
+        const std::uint32_t re = slot.grid_meta.spot_check_re_slots[sample];
         for (std::uint32_t layer = 0; layer < slot.out_view.n_layers; ++layer) {
             if (re >= slot.out_view.n_re_per_layer) {
                 continue;
@@ -632,7 +630,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::validate_equalize_stub(const HostPinne
             if (!(slot.sinr[idx] > 0.0F)) {
                 return MmseStatus::kInternalError;
             }
-            if constexpr (!kEnableDeepCudaStubValidation) {
+            if (!deep_validation_enabled()) {
                 continue;
             }
             if (slot.grid_meta.n_layers == 2U) {
@@ -648,10 +646,11 @@ MmseStatus MmseEqualizerGpuContext::Impl::validate_equalize_stub(const HostPinne
             }
         }
     }
-    if constexpr (kEnableDeepCudaStubValidation) {
+
+    // Debug/test policy adds CPU-vs-GPU trace comparison on sampled REs.
+    if (deep_validation_enabled()) {
         if (slot.grid_meta.n_layers == 2U) {
-            for (std::uint32_t sample = 0; sample < slot.grid_meta.validation_sample_count;
-                 ++sample) {
+            for (std::uint32_t sample = 0; sample < slot.grid_meta.trace_sample_count; ++sample) {
                 if (compare_equalize_trace_sample(slot, sample) != MmseStatus::kOk) {
                     return MmseStatus::kInternalError;
                 }
@@ -668,7 +667,25 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         return MmseStatus::kUnsupportedConfig;
     }
 
+    last_host_profile.layout_build_us = 0.0;
+    last_host_profile.grid_meta_pack_us = 0.0;
+    last_host_profile.grid_h2d_us = 0.0;
+    last_host_profile.estimate_launch_us = 0.0;
+    last_host_profile.sigma2_d2h_us = 0.0;
+    last_host_profile.sigma2_mid_sync_us = 0.0;
+    last_host_profile.sigma2_host_update_us = 0.0;
+    last_host_profile.sigma2_h2d_us = 0.0;
+    last_host_profile.equalize_launch_us = 0.0;
+    last_host_profile.outputs_d2h_us = 0.0;
+    last_host_profile.scratch_d2h_us = 0.0;
+    last_host_profile.completion_d2h_us = 0.0;
+    last_host_profile.final_sync_us = 0.0;
+
+    const Clock::time_point layout_start = Clock::now();
     detail::build_data_re_layout(desc, slot.layout);
+    last_host_profile.layout_build_us = elapsed_us(layout_start, Clock::now());
+
+    const Clock::time_point grid_meta_pack_start = Clock::now();
     slot.grid_meta.n_valid_re = slot.layout.n_re;
     slot.grid_meta.first_valid_grid_idx = slot.layout.n_re == 0U ? 0U : slot.layout.grid_indices[0];
     slot.grid_meta.subframe = detail::subframe_from_descriptor(desc);
@@ -676,18 +693,23 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     slot.grid_meta.n_layers = desc.n_layers;
     slot.grid_meta.n_tx_ports = desc.n_tx_ports;
     slot.grid_meta.n_segments = slot.layout.n_segments;
+    slot.grid_meta.sigma2_device_owned = use_device_owned_sigma2(config) ? 1U : 0U;
     slot.grid_meta.sigma2 = config.sigma2_min;
+    slot.grid_meta.sigma2_iir_alpha = config.sigma2_iir_alpha;
     slot.grid_meta.det_floor = config.det_floor;
     slot.grid_meta.g_min = config.g_min;
     slot.grid_meta.gamma_max = config.gamma_max;
     std::array<std::uint32_t, detail::kCudaValidationSampleCount> validation_re_slots{};
-    slot.grid_meta.validation_sample_count = detail::build_validation_re_samples(
+    slot.grid_meta.spot_check_sample_count = detail::build_validation_re_samples(
         slot.layout, desc.start_symbol, slot.grid_meta.n_symbols, slot.grid_meta.n_subcarriers,
         validation_re_slots.data(), detail::kCudaValidationSampleCount);
-    for (std::uint32_t i = 0; i < slot.grid_meta.validation_sample_count; ++i) {
-        slot.grid_meta.validation_re_slots[i] = static_cast<std::uint16_t>(validation_re_slots[i]);
+    slot.grid_meta.trace_sample_count =
+        deep_validation_enabled() ? slot.grid_meta.spot_check_sample_count : 0U;
+    for (std::uint32_t i = 0; i < slot.grid_meta.spot_check_sample_count; ++i) {
+        slot.grid_meta.spot_check_re_slots[i] = static_cast<std::uint16_t>(validation_re_slots[i]);
     }
-    if constexpr (kEnableDeepCudaStubValidation) {
+
+    if (deep_validation_enabled()) {
         const MmseStatus cpu_status = cpu_fallback.run(slot.grid_view, desc, slot.out_view);
         if (cpu_status != MmseStatus::kOk) {
             return cpu_status;
@@ -705,6 +727,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         slot.out_view.n_layers = desc.n_layers;
         slot.out_view.mod_order = desc.mod_order;
     }
+
     std::copy_n(slot.layout.grid_indices.begin(), detail::kCudaMaxDataRe,
                 slot.grid_meta.grid_indices);
     std::copy_n(slot.layout.output_slot_by_grid_re.begin(), detail::kCudaMaxGridRe,
@@ -731,79 +754,114 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
             }
         }
     }
+    last_host_profile.grid_meta_pack_us = elapsed_us(grid_meta_pack_start, Clock::now());
 
+    const Clock::time_point grid_h2d_start = Clock::now();
     if (const MmseStatus status = detail::cuda_copy_grid_h2d_async(
-            slot.device, slot.transport_re, slot.transport_im, slot.grid_scale, slot.grid_meta,
+            slot.device, slot.transport_re, slot.transport_im, slot.grid_meta,
             slot.grid_plane_bytes, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
+    last_host_profile.grid_h2d_us = elapsed_us(grid_h2d_start, Clock::now());
     slot.h2d_submitted = true;
 
+    if (use_device_owned_sigma2(config) && !device.sigma2_state_seeded) {
+        if (const MmseStatus status = detail::cuda_copy_sigma2_h2d_async(
+                slot.device, config.sigma2_min, slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        device.sigma2_state_seeded = true;
+    }
+
     const std::uint32_t completion_value = static_cast<std::uint32_t>(slot.sequence & 0xFFFFFFFFU);
+    const Clock::time_point estimate_launch_start = Clock::now();
     if (const MmseStatus status =
             detail::cuda_launch_estimate_stub(slot.device, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
+    last_host_profile.estimate_launch_us = elapsed_us(estimate_launch_start, Clock::now());
     slot.kernel_submitted = true;
 
-    if (const MmseStatus status = detail::cuda_copy_estimate_d2h_async(
-            slot.device, slot.h_estimate, slot.estimate_bytes, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
+    if (!use_device_owned_sigma2(config)) {
+        float sigma2_estimate = 0.0F;
+        const Clock::time_point sigma2_d2h_start = Clock::now();
+        if (const MmseStatus status = detail::cuda_copy_sigma2_d2h_async(
+                slot.device, sigma2_estimate, slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        last_host_profile.sigma2_d2h_us = elapsed_us(sigma2_d2h_start, Clock::now());
+        const Clock::time_point sigma2_sync_start = Clock::now();
+        if (const MmseStatus status = detail::cuda_stream_synchronize(slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        last_host_profile.sigma2_mid_sync_us = elapsed_us(sigma2_sync_start, Clock::now());
+        const Clock::time_point sigma2_host_update_start = Clock::now();
+        slot.grid_meta.sigma2 = detail::update_sigma2_state(
+            sigma2_by_cell[desc.cell_id], sigma2_estimate, make_cpu_fallback_config(config));
+        last_host_profile.sigma2_host_update_us =
+            elapsed_us(sigma2_host_update_start, Clock::now());
+        const Clock::time_point sigma2_h2d_start = Clock::now();
+        if (const MmseStatus status = detail::cuda_copy_sigma2_h2d_async(
+                slot.device, slot.grid_meta.sigma2, slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        last_host_profile.sigma2_h2d_us = elapsed_us(sigma2_h2d_start, Clock::now());
     }
-    float sigma2_estimate = 0.0F;
-    if (const MmseStatus status =
-            detail::cuda_copy_sigma2_d2h_async(slot.device, sigma2_estimate, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    if (const MmseStatus status = detail::cuda_stream_synchronize(slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    slot.grid_meta.sigma2 = detail::update_sigma2_state(
-        sigma2_by_cell[desc.cell_id], sigma2_estimate, make_cpu_fallback_config(config));
-    if (const MmseStatus status =
-            detail::cuda_copy_grid_meta_h2d_async(slot.device, slot.grid_meta, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    if (const MmseStatus status = detail::cuda_copy_outputs_h2d_async(
-            slot.device, slot.xhat_re, slot.xhat_im, slot.sinr, slot.xhat_plane_bytes,
-            slot.sinr_plane_bytes, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
+    const Clock::time_point equalize_launch_start = Clock::now();
     if (const MmseStatus status = detail::cuda_launch_equalize_stub(
             slot.device, slot.grid_meta.n_valid_re, completion_value, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
+    last_host_profile.equalize_launch_us = elapsed_us(equalize_launch_start, Clock::now());
+    const Clock::time_point outputs_d2h_start = Clock::now();
     if (const MmseStatus status = detail::cuda_copy_outputs_d2h_async(
             slot.device, slot.xhat_re, slot.xhat_im, slot.sinr, slot.xhat_plane_bytes,
             slot.sinr_plane_bytes, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
+    last_host_profile.outputs_d2h_us = elapsed_us(outputs_d2h_start, Clock::now());
     slot.d2h_submitted = true;
+    if (deep_validation_enabled()) {
+        if (const MmseStatus status = detail::cuda_copy_estimate_d2h_async(
+                slot.device, slot.h_estimate, slot.estimate_bytes, slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+    }
+    const Clock::time_point scratch_d2h_start = Clock::now();
     if (const MmseStatus status = detail::cuda_copy_scratch_d2h_async(
-            slot.device, slot.scratch_host.data(), slot.scratch_host.size() * sizeof(float),
+            slot.device, slot.scratch_host.data(), scratch_float_count() * sizeof(float),
             slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
+    last_host_profile.scratch_d2h_us = elapsed_us(scratch_d2h_start, Clock::now());
+    const Clock::time_point completion_d2h_start = Clock::now();
     if (const MmseStatus status = detail::cuda_copy_completion_d2h_async(
             slot.device, slot.completion_value, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
+    last_host_profile.completion_d2h_us = elapsed_us(completion_d2h_start, Clock::now());
+    const Clock::time_point final_sync_start = Clock::now();
     if (const MmseStatus status = detail::cuda_stream_synchronize(slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
-    if constexpr (kEnableDeepCudaStubValidation) {
+    last_host_profile.final_sync_us = elapsed_us(final_sync_start, Clock::now());
+    if (use_device_owned_sigma2(config)) {
+        slot.grid_meta.sigma2 = slot.scratch_host[3];
+    }
+
+    if (deep_validation_enabled()) {
         if (desc.n_layers == 2U) {
             if (const MmseStatus status = validate_estimate_stub(desc, slot);
                 status != MmseStatus::kOk) {
@@ -871,6 +929,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_outputs(EqualizerOutputView& out
         return MmseStatus::kBufferTooSmall;
     }
 
+    const Clock::time_point output_stage_start = Clock::now();
     for (std::uint32_t layer = 0; layer < slot.out_view.n_layers; ++layer) {
         const std::size_t src_base =
             static_cast<std::size_t>(layer) * slot.out_view.capacity_re_per_layer;
@@ -885,6 +944,24 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_outputs(EqualizerOutputView& out
     out.n_re_per_layer = slot.out_view.n_re_per_layer;
     out.n_layers = slot.out_view.n_layers;
     out.mod_order = slot.out_view.mod_order;
+    const_cast<Impl*>(this)->last_host_profile.output_stage_us =
+        elapsed_us(output_stage_start, Clock::now());
+    const_cast<Impl*>(this)->last_host_profile.total_host_us =
+        const_cast<Impl*>(this)->last_host_profile.quantize_us +
+        const_cast<Impl*>(this)->last_host_profile.layout_build_us +
+        const_cast<Impl*>(this)->last_host_profile.grid_meta_pack_us +
+        const_cast<Impl*>(this)->last_host_profile.grid_h2d_us +
+        const_cast<Impl*>(this)->last_host_profile.estimate_launch_us +
+        const_cast<Impl*>(this)->last_host_profile.sigma2_d2h_us +
+        const_cast<Impl*>(this)->last_host_profile.sigma2_mid_sync_us +
+        const_cast<Impl*>(this)->last_host_profile.sigma2_host_update_us +
+        const_cast<Impl*>(this)->last_host_profile.sigma2_h2d_us +
+        const_cast<Impl*>(this)->last_host_profile.equalize_launch_us +
+        const_cast<Impl*>(this)->last_host_profile.outputs_d2h_us +
+        const_cast<Impl*>(this)->last_host_profile.scratch_d2h_us +
+        const_cast<Impl*>(this)->last_host_profile.completion_d2h_us +
+        const_cast<Impl*>(this)->last_host_profile.final_sync_us +
+        const_cast<Impl*>(this)->last_host_profile.output_stage_us;
     return MmseStatus::kOk;
 }
 
@@ -945,6 +1022,10 @@ MmseStatus MmseEqualizerGpuContext::run(const PlanarGridViewF32& grid,
         return status;
     }
     return MmseStatus::kOk;
+}
+
+MmseGpuHostProfileSnapshot MmseEqualizerGpuContext::last_host_profile() const {
+    return impl_->last_host_profile;
 }
 
 } // namespace mmse
