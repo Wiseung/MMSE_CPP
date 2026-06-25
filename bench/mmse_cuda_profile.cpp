@@ -547,7 +547,7 @@ int main(int argc, char** argv) {
     MmseEqualizerGpuConfig config{};
     config.backend = MmseGpuBackend::kCuda;
     config.stream_count = 1U;
-    config.sigma2_ownership = MmseGpuSigma2Ownership::kHostOwnedIir;
+    config.sigma2_ownership = MmseGpuSigma2Ownership::kDeviceOwnedState;
     config.validation_policy = MmseGpuValidationPolicy::kReleaseSanity;
 
     const auto init_start = std::chrono::steady_clock::now();
