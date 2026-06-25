@@ -567,6 +567,41 @@ MmseStatus cuda_query_equalize_kernel_resources(std::int32_t block_size,
                                      info);
 }
 
+MmseStatus cuda_create_event(std::uintptr_t& event_handle) {
+    cudaEvent_t event{};
+    if (const cudaError_t status = cudaEventCreate(&event); status != cudaSuccess) {
+        event_handle = 0U;
+        return map_cuda_error(status);
+    }
+    event_handle = reinterpret_cast<std::uintptr_t>(event);
+    return MmseStatus::kOk;
+}
+
+void cuda_destroy_event(std::uintptr_t event_handle) {
+    if (event_handle != 0U) {
+        cudaEventDestroy(reinterpret_cast<cudaEvent_t>(event_handle));
+    }
+}
+
+MmseStatus cuda_event_record(std::uintptr_t event_handle, std::uintptr_t stream_handle) {
+    return map_cuda_error(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event_handle),
+                                          reinterpret_cast<cudaStream_t>(stream_handle)));
+}
+
+MmseStatus cuda_event_elapsed_us(std::uintptr_t start_event_handle, std::uintptr_t end_event_handle,
+                                 double& elapsed_us) {
+    float elapsed_ms = 0.0F;
+    if (const cudaError_t status =
+            cudaEventElapsedTime(&elapsed_ms, reinterpret_cast<cudaEvent_t>(start_event_handle),
+                                 reinterpret_cast<cudaEvent_t>(end_event_handle));
+        status != cudaSuccess) {
+        elapsed_us = 0.0;
+        return map_cuda_error(status);
+    }
+    elapsed_us = static_cast<double>(elapsed_ms) * 1000.0;
+    return MmseStatus::kOk;
+}
+
 MmseStatus cuda_alloc_host_f32(float*& ptr,
                                std::size_t count,
                                bool request_pinned,

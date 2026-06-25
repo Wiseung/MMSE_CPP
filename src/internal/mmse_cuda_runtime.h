@@ -103,6 +103,11 @@ MmseStatus cuda_query_current_memory_info(std::size_t& free_bytes, std::size_t& 
 MmseStatus cuda_query_estimate_kernel_resources(CudaKernelResourceInfo& info);
 MmseStatus cuda_query_equalize_kernel_resources(std::int32_t block_size,
                                                 CudaKernelResourceInfo& info);
+MmseStatus cuda_create_event(std::uintptr_t& event_handle);
+void cuda_destroy_event(std::uintptr_t event_handle);
+MmseStatus cuda_event_record(std::uintptr_t event_handle, std::uintptr_t stream_handle);
+MmseStatus cuda_event_elapsed_us(std::uintptr_t start_event_handle, std::uintptr_t end_event_handle,
+                                 double& elapsed_us);
 
 MmseStatus cuda_alloc_host_f32(float*& ptr, std::size_t count, bool request_pinned,
                                bool& pinned_allocation);

@@ -36,6 +36,20 @@ MmseStatus cuda_query_equalize_kernel_resources(std::int32_t, CudaKernelResource
     return MmseStatus::kUnsupportedConfig;
 }
 
+MmseStatus cuda_create_event(std::uintptr_t&) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+void cuda_destroy_event(std::uintptr_t) {}
+
+MmseStatus cuda_event_record(std::uintptr_t, std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_event_elapsed_us(std::uintptr_t, std::uintptr_t, double&) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
 MmseStatus cuda_alloc_host_f32(float*& ptr, std::size_t count, bool, bool& pinned_allocation) {
     ptr = new (std::nothrow) float[count];
     if (ptr == nullptr) {

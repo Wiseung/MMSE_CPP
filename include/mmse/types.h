@@ -108,6 +108,9 @@ struct MmseGpuHostProfileSnapshot {
     double final_sync_us = 0.0;
     double output_stage_us = 0.0;
     double total_host_us = 0.0;
+    double estimate_gpu_us = 0.0;
+    double equalize_gpu_us = 0.0;
+    double stream_gpu_us = 0.0;
 };
 
 } // namespace mmse

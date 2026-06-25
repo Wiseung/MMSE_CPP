@@ -96,6 +96,9 @@ struct HostPhaseSummary {
     double final_sync_us = 0.0;
     double output_stage_us = 0.0;
     double total_host_us = 0.0;
+    double estimate_gpu_us = 0.0;
+    double equalize_gpu_us = 0.0;
+    double stream_gpu_us = 0.0;
 };
 
 struct BufferAccounting {
@@ -363,6 +366,9 @@ TimedRun run_subframe_window(MmseEqualizerGpuContext& ctx, const std::vector<Sub
             host_summary->final_sync_us += snapshot.final_sync_us;
             host_summary->output_stage_us += snapshot.output_stage_us;
             host_summary->total_host_us += snapshot.total_host_us;
+            host_summary->estimate_gpu_us += snapshot.estimate_gpu_us;
+            host_summary->equalize_gpu_us += snapshot.equalize_gpu_us;
+            host_summary->stream_gpu_us += snapshot.stream_gpu_us;
         }
     }
     const auto end = std::chrono::steady_clock::now();
@@ -772,6 +778,12 @@ int main(int argc, char** argv) {
     std::cout << "host.phase.output_stage_us=" << (host_phase_10ms.output_stage_us / host_divisor)
               << '\n';
     std::cout << "host.phase.total_host_us=" << (host_phase_10ms.total_host_us / host_divisor)
+              << '\n';
+    std::cout << "host.phase.estimate_gpu_us=" << (host_phase_10ms.estimate_gpu_us / host_divisor)
+              << '\n';
+    std::cout << "host.phase.equalize_gpu_us=" << (host_phase_10ms.equalize_gpu_us / host_divisor)
+              << '\n';
+    std::cout << "host.phase.stream_gpu_us=" << (host_phase_10ms.stream_gpu_us / host_divisor)
               << '\n';
 
     std::cout << "[derived]\n";
