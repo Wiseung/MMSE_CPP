@@ -298,6 +298,18 @@ __global__ void finalize_sigma2_kernel(const CudaGridMeta* grid_meta,
     }
 }
 
+__global__ void zero_estimate_accumulators_kernel(float* sigma2_accum_out,
+                                                  std::uint32_t* residual_count_out) {
+    if (threadIdx.x == 0U && blockIdx.x == 0U) {
+        if (sigma2_accum_out != nullptr) {
+            *sigma2_accum_out = 0.0F;
+        }
+        if (residual_count_out != nullptr) {
+            *residual_count_out = 0U;
+        }
+    }
+}
+
 __global__ void equalize_stub_kernel(const float* grid_re0,
                                      const float* grid_re1,
                                      const float* grid_im0,
@@ -567,6 +579,41 @@ MmseStatus cuda_query_equalize_kernel_resources(std::int32_t block_size,
                                      info);
 }
 
+MmseStatus cuda_create_event(std::uintptr_t& event_handle) {
+    cudaEvent_t event{};
+    if (const cudaError_t status = cudaEventCreate(&event); status != cudaSuccess) {
+        event_handle = 0U;
+        return map_cuda_error(status);
+    }
+    event_handle = reinterpret_cast<std::uintptr_t>(event);
+    return MmseStatus::kOk;
+}
+
+void cuda_destroy_event(std::uintptr_t event_handle) {
+    if (event_handle != 0U) {
+        cudaEventDestroy(reinterpret_cast<cudaEvent_t>(event_handle));
+    }
+}
+
+MmseStatus cuda_event_record(std::uintptr_t event_handle, std::uintptr_t stream_handle) {
+    return map_cuda_error(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event_handle),
+                                          reinterpret_cast<cudaStream_t>(stream_handle)));
+}
+
+MmseStatus cuda_event_elapsed_us(std::uintptr_t start_event_handle, std::uintptr_t end_event_handle,
+                                 double& elapsed_us) {
+    float elapsed_ms = 0.0F;
+    if (const cudaError_t status =
+            cudaEventElapsedTime(&elapsed_ms, reinterpret_cast<cudaEvent_t>(start_event_handle),
+                                 reinterpret_cast<cudaEvent_t>(end_event_handle));
+        status != cudaSuccess) {
+        elapsed_us = 0.0;
+        return map_cuda_error(status);
+    }
+    elapsed_us = static_cast<double>(elapsed_ms) * 1000.0;
+    return MmseStatus::kOk;
+}
+
 MmseStatus cuda_alloc_host_f32(float*& ptr,
                                std::size_t count,
                                bool request_pinned,
@@ -693,25 +740,18 @@ MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers,
 }
 
 MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
-                                     std::uintptr_t stream_handle) {
+                                     std::uintptr_t stream_handle,
+                                     std::uintptr_t residual_done_event_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     if (buffers.h_estimate == nullptr || buffers.scratch == nullptr) {
         return MmseStatus::kInternalError;
     }
-    float zero_sigma2 = 0.0F;
-    std::uint32_t zero_count = 0U;
     float* sigma2_accum = reinterpret_cast<float*>(buffers.scratch);
     std::uint32_t* residual_count =
         reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::byte*>(buffers.scratch) + sizeof(float));
-    if (const cudaError_t status =
-            cudaMemcpyAsync(sigma2_accum, &zero_sigma2, sizeof(zero_sigma2), cudaMemcpyHostToDevice, stream);
-        status != cudaSuccess) {
-        return map_cuda_error(status);
-    }
-    if (const cudaError_t status =
-            cudaMemcpyAsync(residual_count, &zero_count, sizeof(zero_count), cudaMemcpyHostToDevice, stream);
-        status != cudaSuccess) {
-        return map_cuda_error(status);
+    zero_estimate_accumulators_kernel<<<1, 1, 0, stream>>>(sigma2_accum, residual_count);
+    if (const cudaError_t zero_status = cudaGetLastError(); zero_status != cudaSuccess) {
+        return map_cuda_error(zero_status);
     }
 
     estimate_residual_kernel<<<kEstimateResidualBlocks, kEstimateThreadsPerBlock, 0, stream>>>(
@@ -724,6 +764,13 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
         residual_count);
     if (const cudaError_t residual_status = cudaGetLastError(); residual_status != cudaSuccess) {
         return map_cuda_error(residual_status);
+    }
+    if (residual_done_event_handle != 0U) {
+        if (const cudaError_t status =
+                cudaEventRecord(reinterpret_cast<cudaEvent_t>(residual_done_event_handle), stream);
+            status != cudaSuccess) {
+            return map_cuda_error(status);
+        }
     }
 
     const std::uint32_t total_h = kLteNumTxPortsV1 * kLteNumRxAntV1 * kLteNumSymbolsNormalCp *
