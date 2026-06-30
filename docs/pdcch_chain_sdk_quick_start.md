@@ -25,6 +25,7 @@ The SDK does:
 - CRS-based channel estimation
 - MMSE equalization
 - per-RE soft-symbol and SINR output
+- additive 2Tx transmit-diversity de-mapping through `run_pdcch_td(...)`
 
 The SDK does not do:
 
@@ -97,6 +98,78 @@ mmse::pdcch::BackendPdcchEqualizedIndication backend =
     mmse::pdcch::make_backend_pdcch_equalized_indication(meta, out);
 ```
 
+## 2Tx TD Example
+
+For `2 Tx port` LTE PDCCH transmit diversity, keep the same `FrontendPdcchIndication` and
+`PdcchMmseInput`, but allocate the additive TD output surface instead of the legacy single-RE one.
+
+Capacity rule:
+
+- `capacity_symbols >= expected_n_soft_symbols`
+- for the current control-region TD implementation, `expected_n_soft_symbols` equals the number of
+  valid control-region RE after CRS and reserved-RE exclusion
+- each adjacent RE pair produces two QPSK soft symbols, so `meta.n_symbols == meta.n_source_re`
+
+```cpp
+#include "mmse/pdcch_chain_sdk.h"
+
+mmse::pdcch::FrontendPdcchIndication frontend = get_frontend_indication();
+mmse::PlanarGridViewF32 grid = get_fft_grid();
+
+frontend.n_tx_ports = 2;
+frontend.tx_mode = 2;
+frontend.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                             .subframe = 0,
+                             .ul_dl_config = 0,
+                             .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+mmse::pdcch::append_pcfich_reserved_control_re_list(frontend);
+const mmse::MmseStatus phich_status = mmse::pdcch::append_phich_reserved_control_re_list(
+    frontend,
+    {.resource = mmse::pdcch::PhichResource::kOne,
+     .duration = mmse::pdcch::PhichDuration::kNormal,
+     .mi = 1,
+     .subframe_ctx = frontend.control_subframe});
+if (phich_status != mmse::MmseStatus::kOk) {
+    return;
+}
+
+mmse::PdcchMmseInput in = mmse::pdcch::make_pdcch_mmse_input(grid, frontend);
+
+const std::size_t capacity_symbols = conservative_td_capacity();
+std::vector<float> xhat_re(capacity_symbols);
+std::vector<float> xhat_im(capacity_symbols);
+std::vector<float> sinr(capacity_symbols);
+std::vector<std::uint16_t> re_grid_indices0(capacity_symbols);
+std::vector<std::uint16_t> re_grid_indices1(capacity_symbols);
+
+mmse::PdcchTdMmseOutputView out{};
+out.x_hat_re = xhat_re.data();
+out.x_hat_im = xhat_im.data();
+out.sinr = sinr.data();
+out.re_grid_indices0 = re_grid_indices0.data();
+out.re_grid_indices1 = re_grid_indices1.data();
+out.capacity_symbols = static_cast<std::uint32_t>(capacity_symbols);
+
+mmse::PdcchTdMmseResult meta{};
+
+mmse::MmseEqualizerGpuContext ctx;
+mmse::MmseEqualizerGpuConfig cfg{};
+cfg.backend = mmse::MmseGpuBackend::kCuda;
+ctx.init(cfg);
+
+const mmse::MmseStatus status = ctx.run_pdcch_td(in, out, meta);
+if (status != mmse::MmseStatus::kOk) {
+    return;
+}
+
+mmse::pdcch::BackendPdcchTdEqualizedIndication backend =
+    mmse::pdcch::make_backend_pdcch_td_equalized_indication(meta, out);
+```
+
+Each `backend.x_hat_re[i] / x_hat_im[i] / sinr[i]` is one decoded QPSK soft symbol. The two source
+REs used to produce that symbol are `backend.re_grid_indices0[i]` and `backend.re_grid_indices1[i]`.
+
 ## Upstream Requirements
 
 Upstream must provide:
@@ -140,6 +213,17 @@ Important fields:
 - `re_grid_indices`
 - `chain`
 
+For `2 Tx port` transmit-diversity PDCCH, use the additive TD surface instead:
+
+- `mmse::PdcchTdMmseOutputView`
+- `mmse::PdcchTdMmseResult`
+- `mmse::MmseEqualizerCpuContext::run_pdcch_td(...)`
+- `mmse::MmseEqualizerGpuContext::run_pdcch_td(...)`
+- `mmse::pdcch::BackendPdcchTdEqualizedIndication`
+
+That surface returns one soft symbol per decoded QPSK symbol, plus source RE-pair mapping through
+`re_grid_indices0[i]` and `re_grid_indices1[i]`.
+
 Downstream can recover LTE coordinates with:
 
 ```cpp
@@ -157,14 +241,14 @@ Current validated support:
 - `n_symbols == 14`
 - `n_subcarriers == 1200`
 - `control_symbol_count in [1, 3]`
-- `n_tx_ports == 1`
 - `n_layers == 1`
 - `mod_order == 2`
 - `tx_mode == 1 or 2`
+- `run_pdcch(...)` with `n_tx_ports == 1`
+- `run_pdcch_td(...)` with `n_tx_ports == 2`
 
 Important non-support:
 
-- `2 Tx port` LTE PDCCH
 - helper-based automatic PHICH reservation does not imply PHICH decoding support
 
 ## Build and Demo

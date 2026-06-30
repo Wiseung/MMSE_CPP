@@ -169,7 +169,7 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
         if (desc.n_layers != 1U) {
             return false;
         }
-        if (desc.n_tx_ports != 1U) {
+        if (desc.n_tx_ports != 1U && desc.n_tx_ports != 2U) {
             return false;
         }
         if (desc.tx_mode != 1U && desc.tx_mode != 2U) {
@@ -664,6 +664,120 @@ struct MmseEqualizerCpuContext::Impl {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges{};
 };
 
+namespace {
+
+struct PdcchTdRePair {
+    std::uint16_t grid_index0 = 0;
+    std::uint16_t grid_index1 = 0;
+};
+
+inline float td_clampf(float value, float lo, float hi) {
+    return std::min(std::max(value, lo), hi);
+}
+
+inline std::size_t td_h_index(std::uint32_t tx, std::uint32_t rx, std::uint32_t symbol,
+                              std::uint32_t sc) {
+    return (((static_cast<std::size_t>(tx) * kLteNumRxAntV1 + rx) * kLteNumSymbolsNormalCp +
+             symbol) *
+            kLteNumSubcarriers20MHz) +
+           sc;
+}
+
+inline Complex32 td_grid_at(const PlanarGridViewF32& grid, std::uint32_t rx, std::uint32_t symbol,
+                            std::uint32_t sc) {
+    const std::size_t idx = static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz + sc;
+    return {grid.re[rx][idx], grid.im[rx][idx]};
+}
+
+bool build_pdcch_td_re_pairs(const ReLayout& layout, std::vector<PdcchTdRePair>& pairs) {
+    pairs.clear();
+    if ((layout.n_re & 1U) != 0U) {
+        return false;
+    }
+    pairs.reserve(layout.n_re / 2U);
+    for (std::uint32_t i = 0; i < layout.n_re; i += 2U) {
+        const std::uint16_t grid0 = layout.grid_indices[i];
+        const std::uint16_t grid1 = layout.grid_indices[i + 1U];
+        const std::uint32_t symbol0 = grid0 / kLteNumSubcarriers20MHz;
+        const std::uint32_t symbol1 = grid1 / kLteNumSubcarriers20MHz;
+        if (symbol0 != symbol1) {
+            return false;
+        }
+        const std::uint32_t sc0 = grid0 % kLteNumSubcarriers20MHz;
+        const std::uint32_t sc1 = grid1 % kLteNumSubcarriers20MHz;
+        if (sc1 != sc0 + 1U) {
+            return false;
+        }
+        pairs.push_back({grid0, grid1});
+    }
+    return true;
+}
+
+detail::PdcchTdEqualizePair demap_pdcch_transmit_diversity_from_grid(
+    const HGridStorage& h_full, const PlanarGridViewF32& grid, std::uint16_t grid_index0,
+    std::uint16_t grid_index1, float sigma2, float det_floor, float g_min, float gamma_max);
+
+} // namespace
+
+namespace detail {
+
+PdcchTdEqualizePair
+demap_pdcch_transmit_diversity_scalar(Complex32 h00, Complex32 h01, Complex32 h10, Complex32 h11,
+                                      Complex32 h00_next, Complex32 h01_next, Complex32 h10_next,
+                                      Complex32 h11_next, Complex32 y0, Complex32 y1,
+                                      Complex32 y0_next, Complex32 y1_next, float sigma2,
+                                      float det_floor, float g_min, float gamma_max) {
+    const Complex32 z_rx0 = csub(cmul(cconj(h00), y0), cmul(h01_next, cconj(y0_next)));
+    const Complex32 z_rx1 = csub(cmul(cconj(h10), y1), cmul(h11_next, cconj(y1_next)));
+    const Complex32 z0 = cadd(z_rx0, z_rx1);
+
+    const Complex32 z1_rx0 = cadd(cmul(cconj(h01), y0), cmul(h00_next, cconj(y0_next)));
+    const Complex32 z1_rx1 = cadd(cmul(cconj(h11), y1), cmul(h10_next, cconj(y1_next)));
+    const Complex32 z1 = cadd(z1_rx0, z1_rx1);
+
+    const float energy0 = cnorm2(h00) + cnorm2(h01_next) + cnorm2(h10) + cnorm2(h11_next);
+    const float energy1 = cnorm2(h01) + cnorm2(h00_next) + cnorm2(h11) + cnorm2(h10_next);
+    const float denom0 = std::max(energy0 + sigma2, det_floor);
+    const float denom1 = std::max(energy1 + sigma2, det_floor);
+    const float gain0 = td_clampf(energy0 / denom0, g_min, 1.0F - g_min);
+    const float gain1 = td_clampf(energy1 / denom1, g_min, 1.0F - g_min);
+    return {
+        .symbol0 =
+            {
+                .xhat = cscale(cscale(z0, 1.0F / denom0), 1.0F / gain0),
+                .gamma = td_clampf(gain0 / (1.0F - gain0), g_min, gamma_max),
+            },
+        .symbol1 =
+            {
+                .xhat = cscale(cscale(z1, 1.0F / denom1), 1.0F / gain1),
+                .gamma = td_clampf(gain1 / (1.0F - gain1), g_min, gamma_max),
+            },
+    };
+}
+
+} // namespace detail
+
+namespace {
+
+detail::PdcchTdEqualizePair demap_pdcch_transmit_diversity_from_grid(
+    const HGridStorage& h_full, const PlanarGridViewF32& grid, std::uint16_t grid_index0,
+    std::uint16_t grid_index1, float sigma2, float det_floor, float g_min, float gamma_max) {
+    const std::uint32_t symbol0 = grid_index0 / kLteNumSubcarriers20MHz;
+    const std::uint32_t sc0 = grid_index0 % kLteNumSubcarriers20MHz;
+    const std::uint32_t symbol1 = grid_index1 / kLteNumSubcarriers20MHz;
+    const std::uint32_t sc1 = grid_index1 % kLteNumSubcarriers20MHz;
+    return detail::demap_pdcch_transmit_diversity_scalar(
+        h_full[td_h_index(0U, 0U, symbol0, sc0)], h_full[td_h_index(1U, 0U, symbol0, sc0)],
+        h_full[td_h_index(0U, 1U, symbol0, sc0)], h_full[td_h_index(1U, 1U, symbol0, sc0)],
+        h_full[td_h_index(0U, 0U, symbol1, sc1)], h_full[td_h_index(1U, 0U, symbol1, sc1)],
+        h_full[td_h_index(0U, 1U, symbol1, sc1)], h_full[td_h_index(1U, 1U, symbol1, sc1)],
+        td_grid_at(grid, 0U, symbol0, sc0), td_grid_at(grid, 1U, symbol0, sc0),
+        td_grid_at(grid, 0U, symbol1, sc1), td_grid_at(grid, 1U, symbol1, sc1), sigma2, det_floor,
+        g_min, gamma_max);
+}
+
+} // namespace
+
 MmseEqualizerCpuContext::MmseEqualizerCpuContext() : impl_(new Impl()) {}
 
 MmseEqualizerCpuContext::~MmseEqualizerCpuContext() {
@@ -790,6 +904,27 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
     out.n_layers = desc.n_layers;
     out.mod_order = desc.mod_order;
 
+    if (desc.channel_type == MmseChannelType::kPdcch && desc.n_tx_ports == 2U &&
+        desc.n_layers == 1U) {
+        std::vector<PdcchTdRePair> pairs{};
+        if (!build_pdcch_td_re_pairs(impl_->layout, pairs)) {
+            return MmseStatus::kUnsupportedConfig;
+        }
+        for (std::uint32_t i = 0; i < pairs.size(); ++i) {
+            const auto eq = demap_pdcch_transmit_diversity_from_grid(
+                impl_->h_full, grid, pairs[i].grid_index0, pairs[i].grid_index1, sigma2,
+                impl_->config.det_floor, impl_->config.g_min, impl_->config.gamma_max);
+            const std::uint32_t base = i * 2U;
+            out.x_hat_re[base] = eq.symbol0.xhat.re;
+            out.x_hat_im[base] = eq.symbol0.xhat.im;
+            out.sinr[base] = eq.symbol0.gamma;
+            out.x_hat_re[base + 1U] = eq.symbol1.xhat.re;
+            out.x_hat_im[base + 1U] = eq.symbol1.xhat.im;
+            out.sinr[base + 1U] = eq.symbol1.gamma;
+        }
+        return MmseStatus::kOk;
+    }
+
     Impl::RunTaskContext worker_ctx{
         .impl = impl_,
         .desc = desc,
@@ -819,6 +954,9 @@ MmseStatus MmseEqualizerCpuContext::run_pdcch(const PdcchMmseInput& in, PdcchMms
     if (const MmseStatus status = mmse::pdcch::validate_pdcch_mmse_input(in);
         status != MmseStatus::kOk) {
         return status;
+    }
+    if (in.n_tx_ports != 1U) {
+        return MmseStatus::kUnsupportedConfig;
     }
 
     ExtractDescriptor desc{};
@@ -868,6 +1006,107 @@ MmseStatus MmseEqualizerCpuContext::run_pdcch(const PdcchMmseInput& in, PdcchMms
     meta.tx_mode = in.tx_mode;
     meta.control_symbol_count = in.control_symbol_count;
     meta.mod_order = base_out.mod_order;
+    meta.sigma2 =
+        detail::peek_sigma2_state(impl_->sigma2_by_cell[in.cell_id], impl_->config.sigma2_min);
+    meta.prb_bitmap = in.prb_bitmap;
+    meta.chain = in.chain;
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerCpuContext::run_pdcch_td(const PdcchMmseInput& in,
+                                                 PdcchTdMmseOutputView& out,
+                                                 PdcchTdMmseResult& meta) {
+    if (!impl_->initialized) {
+        return MmseStatus::kNotInitialized;
+    }
+    if (const MmseStatus status = mmse::pdcch::validate_pdcch_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    if (in.n_tx_ports != 2U) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (out.x_hat_re == nullptr || out.x_hat_im == nullptr || out.sinr == nullptr ||
+        out.re_grid_indices0 == nullptr || out.re_grid_indices1 == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = in.n_tx_ports;
+    desc.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    desc.n_layers = 1U;
+    desc.tx_mode = in.tx_mode;
+    desc.channel_type = MmseChannelType::kPdcch;
+    desc.start_symbol = 0U;
+    desc.control_symbol_count = in.control_symbol_count;
+    desc.mod_order = 2U;
+    desc.n_prb = in.n_prb;
+    desc.prb_bitmap = in.prb_bitmap;
+    desc.control_re_exclusion_masks = in.control_re_exclusion_masks;
+    desc.pmi = -1;
+
+    if (const MmseStatus status = detail::validate_grid(in.grid); status != MmseStatus::kOk) {
+        return status;
+    }
+
+    if (!detail::descriptor_supported(desc) && desc.n_tx_ports == 2U) {
+        ExtractDescriptor support_probe = desc;
+        support_probe.n_tx_ports = 1U;
+        if (!detail::descriptor_supported(support_probe)) {
+            return MmseStatus::kUnsupportedConfig;
+        }
+    }
+
+    const std::uint32_t n_source_re = detail::build_pdcch_re_layout(desc, impl_->layout);
+    std::vector<PdcchTdRePair> pairs{};
+    if (!build_pdcch_td_re_pairs(impl_->layout, pairs)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    const std::uint32_t n_symbols = static_cast<std::uint32_t>(pairs.size() * 2U);
+    if (out.capacity_symbols < n_symbols) {
+        return MmseStatus::kBufferTooSmall;
+    }
+
+    float sigma2_estimate = 0.0F;
+    detail::estimate_channel(in.grid, desc, impl_->h_full, sigma2_estimate);
+    const float sigma2 = detail::update_sigma2_state(impl_->sigma2_by_cell[in.cell_id],
+                                                     sigma2_estimate, impl_->config);
+
+    for (std::uint32_t i = 0; i < pairs.size(); ++i) {
+        const PdcchTdRePair& pair = pairs[i];
+        const detail::PdcchTdEqualizePair eq = demap_pdcch_transmit_diversity_from_grid(
+            impl_->h_full, in.grid, pair.grid_index0, pair.grid_index1, sigma2,
+            impl_->config.det_floor, impl_->config.g_min, impl_->config.gamma_max);
+        const std::uint32_t base = i * 2U;
+        out.x_hat_re[base] = eq.symbol0.xhat.re;
+        out.x_hat_im[base] = eq.symbol0.xhat.im;
+        out.sinr[base] = eq.symbol0.gamma;
+        out.re_grid_indices0[base] = pair.grid_index0;
+        out.re_grid_indices1[base] = pair.grid_index1;
+
+        out.x_hat_re[base + 1U] = eq.symbol1.xhat.re;
+        out.x_hat_im[base + 1U] = eq.symbol1.xhat.im;
+        out.sinr[base + 1U] = eq.symbol1.gamma;
+        out.re_grid_indices0[base + 1U] = pair.grid_index0;
+        out.re_grid_indices1[base + 1U] = pair.grid_index1;
+    }
+
+    meta = {};
+    meta.n_symbols = n_symbols;
+    meta.n_source_re = n_source_re;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.grid_symbol_count = in.grid.n_symbols;
+    meta.grid_subcarrier_count = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.n_prb = in.n_prb;
+    meta.n_tx_ports = in.n_tx_ports;
+    meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    meta.n_layers = 1U;
+    meta.tx_mode = in.tx_mode;
+    meta.control_symbol_count = in.control_symbol_count;
+    meta.mod_order = 2U;
     meta.sigma2 =
         detail::peek_sigma2_state(impl_->sigma2_by_cell[in.cell_id], impl_->config.sigma2_min);
     meta.prb_bitmap = in.prb_bitmap;

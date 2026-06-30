@@ -2,6 +2,17 @@
 
 This page defines the compatibility boundary for `PDCCH Chain SDK v1`.
 
+This repo also ships an additive parallel TD surface for `2 Tx port` LTE PDCCH:
+
+- `MmseEqualizerCpuContext::run_pdcch_td`
+- `MmseEqualizerGpuContext::run_pdcch_td`
+- `PdcchTdMmseOutputView`
+- `PdcchTdMmseResult`
+- `BackendPdcchTdEqualizedIndication`
+
+Those symbols are outside the frozen `v1` single-RE contract described below. The `v1` boundary
+still applies specifically to `run_pdcch(...)` and its per-RE DTO semantics.
+
 Related pages:
 
 - [Documentation Index](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)

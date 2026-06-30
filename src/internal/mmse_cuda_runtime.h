@@ -43,6 +43,7 @@ struct CudaGridMeta {
     std::uint32_t start_symbol = 0;
     std::uint32_t n_layers = 0;
     std::uint32_t n_tx_ports = 0;
+    std::uint32_t channel_type = 0;
     std::uint32_t n_segments = 0;
     std::uint32_t spot_check_sample_count = 0;
     std::uint32_t trace_sample_count = 0;

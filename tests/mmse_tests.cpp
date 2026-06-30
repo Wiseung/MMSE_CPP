@@ -298,6 +298,46 @@ void fill_constant_mimo_channel(GridBuffers& buffers, const ExtractDescriptor& d
     }
 }
 
+void fill_pdcch_td_pair(GridBuffers& buffers, const ExtractDescriptor& desc, std::uint16_t grid0,
+                        std::uint16_t grid1, Complex32 h00, Complex32 h01, Complex32 h10,
+                        Complex32 h11, Complex32 s0, Complex32 s1) {
+    const std::uint32_t symbol0 = grid0 / kLteNumSubcarriers20MHz;
+    const std::uint32_t sc0 = grid0 % kLteNumSubcarriers20MHz;
+    const std::uint32_t symbol1 = grid1 / kLteNumSubcarriers20MHz;
+    const std::uint32_t sc1 = grid1 % kLteNumSubcarriers20MHz;
+    expect_true(symbol0 == symbol1, "td pair must stay in one symbol");
+    expect_true(sc1 == sc0 + 1U, "td pair must be adjacent");
+
+    const Complex32 y0_k0 =
+        mmse::detail::cadd(mmse::detail::cmul(h00, s0), mmse::detail::cmul(h01, s1));
+    const Complex32 y1_k0 =
+        mmse::detail::cadd(mmse::detail::cmul(h10, s0), mmse::detail::cmul(h11, s1));
+    const Complex32 y0_k1 = mmse::detail::csub(mmse::detail::cmul(h00, mmse::detail::cconj(s1)),
+                                               mmse::detail::cmul(h01, mmse::detail::cconj(s0)));
+    const Complex32 y1_k1 = mmse::detail::csub(mmse::detail::cmul(h10, mmse::detail::cconj(s1)),
+                                               mmse::detail::cmul(h11, mmse::detail::cconj(s0)));
+
+    buffers.re[0][grid0] = y0_k0.re;
+    buffers.im[0][grid0] = y0_k0.im;
+    buffers.re[1][grid0] = y1_k0.re;
+    buffers.im[1][grid0] = y1_k0.im;
+
+    buffers.re[0][grid1] = y0_k1.re;
+    buffers.im[0][grid1] = y0_k1.im;
+    buffers.re[1][grid1] = y1_k1.re;
+    buffers.im[1][grid1] = y1_k1.im;
+}
+
+void fill_pdcch_td_layout(GridBuffers& buffers, const ExtractDescriptor& desc,
+                          const mmse::detail::ReLayout& layout, Complex32 h00, Complex32 h01,
+                          Complex32 h10, Complex32 h11, Complex32 s0, Complex32 s1) {
+    expect_true((layout.n_re & 1U) == 0U, "td layout must have even RE count");
+    for (std::uint32_t i = 0; i < layout.n_re; i += 2U) {
+        fill_pdcch_td_pair(buffers, desc, layout.grid_indices[i], layout.grid_indices[i + 1U], h00,
+                           h01, h10, h11, s0, s1);
+    }
+}
+
 void test_reject_invalid_descriptor() {
     MmseEqualizerCpuContext ctx;
     MmseEqualizerCpuConfig config{};
@@ -674,7 +714,7 @@ void test_pdcch_layout_excludes_crs_and_reserved_res() {
     expect_true(n_re_reserved == n_re - 4U, "reserved control REs must be excluded");
 }
 
-void test_pdcch_cpu_run_supports_single_port_and_rejects_two_port() {
+void test_pdcch_cpu_run_supports_single_port_and_generic_two_port_layout() {
     MmseEqualizerCpuContext ctx;
     MmseEqualizerCpuConfig config{};
     config.worker_count = 1;
@@ -695,10 +735,152 @@ void test_pdcch_cpu_run_supports_single_port_and_rejects_two_port() {
     expect_true(out.n_re_per_layer == 3400U, "single-port pdcch RE count");
     expect_true(out.mod_order == 2U, "pdcch mod order must stay qpsk");
 
-    auto unsupported = desc;
-    unsupported.n_tx_ports = 2U;
-    expect_true(ctx.run(grid, unsupported, out) == MmseStatus::kUnsupportedConfig,
-                "two-port pdcch should be rejected");
+    auto two_port = desc;
+    two_port.n_tx_ports = 2U;
+    two_port.tx_mode = 2U;
+    expect_true(ctx.run(grid, two_port, out) == MmseStatus::kOk,
+                "generic run should allow two-port pdcch backend path");
+    expect_true(out.n_re_per_layer == 3200U, "two-port generic pdcch RE count");
+}
+
+void test_pdcch_td_cpu_run_recovers_qpsk_symbols() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1;
+    config.sigma2_min = 1.0e-5F;
+    config.det_floor = 1.0e-6F;
+    config.g_min = 1.0e-4F;
+    config.gamma_max = 1.0e4F;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "init must succeed");
+
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 2U;
+    desc.tx_mode = 2U;
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    if (n_source_re != 3200U) {
+        throw TestFailure{"two-port pdcch RE count actual=" + std::to_string(n_source_re)};
+    }
+    expect_true((n_source_re & 1U) == 0U, "two-port pdcch RE count must be even");
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+    fill_pdcch_td_layout(buffers, desc, layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                         {1.0F, 0.0F}, s0, s1);
+
+    PdcchMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = desc.n_tx_ports;
+    in.tx_mode = desc.tx_mode;
+    in.control_symbol_count = desc.control_symbol_count;
+    in.n_prb = desc.n_prb;
+    in.prb_bitmap = desc.prb_bitmap;
+    in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                           .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                           .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+    std::vector<float> xre(n_source_re);
+    std::vector<float> xim(n_source_re);
+    std::vector<float> sinr(n_source_re);
+    std::vector<std::uint16_t> grid0(n_source_re);
+    std::vector<std::uint16_t> grid1(n_source_re);
+    PdcchTdMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices0 = grid0.data();
+    out.re_grid_indices1 = grid1.data();
+    out.capacity_symbols = n_source_re;
+
+    PdcchTdMmseResult meta{};
+    const MmseStatus status = ctx.run_pdcch_td(in, out, meta);
+    if (status != MmseStatus::kOk) {
+        throw TestFailure{"pdcch td cpu run status=" + std::string(to_string(status))};
+    }
+
+    expect_true(meta.n_source_re == n_source_re, "td source re count");
+    expect_true(meta.n_symbols == n_source_re, "td soft-symbol count");
+    expect_true(grid0[0] == layout.grid_indices[0] && grid1[0] == layout.grid_indices[1],
+                "td first symbol pair indices");
+    expect_true(grid0[1] == layout.grid_indices[0] && grid1[1] == layout.grid_indices[1],
+                "td second symbol pair indices");
+    expect_near(xre[0], s0.re, 1.0e-3F, "td symbol0 real");
+    expect_near(xim[0], s0.im, 1.0e-3F, "td symbol0 imag");
+    expect_near(xre[1], s1.re, 1.0e-3F, "td symbol1 real");
+    expect_near(xim[1], s1.im, 1.0e-3F, "td symbol1 imag");
+    expect_true(sinr[0] > 10.0F, "td symbol0 sinr");
+    expect_true(sinr[1] > 10.0F, "td symbol1 sinr");
+}
+
+void test_pdcch_td_scalar_demap_recovers_qpsk_symbols() {
+    const Complex32 h00{1.0F, 0.0F};
+    const Complex32 h01{0.0F, 0.0F};
+    const Complex32 h10{0.0F, 0.0F};
+    const Complex32 h11{1.0F, 0.0F};
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+
+    const Complex32 y0_k0 =
+        mmse::detail::cadd(mmse::detail::cmul(h00, s0), mmse::detail::cmul(h01, s1));
+    const Complex32 y1_k0 =
+        mmse::detail::cadd(mmse::detail::cmul(h10, s0), mmse::detail::cmul(h11, s1));
+    const Complex32 y0_k1 = mmse::detail::csub(mmse::detail::cmul(h00, mmse::detail::cconj(s1)),
+                                               mmse::detail::cmul(h01, mmse::detail::cconj(s0)));
+    const Complex32 y1_k1 = mmse::detail::csub(mmse::detail::cmul(h10, mmse::detail::cconj(s1)),
+                                               mmse::detail::cmul(h11, mmse::detail::cconj(s0)));
+
+    const auto eq = mmse::detail::demap_pdcch_transmit_diversity_scalar(
+        h00, h01, h10, h11, h00, h01, h10, h11, y0_k0, y1_k0, y0_k1, y1_k1, 1.0e-5F, 1.0e-6F,
+        1.0e-4F, 1.0e4F);
+    expect_near(eq.symbol0.xhat.re, s0.re, 1.0e-3F, "td scalar symbol0 real");
+    expect_near(eq.symbol0.xhat.im, s0.im, 1.0e-3F, "td scalar symbol0 imag");
+    expect_near(eq.symbol1.xhat.re, s1.re, 1.0e-3F, "td scalar symbol1 real");
+    expect_near(eq.symbol1.xhat.im, s1.im, 1.0e-3F, "td scalar symbol1 imag");
+}
+
+void test_pdcch_run_rejects_two_port_contract() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1;
+    config.sigma2_min = 1.0e-5F;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "init must succeed");
+
+    GridBuffers buffers = make_zero_grid();
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 2U;
+    desc.tx_mode = 2U;
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+
+    PdcchMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = desc.n_tx_ports;
+    in.tx_mode = desc.tx_mode;
+    in.control_symbol_count = desc.control_symbol_count;
+    in.n_prb = desc.n_prb;
+    in.prb_bitmap = desc.prb_bitmap;
+    in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                           .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                           .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+    std::vector<float> xre(4000U), xim(4000U), sinr(4000U);
+    std::vector<std::uint16_t> grid_idx(4000U);
+    PdcchMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices = grid_idx.data();
+    out.capacity_re_per_layer = 4000U;
+    out.capacity_re_metadata = 4000U;
+    PdcchMmseResult meta{};
+
+    expect_true(ctx.run_pdcch(in, out, meta) == MmseStatus::kUnsupportedConfig,
+                "legacy run_pdcch contract should still reject two-port td");
 }
 
 void test_pdcch_module_api_returns_chain_metadata_and_re_indices() {
@@ -1209,6 +1391,43 @@ void test_pdcch_backend_dto_packs_equalized_output() {
     expect_true(backend.sigma2 == meta.sigma2, "backend dto sigma2");
 }
 
+void test_pdcch_td_backend_dto_packs_equalized_output() {
+    PdcchTdMmseResult meta{};
+    meta.n_symbols = 2U;
+    meta.n_source_re = 2U;
+    meta.sfn_subframe = 9U;
+    meta.cell_id = 21U;
+    meta.n_prb = 100U;
+    meta.n_tx_ports = 2U;
+    meta.n_rx_ant = 2U;
+    meta.n_layers = 1U;
+    meta.tx_mode = 2U;
+    meta.control_symbol_count = 3U;
+    meta.mod_order = 2U;
+    meta.sigma2 = 0.125F;
+    meta.chain.request_id = 88U;
+
+    std::array<float, 2> xre = {1.0F, 2.0F};
+    std::array<float, 2> xim = {0.1F, 0.2F};
+    std::array<float, 2> sinr = {10.0F, 11.0F};
+    std::array<std::uint16_t, 2> grid_idx0 = {4U, 4U};
+    std::array<std::uint16_t, 2> grid_idx1 = {5U, 5U};
+
+    PdcchTdMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices0 = grid_idx0.data();
+    out.re_grid_indices1 = grid_idx1.data();
+
+    const auto backend = mmse::pdcch::make_backend_pdcch_td_equalized_indication(meta, out);
+    expect_true(backend.x_hat_re.size() == 2U, "td backend dto size");
+    expect_true(backend.re_grid_indices0[0] == 4U, "td backend dto first re0");
+    expect_true(backend.re_grid_indices1[1] == 5U, "td backend dto second re1");
+    expect_true(backend.x_hat_im[1] == 0.2F, "td backend dto imag");
+    expect_true(backend.chain.request_id == meta.chain.request_id, "td backend dto chain");
+}
+
 void test_gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback() {
     MmseEqualizerGpuContext gpu;
     MmseEqualizerGpuConfig config{};
@@ -1219,6 +1438,8 @@ void test_gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback() {
     GridBuffers buffers = make_zero_grid();
     auto desc = make_fullband_desc();
     desc.n_layers = 1;
+    desc.n_tx_ports = 1;
+    desc.tx_mode = 1;
     fill_identity_channel(buffers, desc, 0.75F, 0.0F);
     auto grid = make_grid_view(buffers);
     const std::uint32_t cap = 20000U;
@@ -1233,6 +1454,187 @@ void test_gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback() {
 #else
     expect_true(gpu.init(config) == MmseStatus::kUnsupportedConfig,
                 "gpu strict cuda init should be unsupported without cuda build");
+#endif
+}
+
+void test_gpu_context_auto_td_fallback_matches_cpu_td() {
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kAuto;
+    gpu_config.sigma2_min = 1.0e-5F;
+    gpu_config.det_floor = 1.0e-6F;
+    gpu_config.g_min = 1.0e-4F;
+    gpu_config.gamma_max = 1.0e4F;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "gpu auto td init");
+
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1;
+    cpu_config.sigma2_min = gpu_config.sigma2_min;
+    cpu_config.det_floor = gpu_config.det_floor;
+    cpu_config.g_min = gpu_config.g_min;
+    cpu_config.gamma_max = gpu_config.gamma_max;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "cpu td init");
+
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 2U;
+    desc.tx_mode = 2U;
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+    fill_pdcch_td_layout(buffers, desc, layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                         {1.0F, 0.0F}, s0, s1);
+
+    PdcchMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = desc.n_tx_ports;
+    in.tx_mode = desc.tx_mode;
+    in.control_symbol_count = desc.control_symbol_count;
+    in.n_prb = desc.n_prb;
+    in.prb_bitmap = desc.prb_bitmap;
+    in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                           .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                           .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+    std::vector<float> cpu_re(n_source_re), cpu_im(n_source_re), cpu_sinr(n_source_re);
+    std::vector<float> gpu_re(n_source_re), gpu_im(n_source_re), gpu_sinr(n_source_re);
+    std::vector<std::uint16_t> cpu_g0(n_source_re), cpu_g1(n_source_re);
+    std::vector<std::uint16_t> gpu_g0(n_source_re), gpu_g1(n_source_re);
+    PdcchTdMmseOutputView cpu_out{cpu_re.data(), cpu_im.data(), cpu_sinr.data(),
+                                  cpu_g0.data(), cpu_g1.data(), n_source_re};
+    PdcchTdMmseOutputView gpu_out{gpu_re.data(), gpu_im.data(), gpu_sinr.data(),
+                                  gpu_g0.data(), gpu_g1.data(), n_source_re};
+    PdcchTdMmseResult cpu_meta{}, gpu_meta{};
+
+    expect_true(cpu.run_pdcch_td(in, cpu_out, cpu_meta) == MmseStatus::kOk, "cpu td run");
+    expect_true(gpu.run_pdcch_td(in, gpu_out, gpu_meta) == MmseStatus::kOk, "gpu auto td run");
+    expect_true(cpu_meta.n_symbols == gpu_meta.n_symbols, "gpu auto td symbol count");
+    for (std::uint32_t i = 0; i < cpu_meta.n_symbols; ++i) {
+        expect_near(gpu_re[i], cpu_re[i], 1.0e-5F, "gpu auto td xhat real");
+        expect_near(gpu_im[i], cpu_im[i], 1.0e-5F, "gpu auto td xhat imag");
+        expect_near(gpu_sinr[i], cpu_sinr[i], 1.0e-5F, "gpu auto td sinr");
+        expect_true(gpu_g0[i] == cpu_g0[i] && gpu_g1[i] == cpu_g1[i], "gpu auto td re pairs");
+    }
+}
+
+void test_gpu_context_cuda_td_matches_cpu_td() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kCuda;
+    gpu_config.sigma2_min = 1.0e-5F;
+    gpu_config.det_floor = 1.0e-6F;
+    gpu_config.g_min = 1.0e-4F;
+    gpu_config.gamma_max = 1.0e4F;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "gpu cuda td init");
+
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1;
+    cpu_config.sigma2_min = gpu_config.sigma2_min;
+    cpu_config.det_floor = gpu_config.det_floor;
+    cpu_config.g_min = gpu_config.g_min;
+    cpu_config.gamma_max = gpu_config.gamma_max;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "cpu td init");
+
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 2U;
+    desc.tx_mode = 2U;
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+    fill_pdcch_td_layout(buffers, desc, layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                         {1.0F, 0.0F}, s0, s1);
+
+    PdcchMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = desc.n_tx_ports;
+    in.tx_mode = desc.tx_mode;
+    in.control_symbol_count = desc.control_symbol_count;
+    in.n_prb = desc.n_prb;
+    in.prb_bitmap = desc.prb_bitmap;
+    in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                           .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                           .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+    std::vector<float> cpu_re(n_source_re), cpu_im(n_source_re), cpu_sinr(n_source_re);
+    std::vector<float> gpu_re(n_source_re), gpu_im(n_source_re), gpu_sinr(n_source_re);
+    std::vector<std::uint16_t> cpu_g0(n_source_re), cpu_g1(n_source_re);
+    std::vector<std::uint16_t> gpu_g0(n_source_re), gpu_g1(n_source_re);
+    PdcchTdMmseOutputView cpu_out{cpu_re.data(), cpu_im.data(), cpu_sinr.data(),
+                                  cpu_g0.data(), cpu_g1.data(), n_source_re};
+    PdcchTdMmseOutputView gpu_out{gpu_re.data(), gpu_im.data(), gpu_sinr.data(),
+                                  gpu_g0.data(), gpu_g1.data(), n_source_re};
+    PdcchTdMmseResult cpu_meta{}, gpu_meta{};
+
+    expect_true(cpu.run_pdcch_td(in, cpu_out, cpu_meta) == MmseStatus::kOk, "cpu td run");
+    expect_true(gpu.run_pdcch_td(in, gpu_out, gpu_meta) == MmseStatus::kOk, "gpu cuda td run");
+    expect_true(cpu_meta.n_symbols == gpu_meta.n_symbols, "gpu cuda td symbol count");
+    for (std::uint32_t i = 0; i < cpu_meta.n_symbols; ++i) {
+        expect_near(gpu_re[i], cpu_re[i], 1.0e-4F, "gpu cuda td xhat real");
+        expect_near(gpu_im[i], cpu_im[i], 1.0e-4F, "gpu cuda td xhat imag");
+        expect_near(gpu_sinr[i], cpu_sinr[i], 1.0e-4F, "gpu cuda td sinr");
+        expect_true(gpu_g0[i] == cpu_g0[i] && gpu_g1[i] == cpu_g1[i], "gpu cuda td re pairs");
+    }
+#endif
+}
+
+void test_gpu_context_cuda_td_backend_run_matches_cpu_run() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kCuda;
+    gpu_config.sigma2_min = 1.0e-5F;
+    gpu_config.det_floor = 1.0e-6F;
+    gpu_config.g_min = 1.0e-4F;
+    gpu_config.gamma_max = 1.0e4F;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "gpu cuda td backend init");
+
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1;
+    cpu_config.sigma2_min = gpu_config.sigma2_min;
+    cpu_config.det_floor = gpu_config.det_floor;
+    cpu_config.g_min = gpu_config.g_min;
+    cpu_config.gamma_max = gpu_config.gamma_max;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "cpu td backend init");
+
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 2U;
+    desc.tx_mode = 2U;
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+    fill_pdcch_td_layout(buffers, desc, layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                         {1.0F, 0.0F}, s0, s1);
+    auto grid = make_grid_view(buffers);
+
+    std::vector<float> cpu_re(n_re), cpu_im(n_re), cpu_sinr(n_re);
+    std::vector<float> gpu_re(n_re), gpu_im(n_re), gpu_sinr(n_re);
+    EqualizerOutputView cpu_out{cpu_re.data(), cpu_im.data(), cpu_sinr.data(), n_re};
+    EqualizerOutputView gpu_out{gpu_re.data(), gpu_im.data(), gpu_sinr.data(), n_re};
+
+    expect_true(cpu.run(grid, desc, cpu_out) == MmseStatus::kOk, "cpu td backend run");
+    expect_true(gpu.run(grid, desc, gpu_out) == MmseStatus::kOk, "gpu td backend run");
+    expect_true(cpu_out.n_re_per_layer == gpu_out.n_re_per_layer, "td backend re count");
+    for (std::uint32_t i = 0; i < cpu_out.n_re_per_layer; ++i) {
+        expect_near(gpu_re[i], cpu_re[i], 1.0e-4F, "gpu td backend xhat real");
+        expect_near(gpu_im[i], cpu_im[i], 1.0e-4F, "gpu td backend xhat imag");
+        expect_near(gpu_sinr[i], cpu_sinr[i], 1.0e-4F, "gpu td backend sinr");
+    }
 #endif
 }
 
@@ -1387,6 +1789,8 @@ void test_gpu_context_cuda_float_transport_preserves_small_signal() {
 
     auto desc = make_fullband_desc();
     desc.n_layers = 1;
+    desc.n_tx_ports = 1;
+    desc.tx_mode = 1;
     GridBuffers buffers = make_zero_grid();
     fill_identity_channel(buffers, desc, 0.03125F, 0.0F);
     auto grid = make_grid_view(buffers);
@@ -1613,8 +2017,13 @@ int main() {
         std::pair{"single_layer_path", &test_single_layer_path},
         std::pair{"pdcch_layout_excludes_crs_and_reserved_res",
                   &test_pdcch_layout_excludes_crs_and_reserved_res},
-        std::pair{"pdcch_cpu_run_supports_single_port_and_rejects_two_port",
-                  &test_pdcch_cpu_run_supports_single_port_and_rejects_two_port},
+        std::pair{"pdcch_cpu_run_supports_single_port_and_generic_two_port_layout",
+                  &test_pdcch_cpu_run_supports_single_port_and_generic_two_port_layout},
+        std::pair{"pdcch_td_scalar_demap_recovers_qpsk_symbols",
+                  &test_pdcch_td_scalar_demap_recovers_qpsk_symbols},
+        std::pair{"pdcch_td_cpu_run_recovers_qpsk_symbols",
+                  &test_pdcch_td_cpu_run_recovers_qpsk_symbols},
+        std::pair{"pdcch_run_rejects_two_port_contract", &test_pdcch_run_rejects_two_port_contract},
         std::pair{"pdcch_module_api_returns_chain_metadata_and_re_indices",
                   &test_pdcch_module_api_returns_chain_metadata_and_re_indices},
         std::pair{"pdcch_mmse_input_validator", &test_pdcch_mmse_input_validator},
@@ -1642,6 +2051,8 @@ int main() {
                   &test_pdcch_frontend_control_subframe_drives_helpers},
         std::pair{"pdcch_backend_dto_packs_equalized_output",
                   &test_pdcch_backend_dto_packs_equalized_output},
+        std::pair{"pdcch_td_backend_dto_packs_equalized_output",
+                  &test_pdcch_td_backend_dto_packs_equalized_output},
         std::pair{"two_layer_scalar_golden_matches", &test_two_layer_scalar_golden_matches},
         std::pair{"two_layer_avx2_matches_scalar_kernel",
                   &test_two_layer_avx2_matches_scalar_kernel},
@@ -1652,6 +2063,11 @@ int main() {
         std::pair{"two_layer_repeated_runs_are_stable", &test_two_layer_repeated_runs_are_stable},
         std::pair{"gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback",
                   &test_gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback},
+        std::pair{"gpu_context_auto_td_fallback_matches_cpu_td",
+                  &test_gpu_context_auto_td_fallback_matches_cpu_td},
+        std::pair{"gpu_context_cuda_td_backend_run_matches_cpu_run",
+                  &test_gpu_context_cuda_td_backend_run_matches_cpu_run},
+        std::pair{"gpu_context_cuda_td_matches_cpu_td", &test_gpu_context_cuda_td_matches_cpu_td},
         std::pair{"gpu_context_auto_fallback_matches_cpu_context",
                   &test_gpu_context_auto_fallback_matches_cpu_context},
         std::pair{"gpu_context_cuda_two_layer_matches_cpu_context_samples",
