@@ -50,3 +50,56 @@ Validation sampling is now split into two layers:
   finite `xhat`, finite positive `sinr`, and header-level `sigma2` sanity
 - debug `trace_sample_count`: sampled REs that additionally emit per-sample equalizer trace payload
   for CPU-vs-GPU alignment
+
+## LTE PDCCH Adaptation
+
+The equalizer path now supports a second LTE downlink extraction mode through
+`ExtractDescriptor::channel_type`:
+
+- `MmseChannelType::kPdsch`: existing data-region flow
+- `MmseChannelType::kPdcch`: control-region flow for LTE PDCCH RE extraction
+
+For `kPdcch`, the caller must provide:
+
+- `control_symbol_count`: the LTE control-region size derived from PCFICH/CFI, in normal-CP
+  symbols (`1..3`)
+- `control_re_exclusion_masks`: per-control-symbol, per-PRB 12-bit RE masks for control-region REs
+  that must be excluded before equalization, such as PCFICH/PHICH-occupied REs
+
+Current support boundary:
+
+- LTE only, aligned with the repo's existing CRS-based 20 MHz normal-CP design
+- PDCCH extraction and MMSE equalization are supported for `1 Tx port`
+- `2 Tx port` LTE PDCCH is rejected as `unsupported_config` because the repo does not yet
+  implement the control-channel transmit-diversity de-mapping stage
+
+### Module Integration Surface
+
+For chain integration, prefer the dedicated PDCCH module API over manually building a generic
+`ExtractDescriptor`.
+
+Recommended single-header SDK entrypoint:
+
+- `#include "mmse/pdcch_chain_sdk.h"`
+- documentation index: `docs/pdcch_chain_sdk_interface.md` (`PDCCH Chain SDK v1`)
+- quick start: `docs/pdcch_chain_sdk_quick_start.md`
+- API reference: `docs/pdcch_chain_sdk_api_reference.md`
+- versioning policy: `docs/pdcch_chain_sdk_versioning_policy.md`
+
+Upstream-facing input:
+
+- `PdcchMmseInput`
+  - FFT grid: `grid`
+  - cell/time context: `sfn_subframe`, `cell_id`
+  - PDCCH region description: `control_symbol_count`, `n_prb`, `prb_bitmap`
+  - non-PDCCH control RE reservation: `control_re_exclusion_masks`
+  - chain passthrough metadata for later stages: `PdcchChainMetadata`
+
+Downstream-facing output:
+
+- equalized soft-symbol inputs: `x_hat_re`, `x_hat_im`, `sinr`
+- per-output RE source mapping: `re_grid_indices`
+- run metadata and passthrough fields: `PdcchMmseResult`
+
+This keeps the current module focused on channel estimation and equalization while preserving the
+resource-location and candidate metadata needed by downstream PDCCH-specific stages.
