@@ -1,4 +1,5 @@
 #include "mmse/mmse_equalizer.h"
+#include "mmse/pdcch_module_api.h"
 
 #include <algorithm>
 #include <array>
@@ -1102,6 +1103,11 @@ MmseStatus MmseEqualizerGpuContext::run(const PlanarGridViewF32& grid,
 
 MmseStatus MmseEqualizerGpuContext::run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out,
                                               PdcchMmseResult& meta) {
+    if (const MmseStatus status = mmse::pdcch::validate_pdcch_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
     ExtractDescriptor desc{};
     desc.sfn_subframe = in.sfn_subframe;
     desc.cell_id = in.cell_id;

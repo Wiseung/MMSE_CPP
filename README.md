@@ -66,12 +66,41 @@ For `kPdcch`, the caller must provide:
 - `control_re_exclusion_masks`: per-control-symbol, per-PRB 12-bit RE masks for control-region REs
   that must be excluded before equalization, such as PCFICH/PHICH-occupied REs
 
+For chain integration that wants to stay at the DTO level, the PDCCH helper layer now also
+provides additive reserved-RE generators for the current LTE support boundary:
+
+- `mmse::pdcch::append_pcfich_reserved_control_re_list(...)`
+- `mmse::pdcch::append_phich_reserved_control_re_list(...)`
+- `mmse::pdcch::append_fdd_phich_reserved_control_re_list(...)`
+
+These helpers auto-populate `FrontendPdcchIndication::reserved_control_res` for the current
+20 MHz normal-CP LTE boundary before `make_pdcch_mmse_input(...)` converts the list into
+`control_re_exclusion_masks`.
+
+Current helper contract is centered on one shared LTE control-subframe context:
+
+- `FrontendPdcchIndication::control_subframe`
+- `PdcchMmseInput::control_subframe`
+- `mmse::pdcch::LteControlSubframeContext`
+
+The current DTO-level integration path is:
+
+1. fill `FrontendPdcchIndication::control_subframe`
+2. call `append_pcfich_reserved_control_re_list(frontend)`
+3. call `append_phich_reserved_control_re_list(frontend, ...)`
+4. call `make_pdcch_mmse_input(...)`
+
+`run_pdcch(...)` now validates the low-level `PdcchMmseInput` through one centralized validator
+path before building the internal descriptor.
+
 Current support boundary:
 
 - LTE only, aligned with the repo's existing CRS-based 20 MHz normal-CP design
 - PDCCH extraction and MMSE equalization are supported for `1 Tx port`
 - `2 Tx port` LTE PDCCH is rejected as `unsupported_config` because the repo does not yet
   implement the control-channel transmit-diversity de-mapping stage
+- helper-based automatic `PHICH` reservation is available within the same LTE 20 MHz normal-CP
+  helper contract and does not expand the equalizer runtime contract
 
 ### Module Integration Surface
 

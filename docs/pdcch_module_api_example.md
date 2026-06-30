@@ -29,6 +29,20 @@ Then fill `PdcchMmseInput` and mark those REs as excluded.
 #include "mmse/pdcch_chain_sdk.h"
 
 mmse::pdcch::FrontendPdcchIndication frontend = get_frontend_pdcch_indication();
+frontend.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                             .subframe = 0,
+                             .ul_dl_config = 0,
+                             .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+mmse::pdcch::append_pcfich_reserved_control_re_list(frontend);
+const mmse::MmseStatus phich_status = mmse::pdcch::append_phich_reserved_control_re_list(
+    frontend,
+    {.resource = mmse::pdcch::PhichResource::kOne,
+     .duration = mmse::pdcch::PhichDuration::kNormal,
+     .mi = 1,
+     .subframe_ctx = frontend.control_subframe});
+if (phich_status != mmse::MmseStatus::kOk) {
+    return;
+}
 
 mmse::PdcchMmseInput in = mmse::pdcch::make_pdcch_mmse_input(fft_grid_view, frontend);
 ```
@@ -106,6 +120,12 @@ This is the intended handoff contract:
 
 - Upstream should treat `control_re_exclusion_masks` as the list of non-PDCCH control REs
 - Upstream should not mark CRS REs there; CRS is already excluded internally
+- If upstream wants helper-generated control-channel reservation, it should pass shared
+  `LteControlSubframeContext` through `FrontendPdcchIndication::control_subframe`, plus
+  `Ng + duration + mi` through `PhichReservationConfig`
+- In TDD mode, `mi` must match the selected `subframe_ctx.ul_dl_config + subframe_ctx.subframe`
+- For extended duration, `TDD subframe 1/6` special-case is selected automatically
+- True `MBSFN` subframes should be marked through `subframe_ctx.kind = kMbsfn`
 - Downstream should not assume output order equals CCE order
 - Downstream should use `re_grid_indices` to rebuild any required ordering
 - Current support is limited to `1 Tx port` LTE PDCCH

@@ -63,6 +63,7 @@ This index is intended for fast lookup of field ownership and semantics.
 | `control_symbol_count` | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
 | `n_prb`                | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
 | `prb_bitmap`           | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
+| `control_subframe`     | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
 | `reserved_control_res` | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
 | `chain`                | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
 
@@ -198,6 +199,9 @@ DTO / helper utilities:
 mmse::pdcch::make_pdcch_mmse_input(...)
 mmse::pdcch::make_backend_pdcch_equalized_indication(...)
 mmse::pdcch::decode_re_grid_index(...)
+mmse::pdcch::append_pcfich_reserved_control_re_list(...)
+mmse::pdcch::append_phich_reserved_control_re_list(...)
+mmse::pdcch::append_fdd_phich_reserved_control_re_list(...)
 ```
 
 ## 2. DTO definitions
@@ -216,6 +220,66 @@ Notes:
 
 - CRS REs should not be listed here. The SDK excludes CRS internally.
 - Typical use is to mark `PCFICH` and `PHICH` occupied REs.
+
+### 2.1a `mmse::pdcch::PhichResource`
+
+Helper enum used by automatic FDD PHICH reservation generation.
+
+| Value       | Meaning        |
+| ----------- | -------------- |
+| `kOneSixth` | LTE `Ng = 1/6` |
+| `kHalf`     | LTE `Ng = 1/2` |
+| `kOne`      | LTE `Ng = 1`   |
+| `kTwo`      | LTE `Ng = 2`   |
+
+### 2.1b `mmse::pdcch::PhichDuplexMode`
+
+Helper enum used by automatic PHICH reservation generation.
+
+| Value  | Meaning |
+| ------ | ------- |
+| `kFdd` | LTE FDD |
+| `kTdd` | LTE TDD |
+
+### 2.1c `mmse::pdcch::PhichDuration`
+
+Helper enum used by automatic PHICH reservation generation.
+
+| Value       | Meaning               |
+| ----------- | --------------------- |
+| `kNormal`   | normal PHICH duration |
+| `kExtended` | extended duration     |
+
+### 2.1d `mmse::pdcch::PhichSubframeKind`
+
+Structured subframe-kind enum for PHICH helper inputs.
+
+| Value      | Meaning          |
+| ---------- | ---------------- |
+| `kRegular` | regular subframe |
+| `kMbsfn`   | MBSFN subframe   |
+
+### 2.1e `mmse::pdcch::LteControlSubframeContext`
+
+Structured LTE control-subframe context shared by `PCFICH/PHICH` helpers.
+
+| Field          | Type                | Meaning              |
+| -------------- | ------------------- | -------------------- |
+| `duplex_mode`  | `PhichDuplexMode`   | LTE duplex mode      |
+| `subframe`     | `uint8_t`           | subframe index       |
+| `ul_dl_config` | `uint8_t`           | LTE TDD UL-DL config |
+| `kind`         | `PhichSubframeKind` | regular vs MBSFN     |
+
+### 2.1f `mmse::pdcch::PhichReservationConfig`
+
+Helper config object for automatic PHICH reservation generation.
+
+| Field          | Type                        | Meaning            |
+| -------------- | --------------------------- | ------------------ |
+| `resource`     | `PhichResource`             | LTE `Ng`           |
+| `duration`     | `PhichDuration`             | LTE PHICH duration |
+| `mi`           | `uint8_t`                   | LTE PHICH `M_i`    |
+| `subframe_ctx` | `LteControlSubframeContext` | subframe context   |
 
 ### 2.2 `mmse::PdcchChainMetadata`
 
@@ -246,6 +310,7 @@ Formal upstream DTO used to describe one PDCCH equalization request.
 | `control_symbol_count` | `uint8_t`                   | LTE control-region size                  | OFDM symbols       | `1..3`                          |
 | `n_prb`                | `uint16_t`                  | PRB count enabled in bitmap              | PRBs               | `1..100`                        |
 | `prb_bitmap`           | `array<uint16_t,7>`         | active PRBs                              | bitmap             | exactly `n_prb` bits set        |
+| `control_subframe`     | `LteControlSubframeContext` | shared LTE control-subframe context      | context            | helper-defined                  |
 | `reserved_control_res` | `vector<ReservedControlRe>` | non-PDCCH control REs                    | RE list            | zero or more                    |
 | `chain`                | `PdcchChainMetadata`        | passthrough metadata                     | none               | any                             |
 
@@ -253,18 +318,19 @@ Formal upstream DTO used to describe one PDCCH equalization request.
 
 Low-level module input after helper conversion.
 
-| Field                        | Type                  | Meaning                    | Unit               | Valid range                     |
-| ---------------------------- | --------------------- | -------------------------- | ------------------ | ------------------------------- |
-| `grid`                       | `PlanarGridViewF32`   | FFT grid input             | complex float32    | see `PlanarGridViewF32`         |
-| `sfn_subframe`               | `uint32_t`            | radio time index           | SFN\*10 + subframe | non-negative                    |
-| `cell_id`                    | `uint16_t`            | LTE physical cell ID       | none               | `0..503`                        |
-| `n_tx_ports`                 | `uint8_t`             | transmit port count        | ports              | current SDK support: `1`        |
-| `tx_mode`                    | `uint8_t`             | transmission mode tag      | none               | current SDK support: `1` or `2` |
-| `control_symbol_count`       | `uint8_t`             | LTE control region size    | OFDM symbols       | `1..3`                          |
-| `n_prb`                      | `uint16_t`            | active PRB count           | PRBs               | `1..100`                        |
-| `prb_bitmap`                 | `array<uint16_t,7>`   | active PRBs                | bitmap             | exactly `n_prb` bits set        |
-| `control_re_exclusion_masks` | `array<uint16_t,300>` | per-symbol/per-PRB RE mask | bitmask            | 12 bits used per entry          |
-| `chain`                      | `PdcchChainMetadata`  | passthrough metadata       | none               | any                             |
+| Field                        | Type                        | Meaning                             | Unit               | Valid range                     |
+| ---------------------------- | --------------------------- | ----------------------------------- | ------------------ | ------------------------------- |
+| `grid`                       | `PlanarGridViewF32`         | FFT grid input                      | complex float32    | see `PlanarGridViewF32`         |
+| `sfn_subframe`               | `uint32_t`                  | radio time index                    | SFN\*10 + subframe | non-negative                    |
+| `cell_id`                    | `uint16_t`                  | LTE physical cell ID                | none               | `0..503`                        |
+| `n_tx_ports`                 | `uint8_t`                   | transmit port count                 | ports              | current SDK support: `1`        |
+| `tx_mode`                    | `uint8_t`                   | transmission mode tag               | none               | current SDK support: `1` or `2` |
+| `control_symbol_count`       | `uint8_t`                   | LTE control region size             | OFDM symbols       | `1..3`                          |
+| `n_prb`                      | `uint16_t`                  | active PRB count                    | PRBs               | `1..100`                        |
+| `prb_bitmap`                 | `array<uint16_t,7>`         | active PRBs                         | bitmap             | exactly `n_prb` bits set        |
+| `control_subframe`           | `LteControlSubframeContext` | shared LTE control-subframe context | context            | helper-defined                  |
+| `control_re_exclusion_masks` | `array<uint16_t,300>`       | per-symbol/per-PRB RE mask          | bitmask            | 12 bits used per entry          |
+| `chain`                      | `PdcchChainMetadata`        | passthrough metadata                | none               | any                             |
 
 Mask mapping:
 
@@ -358,8 +424,62 @@ Builds `PdcchMmseInput` from one grid and one frontend DTO.
 Behavior:
 
 - copies `FrontendPdcchIndication` fields
+- copies `control_subframe` into `PdcchMmseInput`
 - converts `reserved_control_res` into `control_re_exclusion_masks`
+- `run_pdcch` later calls the centralized `PdcchMmseInput` validator on the low-level request
 - does not validate LTE semantics by itself; validation happens in `run_pdcch`
+
+Validator family:
+
+- `validate_lte_control_subframe_context(...)`
+- `validate_phich_reservation_config(...)`
+- `validate_pdcch_mmse_input(...)`
+
+### `append_pcfich_reserved_control_re_list(...)`
+
+Builds and appends the LTE PCFICH-occupied control REs into `reserved_control_res`.
+
+Behavior:
+
+- accepts the shared `LteControlSubframeContext`
+- `FrontendPdcchIndication` overload defaults to `frontend.control_subframe`
+- targets the current 20 MHz normal-CP helper boundary
+- marks only non-CRS REs inside the four PCFICH REGs
+- preserves existing caller-provided entries
+- de-duplicates repeated REs
+
+### `append_phich_reserved_control_re_list(...)`
+
+Builds and appends PHICH-occupied control REs into `reserved_control_res` using an explicit
+`PhichReservationConfig`.
+
+Behavior:
+
+- returns `mmse::MmseStatus::kOk` when the helper supports the requested config
+- returns `mmse::MmseStatus::kInvalidArgument` for malformed helper inputs such as
+  `subframe > 9`, `ul_dl_config > 6`, or mismatched TDD `mi`
+- current validated helper support is `FDD/TDD + normal CP + normal/extended PHICH duration`
+- in TDD mode, `mi` must match the selected `subframe_ctx.ul_dl_config + subframe_ctx.subframe`
+- for extended duration, `TDD subframe 1/6` special-case is selected automatically
+- true `MBSFN` subframes are selected through `subframe_ctx.kind = kMbsfn`
+- `FrontendPdcchIndication` convenience overloads can read the same context from
+  `frontend.control_subframe`
+- preserves existing caller-provided entries
+- de-duplicates repeated REs
+
+### `append_fdd_phich_reserved_control_re_list(...)`
+
+Builds and appends LTE FDD normal-duration PHICH-occupied control REs into
+`reserved_control_res`.
+
+Behavior:
+
+- convenience wrapper over `append_phich_reserved_control_re_list(...)`
+- targets the current 20 MHz FDD normal-CP helper boundary
+- consumes `PhichResource` to derive the PHICH group count
+- marks only non-CRS REs inside the selected PHICH REGs
+- preserves existing caller-provided entries
+- de-duplicates repeated REs
 
 ### `make_backend_pdcch_equalized_indication(meta, out)`
 
@@ -412,6 +532,7 @@ Important non-support:
 - `2 Tx port` LTE PDCCH is rejected
 - SDK does not perform transmit-diversity de-mapping
 - SDK does not decode `PCFICH` or `PHICH`
+- helper-based automatic PHICH reservation is limited to the documented FDD normal-CP boundary
 
 ## 6. Capacity requirements
 

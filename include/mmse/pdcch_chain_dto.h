@@ -23,6 +23,7 @@ struct FrontendPdcchIndication {
     std::uint8_t control_symbol_count = 0;
     std::uint16_t n_prb = 0;
     std::array<std::uint16_t, 7> prb_bitmap{};
+    LteControlSubframeContext control_subframe{};
     std::vector<ReservedControlRe> reserved_control_res{};
     PdcchChainMetadata chain{};
 };
