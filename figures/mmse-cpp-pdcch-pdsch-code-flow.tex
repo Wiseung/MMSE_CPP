@@ -1,0 +1,55 @@
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage[UTF8,fontset=windows]{ctex}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning}
+
+\begin{document}
+\begin{tikzpicture}[
+    font=\small,
+    >=Latex,
+    line/.style={-Latex, very thick, draw=gray!70},
+    box/.style={draw, rounded corners=5pt, very thick, align=center, minimum height=11mm},
+    src/.style={box, fill=violet!25, draw=violet!70!black, text width=4.4cm},
+    io/.style={box, fill=cyan!18, draw=cyan!55!black, text width=4.8cm},
+    proc/.style={box, fill=green!22, draw=green!45!black, text width=5.2cm},
+    outbox/.style={box, fill=gray!20, draw=gray!65!black, text width=5.2cm},
+    note/.style={draw=none, align=left, font=\scriptsize, text width=6.6cm}
+]
+
+\node[font=\Large\bfseries] (title) at (0, 1.0) {\texttt{MMSE\_CPP} 工程代码流程};
+
+\node[src]  (grid) at (0, 0) {FFT 资源网格输入\\\texttt{PlanarGridViewF32}};
+\node[io]   (desc) at (0, -2.0) {描述符 / DTO 构建\\\texttt{ExtractDescriptor} 或 \texttt{PdcchMmseInput}};
+\node[io]   (layout) at (0, -4.0) {RE 布局构建\\\texttt{build\_data\_re\_layout}\\\texttt{build\_pdcch\_re\_layout}};
+\node[proc] (est) at (0, -6.1) {CRS 信道估计\\\texttt{estimate\_channel}};
+\node[proc] (pack) at (0, -8.0) {均衡输入打包\\\texttt{pack\_equalizer\_inputs}};
+\node[proc] (eq) at (0, -10.2) {MMSE 均衡\\CPU: \texttt{equalize\_1x2} / \texttt{equalize\_2x2}\\GPU: \texttt{equalize\_stub\_kernel}};
+\node[proc] (td) at (0, -12.5) {PDCCH 2Tx 发射分集去映射\\CPU: \texttt{demap\_pdcch\_transmit\_diversity\_*}\\GPU: strict CUDA TD 分支};
+
+\node[outbox]  (pdsch) at (-7.0, -15.0) {PDSCH 软输出\\\texttt{x\_hat\_re / x\_hat\_im / sinr}\\\texttt{n\_re\_per\_layer / n\_layers / mod\_order}};
+\node[outbox]  (pdcch1) at (0, -15.0) {PDCCH 1Tx 输出\\\texttt{x\_hat / sinr / re\_grid\_indices}};
+\node[outbox]  (pdcch2) at (7.0, -15.0) {PDCCH 2Tx 输出\\\texttt{x\_hat / sinr / re\_grid\_indices0/1}};
+
+\node[outbox, text width=10.0cm] (down) at (0, -18.5) {下游仍需外部模块完成\\PBCH/MIB、PDCCH 盲检索与 DCI、PDSCH 解扰与 Turbo、MAC/RRC 解析};
+
+\draw[line] (grid) -- (desc);
+\draw[line] (desc) -- (layout);
+\draw[line] (layout) -- (est);
+\draw[line] (est) -- (pack);
+\draw[line] (pack) -- (eq);
+\draw[line] (eq) -- (td);
+
+\draw[line] (eq.west) -- ++(-1.2,0) |- (pdsch.north);
+\draw[line] (eq) -- (pdcch1);
+\draw[line] (td.east) -- ++(1.2,0) |- (pdcch2.north);
+
+\draw[line] (pdsch) -- (down);
+\draw[line] (pdcch1) -- (down);
+\draw[line] (pdcch2) -- (down);
+
+\node[note] at (-7.0, -8.8) {CPU 关键文件：\\\texttt{src/mmse\_equalizer\_cpu.cpp}};
+\node[note] at (7.2, -8.8) {GPU 关键文件：\\\texttt{src/mmse\_equalizer\_gpu.cpp}\\\texttt{src/mmse\_cuda\_runtime.cu}};
+\node[note] at (0, -21.2) {公开接口：\texttt{include/mmse/types.h}、\texttt{include/mmse/mmse\_equalizer.h}、\\\texttt{include/mmse/pdcch\_module\_api.h}、\texttt{include/mmse/pdcch\_chain\_dto.h}};
+
+\end{tikzpicture}
+\end{document}

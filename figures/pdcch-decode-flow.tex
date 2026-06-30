@@ -1,0 +1,69 @@
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage[UTF8,fontset=windows]{ctex}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc}
+
+\begin{document}
+\begin{tikzpicture}[
+    font=\small,
+    >=Latex,
+    line/.style={-Latex, very thick, draw=gray!70},
+    dashline/.style={-Latex, thick, draw=gray!55, dashed},
+    box/.style={draw, rounded corners=6pt, very thick, align=center, minimum height=11mm},
+    srca/.style={box, fill=violet!25, draw=violet!70!black, text width=4.0cm},
+    srcb/.style={box, fill=cyan!22, draw=cyan!55!black, text width=4.0cm},
+    mux/.style={box, fill=gray!18, draw=gray!65!black, text width=3.6cm},
+    proc/.style={box, fill=green!24, draw=green!45!black, text width=5.0cm},
+    outbox/.style={box, fill=gray!24, draw=gray!65!black, text width=5.1cm},
+    note/.style={draw=none, align=left, font=\scriptsize, text width=4.6cm},
+    badge/.style={circle, fill=white, draw=green!45!black, very thick, minimum size=6.5mm, inner sep=0pt, font=\bfseries\small}
+]
+
+\node[font=\Large\bfseries] (title) at (0, 1.2) {PDCCH 信道译码流程图};
+
+% source blocks
+\node[srca] (src_left) at (-4.8, 0) {上游控制信息\\CFI / 控制区大小\\PCFICH / PHICH 占用信息};
+\node[srcb] (src_right) at (4.8, 0) {主输入\\FFT 资源网格\\PCI / SFN / 天线配置};
+\node[mux] (mux) at (0, -2.1) {输入汇聚 / DTO 构建\\\texttt{PdcchMmseInput}};
+
+% main chain
+\node[proc] (step1) at (0, -4.5) {控制区参数整理与 RE 排除\\构造有效控制区资源\\排除 CRS / PCFICH / PHICH};
+\node[badge] (n1) at (-2.8, -4.5) {1};
+
+\node[proc] (step2) at (0, -6.9) {信道估计与 MMSE 均衡\\CRS 信道估计 $\rightarrow$ PDCCH 有效 RE 软符号};
+\node[badge] (n2) at (-2.8, -6.9) {2};
+\node[note] (note2) at (4.9, -6.9) {工程实现输出：\\$x\_hat\_{re}$、$x\_hat\_{im}$、$sinr$\\以及 RE 来源索引};
+
+\node[proc] (step3) at (0, -9.4) {发射分集去映射（2Tx 可选）\\1Tx：逐 RE 直出\\2Tx：按 RE 对恢复两个 QPSK 软符号};
+\node[badge] (n3) at (-2.8, -9.4) {3};
+\node[note] (note3) at (4.9, -9.4) {本工程新增：\\\texttt{run\_pdcch\_td(...)}\\输出 \texttt{re\_grid\_indices0/1}};
+
+\node[proc] (step4) at (0, -11.9) {QPSK 软比特 / LLR\\软符号 $\rightarrow$ 每比特置信度};
+\node[badge] (n4) at (-2.8, -11.9) {4};
+
+\node[proc] (step5) at (0, -14.4) {REG / CCE 重组 + 搜索空间候选\\聚合级别、候选位置、盲检索路径};
+\node[badge] (n5) at (-2.8, -14.4) {5};
+
+\node[proc] (step6) at (0, -16.9) {候选译码\\解扰 $\rightarrow$ 速率恢复\\卷积译码 $\rightarrow$ CRC-RNTI};
+\node[badge] (n6) at (-2.8, -16.9) {6};
+\node[note] (note6) at (4.9, -16.9) {标准完整接收机需要：\\盲检索全部候选并做 RNTI 掩码 CRC 校验};
+
+\node[outbox] (step7) at (0, -19.6) {DCI 输出\\RNTI / DCI 格式 / CCE / 聚合级别\\调度授权 / HARQ / MCS / RV / NDI};
+\node[badge] (n7) at (-2.8, -19.6) {7};
+
+% arrows
+\draw[line] (src_left) -- ($(mux.north west)+(0.3,0)$);
+\draw[line] (src_right) -- ($(mux.north east)+(-0.3,0)$);
+\draw[line] (mux) -- (step1);
+\draw[line] (step1) -- (step2);
+\draw[line] (step2) -- (step3);
+\draw[line] (step3) -- (step4);
+\draw[line] (step4) -- (step5);
+\draw[line] (step5) -- (step6);
+\draw[line] (step6) -- (step7);
+
+% footer note
+\node[note, text width=11.0cm] at (0, -22.3) {说明：当前 \texttt{MMSE\_CPP} 主要覆盖步骤 1--3，即控制区资源整理、CRS 信道估计、MMSE 均衡与 2Tx 发射分集去映射；步骤 4--7 属于完整 PDCCH 接收机后续链路，通常在仓库外部完成。};
+
+\end{tikzpicture}
+\end{document}
