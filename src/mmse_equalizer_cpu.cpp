@@ -46,6 +46,18 @@ inline bool bitmap_has_prb(const ExtractDescriptor& desc, std::uint32_t prb) {
     return (desc.prb_bitmap[word] & (static_cast<std::uint16_t>(1U) << bit)) != 0U;
 }
 
+inline bool control_re_excluded(const ExtractDescriptor& desc, std::uint32_t symbol,
+                                std::uint32_t prb, std::uint32_t tone) {
+    if (symbol >= desc.control_symbol_count || prb >= kLteNumPrb20MHz ||
+        tone >= kLteNumSubcarriersPerPrb) {
+        return false;
+    }
+    const std::size_t mask_idx =
+        static_cast<std::size_t>(symbol) * kLteNumPrb20MHz + static_cast<std::size_t>(prb);
+    return (desc.control_re_exclusion_masks[mask_idx] & (static_cast<std::uint16_t>(1U) << tone)) !=
+           0U;
+}
+
 inline Complex32 grid_at(const PlanarGridViewF32& grid, std::uint32_t rx, std::uint32_t symbol,
                          std::uint32_t sc) {
     const std::size_t idx = static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz + sc;
@@ -104,16 +116,16 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
     if (desc.cell_id >= kLteNumCellIds) {
         return false;
     }
-    if (desc.n_rx_ant != kLteNumRxAntV1 || desc.n_tx_ports != kLteNumTxPortsV1) {
+    if (desc.n_rx_ant != kLteNumRxAntV1) {
+        return false;
+    }
+    if (desc.n_tx_ports == 0U || desc.n_tx_ports > kLteNumTxPortsV1) {
         return false;
     }
     if (desc.n_layers != 1U && desc.n_layers != 2U) {
         return false;
     }
     if (desc.pmi != -1) {
-        return false;
-    }
-    if (desc.start_symbol >= kLteNumSymbolsNormalCp) {
         return false;
     }
     if (desc.mod_order != 2U && desc.mod_order != 4U && desc.mod_order != 6U &&
@@ -131,6 +143,39 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
         return false;
     }
     if (desc.tx_mode == 4U) {
+        return false;
+    }
+    switch (desc.channel_type) {
+    case MmseChannelType::kPdsch:
+        if (desc.start_symbol >= kLteNumSymbolsNormalCp) {
+            return false;
+        }
+        if (desc.control_symbol_count > kLteMaxControlSymbolsNormalCp) {
+            return false;
+        }
+        break;
+    case MmseChannelType::kPdcch:
+        if (desc.control_symbol_count == 0U ||
+            desc.control_symbol_count > kLteMaxControlSymbolsNormalCp) {
+            return false;
+        }
+        if (desc.start_symbol != 0U) {
+            return false;
+        }
+        if (desc.mod_order != 2U) {
+            return false;
+        }
+        if (desc.n_layers != 1U) {
+            return false;
+        }
+        if (desc.n_tx_ports != 1U) {
+            return false;
+        }
+        if (desc.tx_mode != 1U && desc.tx_mode != 2U) {
+            return false;
+        }
+        break;
+    default:
         return false;
     }
     return true;
@@ -182,6 +227,19 @@ bool is_crs_re(std::uint16_t cell_id, std::uint8_t symbol, std::uint32_t sc) {
     }
     return sc % 6U == crs_frequency_offset(cell_id, 0U, symbol) % 6U ||
            sc % 6U == crs_frequency_offset(cell_id, 1U, symbol) % 6U;
+}
+
+bool is_crs_re(const ExtractDescriptor& desc, std::uint8_t symbol, std::uint32_t sc) {
+    if (symbol != 0U && symbol != 4U && symbol != 7U && symbol != 11U) {
+        return false;
+    }
+    for (std::uint32_t port = 0; port < desc.n_tx_ports; ++port) {
+        if (sc % 6U ==
+            crs_frequency_offset(desc.cell_id, static_cast<std::uint8_t>(port), symbol) % 6U) {
+            return true;
+        }
+    }
+    return false;
 }
 
 const Complex32& crs_value(const CrsTableKey& key, std::uint32_t pilot_index) {
@@ -252,7 +310,7 @@ std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layo
             }
             for (std::uint32_t tone = 0; tone < 12U; ++tone) {
                 const std::uint32_t sc = prb * 12U + tone;
-                if (is_crs_re(desc.cell_id, static_cast<std::uint8_t>(symbol), sc)) {
+                if (is_crs_re(desc, static_cast<std::uint8_t>(symbol), sc)) {
                     continue;
                 }
                 const std::uint32_t grid_idx = symbol * kLteNumSubcarriers20MHz + sc;
@@ -265,6 +323,38 @@ std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layo
             layout.prb_segment_offsets[layout.n_segments++] = segment_begin;
         }
     }
+    layout.prb_segment_offsets[layout.n_segments] = layout.n_re;
+    return layout.n_re;
+}
+
+std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
+    layout.n_re = 0U;
+    layout.n_segments = 0U;
+    layout.output_slot_by_grid_re.fill(std::numeric_limits<std::uint32_t>::max());
+
+    for (std::uint32_t symbol = 0; symbol < desc.control_symbol_count; ++symbol) {
+        const std::uint32_t segment_begin = layout.n_re;
+        for (std::uint32_t prb = 0; prb < kLteNumPrb20MHz; ++prb) {
+            if (!bitmap_has_prb(desc, prb)) {
+                continue;
+            }
+            for (std::uint32_t tone = 0; tone < kLteNumSubcarriersPerPrb; ++tone) {
+                const std::uint32_t sc = prb * kLteNumSubcarriersPerPrb + tone;
+                if (is_crs_re(desc, static_cast<std::uint8_t>(symbol), sc) ||
+                    control_re_excluded(desc, symbol, prb, tone)) {
+                    continue;
+                }
+                const std::uint32_t grid_idx = symbol * kLteNumSubcarriers20MHz + sc;
+                layout.grid_indices[layout.n_re] = static_cast<std::uint16_t>(grid_idx);
+                layout.output_slot_by_grid_re[grid_idx] = layout.n_re;
+                ++layout.n_re;
+            }
+        }
+        if (layout.n_re > segment_begin) {
+            layout.prb_segment_offsets[layout.n_segments++] = segment_begin;
+        }
+    }
+
     layout.prb_segment_offsets[layout.n_segments] = layout.n_re;
     return layout.n_re;
 }
@@ -419,6 +509,10 @@ float update_sigma2_state(Sigma2State& state, float sigma2_estimate,
         config.sigma2_iir_alpha * state.value + (1.0F - config.sigma2_iir_alpha) * sigma2_estimate;
     state.value = std::max(state.value, config.sigma2_min);
     return state.value;
+}
+
+float peek_sigma2_state(const Sigma2State& state, float sigma2_min) {
+    return state.initialized ? std::max(state.value, sigma2_min) : sigma2_min;
 }
 
 void pack_equalizer_inputs(const PlanarGridViewF32& grid, const HGridStorage& h_full,
@@ -678,7 +772,9 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
         return MmseStatus::kUnsupportedConfig;
     }
 
-    const std::uint32_t n_re = detail::build_data_re_layout(desc, impl_->layout);
+    const std::uint32_t n_re = (desc.channel_type == MmseChannelType::kPdcch)
+                                   ? detail::build_pdcch_re_layout(desc, impl_->layout)
+                                   : detail::build_data_re_layout(desc, impl_->layout);
     if (out.capacity_re_per_layer < n_re) {
         return MmseStatus::kBufferTooSmall;
     }
@@ -714,6 +810,62 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
     impl_->pool.parallel_for(
         std::span<const std::pair<std::uint32_t, std::uint32_t>>(impl_->ranges.data(), workers),
         Impl::worker_task, &worker_ctx);
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerCpuContext::run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out,
+                                              PdcchMmseResult& meta) {
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = in.n_tx_ports;
+    desc.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    desc.n_layers = 1U;
+    desc.tx_mode = in.tx_mode;
+    desc.channel_type = MmseChannelType::kPdcch;
+    desc.start_symbol = 0U;
+    desc.control_symbol_count = in.control_symbol_count;
+    desc.mod_order = 2U;
+    desc.n_prb = in.n_prb;
+    desc.prb_bitmap = in.prb_bitmap;
+    desc.control_re_exclusion_masks = in.control_re_exclusion_masks;
+    desc.pmi = -1;
+
+    EqualizerOutputView base_out{};
+    base_out.x_hat_re = out.x_hat_re;
+    base_out.x_hat_im = out.x_hat_im;
+    base_out.sinr = out.sinr;
+    base_out.capacity_re_per_layer = out.capacity_re_per_layer;
+
+    const MmseStatus status = run(in.grid, desc, base_out);
+    if (status != MmseStatus::kOk) {
+        return status;
+    }
+    if (out.re_grid_indices == nullptr || out.capacity_re_metadata < base_out.n_re_per_layer) {
+        return MmseStatus::kBufferTooSmall;
+    }
+
+    for (std::uint32_t i = 0; i < base_out.n_re_per_layer; ++i) {
+        out.re_grid_indices[i] = impl_->layout.grid_indices[i];
+    }
+
+    meta = {};
+    meta.n_re = base_out.n_re_per_layer;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.n_symbols = in.grid.n_symbols;
+    meta.n_subcarriers = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.n_prb = in.n_prb;
+    meta.n_tx_ports = in.n_tx_ports;
+    meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    meta.n_layers = base_out.n_layers;
+    meta.tx_mode = in.tx_mode;
+    meta.control_symbol_count = in.control_symbol_count;
+    meta.mod_order = base_out.mod_order;
+    meta.sigma2 =
+        detail::peek_sigma2_state(impl_->sigma2_by_cell[in.cell_id], impl_->config.sigma2_min);
+    meta.prb_bitmap = in.prb_bitmap;
+    meta.chain = in.chain;
     return MmseStatus::kOk;
 }
 

@@ -720,7 +720,11 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     last_host_profile.stream_gpu_us = 0.0;
 
     const Clock::time_point layout_start = Clock::now();
-    detail::build_data_re_layout(desc, slot.layout);
+    if (desc.channel_type == MmseChannelType::kPdcch) {
+        detail::build_pdcch_re_layout(desc, slot.layout);
+    } else {
+        detail::build_data_re_layout(desc, slot.layout);
+    }
     last_host_profile.layout_build_us = elapsed_us(layout_start, Clock::now());
 
     const Clock::time_point grid_meta_pack_start = Clock::now();
@@ -1093,6 +1097,62 @@ MmseStatus MmseEqualizerGpuContext::run(const PlanarGridViewF32& grid,
     if (const MmseStatus status = impl_->stage_outputs(out); status != MmseStatus::kOk) {
         return status;
     }
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerGpuContext::run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out,
+                                              PdcchMmseResult& meta) {
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = in.n_tx_ports;
+    desc.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    desc.n_layers = 1U;
+    desc.tx_mode = in.tx_mode;
+    desc.channel_type = MmseChannelType::kPdcch;
+    desc.start_symbol = 0U;
+    desc.control_symbol_count = in.control_symbol_count;
+    desc.mod_order = 2U;
+    desc.n_prb = in.n_prb;
+    desc.prb_bitmap = in.prb_bitmap;
+    desc.control_re_exclusion_masks = in.control_re_exclusion_masks;
+    desc.pmi = -1;
+
+    EqualizerOutputView base_out{};
+    base_out.x_hat_re = out.x_hat_re;
+    base_out.x_hat_im = out.x_hat_im;
+    base_out.sinr = out.sinr;
+    base_out.capacity_re_per_layer = out.capacity_re_per_layer;
+
+    const MmseStatus status = run(in.grid, desc, base_out);
+    if (status != MmseStatus::kOk) {
+        return status;
+    }
+    if (out.re_grid_indices == nullptr || out.capacity_re_metadata < base_out.n_re_per_layer) {
+        return MmseStatus::kBufferTooSmall;
+    }
+
+    const auto& slot = impl_->buffers.slots[impl_->buffers.completed_slot];
+    for (std::uint32_t i = 0; i < base_out.n_re_per_layer; ++i) {
+        out.re_grid_indices[i] = slot.layout.grid_indices[i];
+    }
+
+    meta = {};
+    meta.n_re = base_out.n_re_per_layer;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.n_symbols = in.grid.n_symbols;
+    meta.n_subcarriers = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.n_prb = in.n_prb;
+    meta.n_tx_ports = in.n_tx_ports;
+    meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    meta.n_layers = base_out.n_layers;
+    meta.tx_mode = in.tx_mode;
+    meta.control_symbol_count = in.control_symbol_count;
+    meta.mod_order = base_out.mod_order;
+    meta.sigma2 = slot.grid_meta.sigma2;
+    meta.prb_bitmap = in.prb_bitmap;
+    meta.chain = in.chain;
     return MmseStatus::kOk;
 }
 

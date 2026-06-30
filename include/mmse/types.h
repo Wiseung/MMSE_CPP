@@ -36,6 +36,11 @@ enum class MmseGpuValidationPolicy : std::uint8_t {
     kTestDeepTrace,
 };
 
+enum class MmseChannelType : std::uint8_t {
+    kPdsch = 0,
+    kPdcch,
+};
+
 struct PlanarGridViewF32 {
     std::array<const float*, 2> re{};
     std::array<const float*, 2> im{};
@@ -51,11 +56,36 @@ struct ExtractDescriptor {
     std::uint8_t n_rx_ant = 0;
     std::uint8_t n_layers = 0;
     std::uint8_t tx_mode = 0;
+    MmseChannelType channel_type = MmseChannelType::kPdsch;
     std::uint8_t start_symbol = 0;
+    std::uint8_t control_symbol_count = 0;
     std::uint8_t mod_order = 0;
     std::uint16_t n_prb = 0;
     std::array<std::uint16_t, 7> prb_bitmap{};
+    std::array<std::uint16_t, kLteMaxControlSymbolsNormalCp * kLteNumPrb20MHz>
+        control_re_exclusion_masks{};
     std::int8_t pmi = -1;
+};
+
+struct PdcchChainMetadata {
+    std::uint64_t request_id = 0;
+    std::uint32_t candidate_id = 0;
+    std::uint16_t first_cce = 0;
+    std::uint8_t aggregation_level = 0;
+};
+
+struct PdcchMmseInput {
+    PlanarGridViewF32 grid{};
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    std::uint8_t n_tx_ports = 1;
+    std::uint8_t tx_mode = 1;
+    std::uint8_t control_symbol_count = 0;
+    std::uint16_t n_prb = 0;
+    std::array<std::uint16_t, 7> prb_bitmap{};
+    std::array<std::uint16_t, kLteMaxControlSymbolsNormalCp * kLteNumPrb20MHz>
+        control_re_exclusion_masks{};
+    PdcchChainMetadata chain{};
 };
 
 struct EqualizerOutputView {
@@ -66,6 +96,33 @@ struct EqualizerOutputView {
     std::uint32_t n_re_per_layer = 0;
     std::uint8_t n_layers = 0;
     std::uint8_t mod_order = 0;
+};
+
+struct PdcchMmseOutputView {
+    float* x_hat_re = nullptr;
+    float* x_hat_im = nullptr;
+    float* sinr = nullptr;
+    std::uint16_t* re_grid_indices = nullptr;
+    std::uint32_t capacity_re_per_layer = 0;
+    std::uint32_t capacity_re_metadata = 0;
+};
+
+struct PdcchMmseResult {
+    std::uint32_t n_re = 0;
+    std::uint32_t sfn_subframe = 0;
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_subcarriers = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t control_symbol_count = 0;
+    std::uint8_t mod_order = 0;
+    float sigma2 = 0.0F;
+    std::array<std::uint16_t, 7> prb_bitmap{};
+    PdcchChainMetadata chain{};
 };
 
 struct MmseEqualizerCpuConfig {

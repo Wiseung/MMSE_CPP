@@ -127,7 +127,9 @@ std::uint32_t crs_frequency_offset(std::uint16_t cell_id, std::uint8_t port, std
 std::uint32_t crs_subcarrier(std::uint16_t cell_id, std::uint8_t port, std::uint8_t symbol,
                              std::uint32_t pilot_index);
 bool is_crs_re(std::uint16_t cell_id, std::uint8_t symbol, std::uint32_t sc);
+bool is_crs_re(const ExtractDescriptor& desc, std::uint8_t symbol, std::uint32_t sc);
 std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layout);
+std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& layout);
 std::uint32_t build_validation_re_samples(const ReLayout& layout, std::uint32_t start_symbol,
                                           std::uint32_t n_symbols, std::uint32_t n_subcarriers,
                                           std::uint32_t* out_re_slots, std::uint32_t max_slots);
@@ -148,6 +150,7 @@ void estimate_channel(
 
 float update_sigma2_state(Sigma2State& state, float sigma2_estimate,
                           const MmseEqualizerCpuConfig& config);
+float peek_sigma2_state(const Sigma2State& state, float sigma2_min);
 
 void pack_equalizer_inputs(
     const PlanarGridViewF32& grid,

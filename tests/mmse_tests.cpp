@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "mmse/mmse_equalizer.h"
+#include "mmse/pdcch_chain_dto.h"
+#include "mmse/pdcch_module_api.h"
 #include "internal/mmse_internal.h"
 
 using mmse::EqualizerOutputView;
@@ -129,6 +131,7 @@ ExtractDescriptor make_fullband_desc() {
     desc.n_rx_ant = 2;
     desc.n_layers = 2;
     desc.start_symbol = 1;
+    desc.control_symbol_count = 0;
     desc.mod_order = 2;
     desc.n_prb = 100;
     desc.tx_mode = 2;
@@ -136,6 +139,25 @@ ExtractDescriptor make_fullband_desc() {
     desc.sfn_subframe = 3;
     desc.prb_bitmap.fill(0xFFFFU);
     desc.prb_bitmap.back() = 0x000FU;
+    return desc;
+}
+
+ExtractDescriptor make_pdcch_desc() {
+    ExtractDescriptor desc{};
+    desc.cell_id = 0;
+    desc.n_tx_ports = 1;
+    desc.n_rx_ant = 2;
+    desc.n_layers = 1;
+    desc.tx_mode = 1;
+    desc.channel_type = MmseChannelType::kPdcch;
+    desc.start_symbol = 0;
+    desc.control_symbol_count = 3;
+    desc.mod_order = 2;
+    desc.n_prb = 100;
+    desc.sfn_subframe = 3;
+    desc.prb_bitmap.fill(0xFFFFU);
+    desc.prb_bitmap.back() = 0x000FU;
+    desc.control_re_exclusion_masks.fill(0U);
     return desc;
 }
 
@@ -632,6 +654,205 @@ void test_single_layer_path() {
     expect_near(out.x_hat_re[0], 0.75F, 1.0e-3F, "single-layer xhat");
 }
 
+void test_pdcch_layout_excludes_crs_and_reserved_res() {
+    const auto desc = make_pdcch_desc();
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    expect_true(n_re == 3400U, "pdcch RE count without extra reserved REs");
+    for (std::uint32_t i = 0; i < n_re; ++i) {
+        const std::uint32_t grid_idx = layout.grid_indices[i];
+        const std::uint32_t symbol = grid_idx / kLteNumSubcarriers20MHz;
+        const std::uint32_t sc = grid_idx % kLteNumSubcarriers20MHz;
+        expect_true(symbol < desc.control_symbol_count, "pdcch symbol must stay in control region");
+        expect_true(!mmse::detail::is_crs_re(desc, static_cast<std::uint8_t>(symbol), sc),
+                    "pdcch layout must exclude CRS");
+    }
+
+    auto reserved = desc;
+    reserved.control_re_exclusion_masks[kLteNumPrb20MHz] = 0x000FU;
+    const std::uint32_t n_re_reserved = mmse::detail::build_pdcch_re_layout(reserved, layout);
+    expect_true(n_re_reserved == n_re - 4U, "reserved control REs must be excluded");
+}
+
+void test_pdcch_cpu_run_supports_single_port_and_rejects_two_port() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1;
+    config.sigma2_min = 1.0e-5F;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "init must succeed");
+
+    GridBuffers buffers = make_zero_grid();
+    auto desc = make_pdcch_desc();
+    fill_identity_channel(buffers, desc, 1.0F, 0.0F);
+    auto grid = make_grid_view(buffers);
+
+    const std::uint32_t cap = 8000U;
+    std::vector<float> xre(cap);
+    std::vector<float> xim(cap);
+    std::vector<float> sinr(cap);
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
+    expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "single-port pdcch run");
+    expect_true(out.n_re_per_layer == 3400U, "single-port pdcch RE count");
+    expect_true(out.mod_order == 2U, "pdcch mod order must stay qpsk");
+
+    auto unsupported = desc;
+    unsupported.n_tx_ports = 2U;
+    expect_true(ctx.run(grid, unsupported, out) == MmseStatus::kUnsupportedConfig,
+                "two-port pdcch should be rejected");
+}
+
+void test_pdcch_module_api_returns_chain_metadata_and_re_indices() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1;
+    config.sigma2_min = 1.0e-5F;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "init must succeed");
+
+    GridBuffers buffers = make_zero_grid();
+    auto desc = make_pdcch_desc();
+    fill_identity_channel(buffers, desc, 1.0F, 0.0F);
+
+    PdcchMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = desc.n_tx_ports;
+    in.tx_mode = desc.tx_mode;
+    in.control_symbol_count = desc.control_symbol_count;
+    in.n_prb = desc.n_prb;
+    in.prb_bitmap = desc.prb_bitmap;
+    in.control_re_exclusion_masks = desc.control_re_exclusion_masks;
+    in.chain.request_id = 77U;
+    in.chain.candidate_id = 5U;
+    in.chain.first_cce = 2U;
+    in.chain.aggregation_level = 4U;
+
+    const std::uint32_t cap = 8000U;
+    std::vector<float> xre(cap);
+    std::vector<float> xim(cap);
+    std::vector<float> sinr(cap);
+    std::vector<std::uint16_t> indices(cap);
+    PdcchMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices = indices.data();
+    out.capacity_re_per_layer = cap;
+    out.capacity_re_metadata = cap;
+
+    PdcchMmseResult meta{};
+    expect_true(ctx.run_pdcch(in, out, meta) == MmseStatus::kOk, "pdcch module api run");
+    expect_true(meta.n_re == 3400U, "pdcch module api RE count");
+    expect_true(meta.chain.request_id == in.chain.request_id, "request id passthrough");
+    expect_true(meta.chain.candidate_id == in.chain.candidate_id, "candidate id passthrough");
+    expect_true(meta.chain.first_cce == in.chain.first_cce, "first cce passthrough");
+    expect_true(meta.chain.aggregation_level == in.chain.aggregation_level,
+                "aggregation passthrough");
+    expect_true(meta.control_symbol_count == in.control_symbol_count, "cfi passthrough");
+    expect_true(meta.mod_order == 2U, "pdcch api qpsk");
+    expect_true(indices[0] < kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz,
+                "grid index must be valid");
+}
+
+void test_pdcch_helper_mask_and_grid_index_decode() {
+    PdcchMmseInput in{};
+    mmse::pdcch::clear_control_re_exclusion_masks(in);
+    expect_true(!mmse::pdcch::is_control_re_excluded(in, 1U, 10U, 3U), "mask should start clear");
+    mmse::pdcch::exclude_control_re(in, 1U, 10U, 3U);
+    expect_true(mmse::pdcch::is_control_re_excluded(in, 1U, 10U, 3U),
+                "mask helper should mark reserved RE");
+
+    const std::uint16_t grid_index =
+        static_cast<std::uint16_t>(2U * kLteNumSubcarriers20MHz + 123U);
+    const auto coord = mmse::pdcch::decode_re_grid_index(grid_index);
+    expect_true(coord.symbol == 2U, "decoded symbol");
+    expect_true(coord.subcarrier == 123U, "decoded subcarrier");
+    expect_true(coord.prb == 10U, "decoded prb");
+    expect_true(coord.tone_in_prb == 3U, "decoded tone");
+}
+
+void test_pdcch_helper_apply_reserved_re_list() {
+    PdcchMmseInput in{};
+    const std::array reserved = {
+        mmse::pdcch::ReservedControlRe{.symbol = 0U, .prb = 0U, .tone_in_prb = 1U},
+        mmse::pdcch::ReservedControlRe{.symbol = 2U, .prb = 5U, .tone_in_prb = 11U},
+    };
+
+    mmse::pdcch::apply_reserved_control_re_list(in, reserved);
+    expect_true(mmse::pdcch::is_control_re_excluded(in, 0U, 0U, 1U),
+                "first reserved RE should be applied");
+    expect_true(mmse::pdcch::is_control_re_excluded(in, 2U, 5U, 11U),
+                "second reserved RE should be applied");
+    expect_true(!mmse::pdcch::is_control_re_excluded(in, 0U, 0U, 0U),
+                "non-reserved RE should remain clear");
+}
+
+void test_pdcch_frontend_dto_builds_mmse_input() {
+    GridBuffers buffers = make_zero_grid();
+    auto grid = make_grid_view(buffers);
+
+    mmse::pdcch::FrontendPdcchIndication frontend{};
+    frontend.sfn_subframe = 9U;
+    frontend.cell_id = 22U;
+    frontend.n_tx_ports = 1U;
+    frontend.tx_mode = 1U;
+    frontend.control_symbol_count = 3U;
+    frontend.n_prb = 100U;
+    frontend.prb_bitmap.fill(0xFFFFU);
+    frontend.prb_bitmap.back() = 0x000FU;
+    frontend.chain.request_id = 55U;
+    frontend.chain.candidate_id = 6U;
+    frontend.chain.first_cce = 3U;
+    frontend.chain.aggregation_level = 4U;
+    frontend.reserved_control_res.push_back({.symbol = 0U, .prb = 1U, .tone_in_prb = 2U});
+
+    const PdcchMmseInput in = mmse::pdcch::make_pdcch_mmse_input(grid, frontend);
+    expect_true(in.grid.n_symbols == grid.n_symbols, "dto grid passthrough");
+    expect_true(in.sfn_subframe == frontend.sfn_subframe, "dto subframe passthrough");
+    expect_true(in.cell_id == frontend.cell_id, "dto cell passthrough");
+    expect_true(in.control_symbol_count == frontend.control_symbol_count, "dto cfi passthrough");
+    expect_true(in.chain.request_id == frontend.chain.request_id, "dto chain passthrough");
+    expect_true(mmse::pdcch::is_control_re_excluded(in, 0U, 1U, 2U), "dto reserved RE application");
+}
+
+void test_pdcch_backend_dto_packs_equalized_output() {
+    PdcchMmseResult meta{};
+    meta.n_re = 3U;
+    meta.sfn_subframe = 9U;
+    meta.cell_id = 21U;
+    meta.n_prb = 100U;
+    meta.n_tx_ports = 1U;
+    meta.n_rx_ant = 2U;
+    meta.n_layers = 1U;
+    meta.tx_mode = 1U;
+    meta.control_symbol_count = 3U;
+    meta.mod_order = 2U;
+    meta.sigma2 = 0.125F;
+    meta.chain.request_id = 88U;
+    meta.chain.candidate_id = 4U;
+    meta.chain.first_cce = 6U;
+    meta.chain.aggregation_level = 8U;
+
+    std::array<float, 3> xre = {1.0F, 2.0F, 3.0F};
+    std::array<float, 3> xim = {0.1F, 0.2F, 0.3F};
+    std::array<float, 3> sinr = {10.0F, 11.0F, 12.0F};
+    std::array<std::uint16_t, 3> grid_idx = {4U, 5U, 6U};
+
+    PdcchMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices = grid_idx.data();
+
+    const auto backend = mmse::pdcch::make_backend_pdcch_equalized_indication(meta, out);
+    expect_true(backend.re_grid_indices.size() == 3U, "backend dto size");
+    expect_true(backend.x_hat_re[1] == 2.0F, "backend dto xhat real");
+    expect_true(backend.x_hat_im[2] == 0.3F, "backend dto xhat imag");
+    expect_true(backend.sinr[0] == 10.0F, "backend dto sinr");
+    expect_true(backend.chain.request_id == meta.chain.request_id, "backend dto chain");
+    expect_true(backend.sigma2 == meta.sigma2, "backend dto sigma2");
+}
+
 void test_gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback() {
     MmseEqualizerGpuContext gpu;
     MmseEqualizerGpuConfig config{};
@@ -1034,6 +1255,19 @@ int main() {
                   &test_single_layer_identity_channel_equalization},
         std::pair{"sigma2_state_persists", &test_sigma2_state_persists},
         std::pair{"single_layer_path", &test_single_layer_path},
+        std::pair{"pdcch_layout_excludes_crs_and_reserved_res",
+                  &test_pdcch_layout_excludes_crs_and_reserved_res},
+        std::pair{"pdcch_cpu_run_supports_single_port_and_rejects_two_port",
+                  &test_pdcch_cpu_run_supports_single_port_and_rejects_two_port},
+        std::pair{"pdcch_module_api_returns_chain_metadata_and_re_indices",
+                  &test_pdcch_module_api_returns_chain_metadata_and_re_indices},
+        std::pair{"pdcch_helper_mask_and_grid_index_decode",
+                  &test_pdcch_helper_mask_and_grid_index_decode},
+        std::pair{"pdcch_helper_apply_reserved_re_list", &test_pdcch_helper_apply_reserved_re_list},
+        std::pair{"pdcch_frontend_dto_builds_mmse_input",
+                  &test_pdcch_frontend_dto_builds_mmse_input},
+        std::pair{"pdcch_backend_dto_packs_equalized_output",
+                  &test_pdcch_backend_dto_packs_equalized_output},
         std::pair{"two_layer_scalar_golden_matches", &test_two_layer_scalar_golden_matches},
         std::pair{"two_layer_avx2_matches_scalar_kernel",
                   &test_two_layer_avx2_matches_scalar_kernel},
