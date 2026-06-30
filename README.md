@@ -96,9 +96,9 @@ path before building the internal descriptor.
 Current support boundary:
 
 - LTE only, aligned with the repo's existing CRS-based 20 MHz normal-CP design
-- PDCCH extraction and MMSE equalization are supported for `1 Tx port`
-- `2 Tx port` LTE PDCCH is rejected as `unsupported_config` because the repo does not yet
-  implement the control-channel transmit-diversity de-mapping stage
+- legacy `run_pdcch(...)` per-RE contract is supported for `1 Tx port`
+- additive `run_pdcch_td(...)` contract supports `2 Tx port` LTE PDCCH transmit-diversity
+  de-mapping and outputs two soft symbols per RE pair
 - helper-based automatic `PHICH` reservation is available within the same LTE 20 MHz normal-CP
   helper contract and does not expand the equalizer runtime contract
 
@@ -126,9 +126,14 @@ Upstream-facing input:
 
 Downstream-facing output:
 
-- equalized soft-symbol inputs: `x_hat_re`, `x_hat_im`, `sinr`
-- per-output RE source mapping: `re_grid_indices`
-- run metadata and passthrough fields: `PdcchMmseResult`
+- legacy per-RE surface:
+  - equalized soft-symbol inputs: `x_hat_re`, `x_hat_im`, `sinr`
+  - per-output RE source mapping: `re_grid_indices`
+  - run metadata and passthrough fields: `PdcchMmseResult`
+- additive 2Tx TD surface:
+  - equalized soft-symbol inputs: `x_hat_re`, `x_hat_im`, `sinr`
+  - per-soft-symbol RE-pair mapping: `re_grid_indices0`, `re_grid_indices1`
+  - run metadata and passthrough fields: `PdcchTdMmseResult`
 
 This keeps the current module focused on channel estimation and equalization while preserving the
 resource-location and candidate metadata needed by downstream PDCCH-specific stages.

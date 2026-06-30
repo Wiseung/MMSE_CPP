@@ -492,6 +492,29 @@ make_backend_pdcch_equalized_indication(const PdcchMmseResult& meta,
     return backend;
 }
 
+inline BackendPdcchTdEqualizedIndication
+make_backend_pdcch_td_equalized_indication(const PdcchTdMmseResult& meta,
+                                           const PdcchTdMmseOutputView& out) {
+    BackendPdcchTdEqualizedIndication backend{};
+    backend.sfn_subframe = meta.sfn_subframe;
+    backend.cell_id = meta.cell_id;
+    backend.n_prb = meta.n_prb;
+    backend.n_tx_ports = meta.n_tx_ports;
+    backend.n_rx_ant = meta.n_rx_ant;
+    backend.n_layers = meta.n_layers;
+    backend.tx_mode = meta.tx_mode;
+    backend.control_symbol_count = meta.control_symbol_count;
+    backend.mod_order = meta.mod_order;
+    backend.sigma2 = meta.sigma2;
+    backend.chain = meta.chain;
+    backend.x_hat_re.assign(out.x_hat_re, out.x_hat_re + meta.n_symbols);
+    backend.x_hat_im.assign(out.x_hat_im, out.x_hat_im + meta.n_symbols);
+    backend.sinr.assign(out.sinr, out.sinr + meta.n_symbols);
+    backend.re_grid_indices0.assign(out.re_grid_indices0, out.re_grid_indices0 + meta.n_symbols);
+    backend.re_grid_indices1.assign(out.re_grid_indices1, out.re_grid_indices1 + meta.n_symbols);
+    return backend;
+}
+
 inline ReCoord decode_re_grid_index(std::uint16_t grid_index) {
     const std::uint32_t symbol = grid_index / kLteNumSubcarriers20MHz;
     const std::uint32_t subcarrier = grid_index % kLteNumSubcarriers20MHz;

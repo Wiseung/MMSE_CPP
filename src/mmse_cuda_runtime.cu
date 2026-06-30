@@ -42,6 +42,21 @@ __device__ inline float clampf(float value, float lo, float hi) {
     return value < lo ? lo : (value > hi ? hi : value);
 }
 
+__device__ inline bool is_pdcch_td_pair_start(const CudaGridMeta* grid_meta,
+                                              std::uint32_t re,
+                                              std::uint32_t grid_idx) {
+    if (grid_meta == nullptr || grid_meta->channel_type != 1U || grid_meta->n_layers != 1U ||
+        grid_meta->n_tx_ports != 2U) {
+        return false;
+    }
+    if ((re & 1U) != 0U || re + 1U >= grid_meta->n_valid_re) {
+        return false;
+    }
+    const std::uint32_t next_grid_idx = grid_meta->grid_indices[re + 1U];
+    return (grid_idx / grid_meta->n_subcarriers) == (next_grid_idx / grid_meta->n_subcarriers) &&
+           next_grid_idx == grid_idx + 1U;
+}
+
 __host__ __device__ inline std::uint32_t min_u32(std::uint32_t lhs, std::uint32_t rhs) {
     return lhs < rhs ? lhs : rhs;
 }
@@ -347,6 +362,9 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
         const std::uint32_t out_slot = grid_meta->output_slot_by_grid_re[grid_idx];
         const std::uint32_t symbol = grid_idx / grid_meta->n_subcarriers;
         const std::uint32_t sc = grid_idx % grid_meta->n_subcarriers;
+        const bool td_pdcch_mode =
+            grid_meta->channel_type == 1U && grid_meta->n_layers == 1U &&
+            grid_meta->n_tx_ports == 2U;
 
         const float y0_re = grid_re0[grid_idx];
         const float y0_im = grid_im0[grid_idx];
@@ -375,7 +393,80 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
         const float h10_re = h_estimate[h10_base];
         const float h10_im = h_estimate[h10_base + 1U];
 
-        if (grid_meta->n_layers == 1U) {
+        if (td_pdcch_mode && is_pdcch_td_pair_start(grid_meta, re, grid_idx)) {
+            const std::uint32_t next_grid_idx = grid_meta->grid_indices[re + 1U];
+            const std::uint32_t next_symbol = next_grid_idx / grid_meta->n_subcarriers;
+            const std::uint32_t next_sc = next_grid_idx % grid_meta->n_subcarriers;
+            const float y0n_re = grid_re0[next_grid_idx];
+            const float y0n_im = grid_im0[next_grid_idx];
+            const float y1n_re = grid_re1[next_grid_idx];
+            const float y1n_im = grid_im1[next_grid_idx];
+
+            const std::uint32_t h00n_base =
+                2U * (((0U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + next_symbol) *
+                          kLteNumSubcarriers20MHz +
+                      next_sc);
+            const std::uint32_t h01n_base =
+                2U * (((1U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + next_symbol) *
+                          kLteNumSubcarriers20MHz +
+                      next_sc);
+            const std::uint32_t h10n_base =
+                2U * (((0U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + next_symbol) *
+                          kLteNumSubcarriers20MHz +
+                      next_sc);
+            const std::uint32_t h11n_base =
+                2U * (((1U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + next_symbol) *
+                          kLteNumSubcarriers20MHz +
+                      next_sc);
+
+            const CudaComplex32 h00{h00_re, h00_im};
+            const CudaComplex32 h01{h_estimate[h01_base], h_estimate[h01_base + 1U]};
+            const CudaComplex32 h10{h10_re, h10_im};
+            const CudaComplex32 h11{h_estimate[h11_base], h_estimate[h11_base + 1U]};
+            const CudaComplex32 h00n{h_estimate[h00n_base], h_estimate[h00n_base + 1U]};
+            const CudaComplex32 h01n{h_estimate[h01n_base], h_estimate[h01n_base + 1U]};
+            const CudaComplex32 h10n{h_estimate[h10n_base], h_estimate[h10n_base + 1U]};
+            const CudaComplex32 h11n{h_estimate[h11n_base], h_estimate[h11n_base + 1U]};
+            const CudaComplex32 y0{y0_re, y0_im};
+            const CudaComplex32 y1{y1_re, y1_im};
+            const CudaComplex32 y0n{y0n_re, y0n_im};
+            const CudaComplex32 y1n{y1n_re, y1n_im};
+
+            const CudaComplex32 z0_rx0 =
+                cadd(cmul(cconj(h00), y0), cscale(cmul(h01n, cconj(y0n)), -1.0F));
+            const CudaComplex32 z0_rx1 =
+                cadd(cmul(cconj(h10), y1), cscale(cmul(h11n, cconj(y1n)), -1.0F));
+            const CudaComplex32 z0 = cadd(z0_rx0, z0_rx1);
+
+            const CudaComplex32 z1_rx0 =
+                cadd(cmul(cconj(h01), y0), cmul(h00n, cconj(y0n)));
+            const CudaComplex32 z1_rx1 =
+                cadd(cmul(cconj(h11), y1), cmul(h10n, cconj(y1n)));
+            const CudaComplex32 z1 = cadd(z1_rx0, z1_rx1);
+
+            const float energy0 =
+                cnorm2(h00) + cnorm2(h01n) + cnorm2(h10) + cnorm2(h11n);
+            const float energy1 =
+                cnorm2(h01) + cnorm2(h00n) + cnorm2(h11) + cnorm2(h10n);
+            const float denom0 = energy0 + sigma2 < det_floor ? det_floor : energy0 + sigma2;
+            const float denom1 = energy1 + sigma2 < det_floor ? det_floor : energy1 + sigma2;
+            float g0 = clampf(energy0 / denom0, g_min, 1.0F - g_min);
+            float g1 = clampf(energy1 / denom1, g_min, 1.0F - g_min);
+
+            const std::uint32_t out0 = re;
+            const std::uint32_t out1 = re + 1U;
+            xhat_re[out0] = (z0.re / denom0) / g0;
+            xhat_im[out0] = (z0.im / denom0) / g0;
+            xhat_re[out1] = (z1.re / denom1) / g1;
+            xhat_im[out1] = (z1.im / denom1) / g1;
+            float gamma0 = g0 / (1.0F - g0);
+            float gamma1 = g1 / (1.0F - g1);
+            sinr[out0] = gamma0 > gamma_max ? gamma_max : gamma0;
+            sinr[out1] = gamma1 > gamma_max ? gamma_max : gamma1;
+        } else if (td_pdcch_mode) {
+            // In TD PDCCH mode, even RE threads write both symbols for one RE pair.
+            // The odd RE partner must not fall back to the legacy single-RE equalizer path.
+        } else if (grid_meta->n_layers == 1U) {
             const float denom = h00_re * h00_re + h00_im * h00_im + h10_re * h10_re +
                                 h10_im * h10_im + sigma2;
             const float w0_re = h00_re / denom;

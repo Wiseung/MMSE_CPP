@@ -17,6 +17,8 @@ class MmseEqualizerCpuContext {
     MmseStatus run(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                    EqualizerOutputView& out);
     MmseStatus run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out, PdcchMmseResult& meta);
+    MmseStatus run_pdcch_td(const PdcchMmseInput& in, PdcchTdMmseOutputView& out,
+                            PdcchTdMmseResult& meta);
 
   private:
     struct Impl;
@@ -35,6 +37,8 @@ class MmseEqualizerGpuContext {
     MmseStatus run(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                    EqualizerOutputView& out);
     MmseStatus run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out, PdcchMmseResult& meta);
+    MmseStatus run_pdcch_td(const PdcchMmseInput& in, PdcchTdMmseOutputView& out,
+                            PdcchTdMmseResult& meta);
     MmseGpuHostProfileSnapshot last_host_profile() const;
 
   private:

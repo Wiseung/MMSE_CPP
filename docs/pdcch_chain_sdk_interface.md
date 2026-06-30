@@ -34,6 +34,7 @@ The SDK covers:
 - CRS-based channel estimation
 - MMSE equalization
 - per-RE soft-symbol and SINR handoff
+- 2Tx transmit-diversity de-mapping through the additive `run_pdcch_td(...)` surface
 
 The SDK does not cover:
 

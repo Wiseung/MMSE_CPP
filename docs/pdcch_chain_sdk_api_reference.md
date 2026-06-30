@@ -38,8 +38,10 @@ Primary runtime calls:
 
 - `MmseEqualizerCpuContext::init`
 - `MmseEqualizerCpuContext::run_pdcch`
+- `MmseEqualizerCpuContext::run_pdcch_td`
 - `MmseEqualizerGpuContext::init`
 - `MmseEqualizerGpuContext::run_pdcch`
+- `MmseEqualizerGpuContext::run_pdcch_td`
 
 Primary DTO flow:
 
@@ -47,6 +49,13 @@ Primary DTO flow:
 2. helper converts it into `mmse::PdcchMmseInput`
 3. CE/MMSE stage fills `mmse::PdcchMmseOutputView` and `mmse::PdcchMmseResult`
 4. helper packs them into `mmse::pdcch::BackendPdcchEqualizedIndication`
+
+Additive `2 Tx port` TD flow:
+
+1. upstream builds `mmse::pdcch::FrontendPdcchIndication`
+2. helper converts it into `mmse::PdcchMmseInput`
+3. TD CE/MMSE stage fills `mmse::PdcchTdMmseOutputView` and `mmse::PdcchTdMmseResult`
+4. helper packs them into `mmse::pdcch::BackendPdcchTdEqualizedIndication`
 
 ## Field Index
 
@@ -181,6 +190,10 @@ mmse::MmseEqualizerCpuContext::run_pdcch(
     const PdcchMmseInput& in,
     PdcchMmseOutputView& out,
     PdcchMmseResult& meta)
+mmse::MmseEqualizerCpuContext::run_pdcch_td(
+    const PdcchMmseInput& in,
+    PdcchTdMmseOutputView& out,
+    PdcchTdMmseResult& meta)
 ```
 
 GPU:
@@ -191,6 +204,10 @@ mmse::MmseEqualizerGpuContext::run_pdcch(
     const PdcchMmseInput& in,
     PdcchMmseOutputView& out,
     PdcchMmseResult& meta)
+mmse::MmseEqualizerGpuContext::run_pdcch_td(
+    const PdcchMmseInput& in,
+    PdcchTdMmseOutputView& out,
+    PdcchTdMmseResult& meta)
 ```
 
 DTO / helper utilities:
@@ -198,6 +215,7 @@ DTO / helper utilities:
 ```cpp
 mmse::pdcch::make_pdcch_mmse_input(...)
 mmse::pdcch::make_backend_pdcch_equalized_indication(...)
+mmse::pdcch::make_backend_pdcch_td_equalized_indication(...)
 mmse::pdcch::decode_re_grid_index(...)
 mmse::pdcch::append_pcfich_reserved_control_re_list(...)
 mmse::pdcch::append_phich_reserved_control_re_list(...)
@@ -529,8 +547,8 @@ Current SDK support boundary:
 
 Important non-support:
 
-- `2 Tx port` LTE PDCCH is rejected
-- SDK does not perform transmit-diversity de-mapping
+- legacy `run_pdcch(...)` rejects `2 Tx port` LTE PDCCH because its frozen contract is per-RE
+- `2 Tx port` transmit-diversity is supported only through additive `run_pdcch_td(...)`
 - SDK does not decode `PCFICH` or `PHICH`
 - helper-based automatic PHICH reservation is limited to the documented FDD normal-CP boundary
 

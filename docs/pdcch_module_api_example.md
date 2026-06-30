@@ -16,6 +16,9 @@ The module does not do:
 - REG/CCE regrouping
 - DCI blind detection or channel decoding
 
+For `2 Tx port` LTE PDCCH transmit diversity, use the additive TD call surface
+`run_pdcch_td(...)` instead of the legacy single-RE `run_pdcch(...)` surface shown below.
+
 ## 1. Upstream: how to fill `control_re_exclusion_masks`
 
 Upstream should first determine:
@@ -81,6 +84,27 @@ mmse::PdcchMmseResult meta{};
 const mmse::MmseStatus status = ctx.run_pdcch(in, out, meta);
 ```
 
+For `2 Tx port` transmit diversity, allocate the additive TD output instead:
+
+```cpp
+std::vector<float> xhat_re(capacity_symbols);
+std::vector<float> xhat_im(capacity_symbols);
+std::vector<float> sinr(capacity_symbols);
+std::vector<std::uint16_t> re_grid_indices0(capacity_symbols);
+std::vector<std::uint16_t> re_grid_indices1(capacity_symbols);
+
+mmse::PdcchTdMmseOutputView td_out{};
+td_out.x_hat_re = xhat_re.data();
+td_out.x_hat_im = xhat_im.data();
+td_out.sinr = sinr.data();
+td_out.re_grid_indices0 = re_grid_indices0.data();
+td_out.re_grid_indices1 = re_grid_indices1.data();
+td_out.capacity_symbols = static_cast<std::uint32_t>(capacity_symbols);
+
+mmse::PdcchTdMmseResult td_meta{};
+const mmse::MmseStatus td_status = ctx.run_pdcch_td(in, td_out, td_meta);
+```
+
 ## 3. Downstream: how to consume `re_grid_indices`
 
 Downstream should first pack the module output into the formal backend DTO, then consume that DTO.
@@ -105,7 +129,30 @@ for (std::size_t i = 0; i < backend.re_grid_indices.size(); ++i) {
     item.first_cce = backend.chain.first_cce;
     item.aggregation_level = backend.chain.aggregation_level;
 
-    downstream_consume(item);
+downstream_consume(item);
+}
+```
+
+For the TD surface:
+
+```cpp
+mmse::pdcch::BackendPdcchTdEqualizedIndication td_backend =
+    mmse::pdcch::make_backend_pdcch_td_equalized_indication(td_meta, td_out);
+
+for (std::size_t i = 0; i < td_backend.x_hat_re.size(); ++i) {
+    const auto coord0 = mmse::pdcch::decode_re_grid_index(td_backend.re_grid_indices0[i]);
+    const auto coord1 = mmse::pdcch::decode_re_grid_index(td_backend.re_grid_indices1[i]);
+
+    DownstreamTdSoftSymbol item{};
+    item.xhat_re = td_backend.x_hat_re[i];
+    item.xhat_im = td_backend.x_hat_im[i];
+    item.sinr = td_backend.sinr[i];
+    item.re0_symbol = coord0.symbol;
+    item.re0_subcarrier = coord0.subcarrier;
+    item.re1_symbol = coord1.symbol;
+    item.re1_subcarrier = coord1.subcarrier;
+
+    downstream_consume_td(item);
 }
 ```
 
@@ -128,7 +175,9 @@ This is the intended handoff contract:
 - True `MBSFN` subframes should be marked through `subframe_ctx.kind = kMbsfn`
 - Downstream should not assume output order equals CCE order
 - Downstream should use `re_grid_indices` to rebuild any required ordering
-- Current support is limited to `1 Tx port` LTE PDCCH
+- `run_pdcch(...)` remains the `1 Tx port` per-RE surface
+- `run_pdcch_td(...)` is the additive `2 Tx port` transmit-diversity surface with
+  `re_grid_indices0/re_grid_indices1` RE-pair mapping
 
 ## 5. Compilable demo
 

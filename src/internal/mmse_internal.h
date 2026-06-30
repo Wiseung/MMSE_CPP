@@ -56,6 +56,11 @@ struct Equalize2x2Trace {
     float gamma1 = 0.0F;
 };
 
+struct PdcchTdEqualizePair {
+    EqualizedSymbol symbol0{};
+    EqualizedSymbol symbol1{};
+};
+
 using HGridStorage =
     std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>;
 
@@ -166,6 +171,12 @@ Equalize2x2Trace trace_equalize_2x2_scalar(Complex32 h00, Complex32 h01, Complex
 
 EqualizedSymbol equalize_1x2_scalar(Complex32 h0, Complex32 h1, Complex32 y0, Complex32 y1,
                                     float sigma2, float g_min, float gamma_max);
+PdcchTdEqualizePair
+demap_pdcch_transmit_diversity_scalar(Complex32 h00, Complex32 h01, Complex32 h10, Complex32 h11,
+                                      Complex32 h00_next, Complex32 h01_next, Complex32 h10_next,
+                                      Complex32 h11_next, Complex32 y0, Complex32 y1,
+                                      Complex32 y0_next, Complex32 y1_next, float sigma2,
+                                      float det_floor, float g_min, float gamma_max);
 
 bool cpu_supports_avx2();
 
