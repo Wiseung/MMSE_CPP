@@ -74,11 +74,17 @@ mmse::pdcch::FrontendPdcchIndication make_mock_frontend_indication() {
     ind.chain.first_cce = 4U;
     ind.chain.aggregation_level = 8U;
 
-    // Mock upstream output: control-region REs already identified as non-PDCCH.
-    for (std::uint32_t tone = 0; tone < 4U; ++tone) {
-        ind.reserved_control_res.push_back({.symbol = 0U, .prb = 0U, .tone_in_prb = tone});
-        ind.reserved_control_res.push_back({.symbol = 0U, .prb = 1U, .tone_in_prb = tone});
-    }
+    // Mock upstream policy: use helper-generated non-PDCCH control RE reservations.
+    ind.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                            .subframe = 0U,
+                            .ul_dl_config = 0U,
+                            .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    mmse::pdcch::append_pcfich_reserved_control_re_list(ind);
+    (void)mmse::pdcch::append_phich_reserved_control_re_list(
+        ind, {.resource = mmse::pdcch::PhichResource::kOne,
+              .duration = mmse::pdcch::PhichDuration::kNormal,
+              .mi = 1U,
+              .subframe_ctx = ind.control_subframe});
     return ind;
 }
 

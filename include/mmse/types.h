@@ -6,6 +6,25 @@
 
 namespace mmse {
 
+namespace pdcch {
+enum class PhichDuplexMode : std::uint8_t {
+    kFdd = 0,
+    kTdd,
+};
+
+enum class LteControlSubframeKind : std::uint8_t {
+    kRegular = 0,
+    kMbsfn,
+};
+
+struct LteControlSubframeContext {
+    PhichDuplexMode duplex_mode = PhichDuplexMode::kFdd;
+    std::uint8_t subframe = 0;
+    std::uint8_t ul_dl_config = 0;
+    LteControlSubframeKind kind = LteControlSubframeKind::kRegular;
+};
+} // namespace pdcch
+
 enum class MmseStatus : std::uint8_t {
     kOk = 0,
     kNotInitialized,
@@ -83,6 +102,7 @@ struct PdcchMmseInput {
     std::uint8_t control_symbol_count = 0;
     std::uint16_t n_prb = 0;
     std::array<std::uint16_t, 7> prb_bitmap{};
+    pdcch::LteControlSubframeContext control_subframe{};
     std::array<std::uint16_t, kLteMaxControlSymbolsNormalCp * kLteNumPrb20MHz>
         control_re_exclusion_masks{};
     PdcchChainMetadata chain{};

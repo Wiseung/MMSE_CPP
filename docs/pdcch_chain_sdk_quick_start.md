@@ -50,6 +50,22 @@ The SDK does not do:
 mmse::pdcch::FrontendPdcchIndication frontend = get_frontend_indication();
 mmse::PlanarGridViewF32 grid = get_fft_grid();
 
+frontend.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                             .subframe = 0,
+                             .ul_dl_config = 0,
+                             .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+mmse::pdcch::append_pcfich_reserved_control_re_list(frontend);
+const mmse::MmseStatus phich_status = mmse::pdcch::append_phich_reserved_control_re_list(
+    frontend,
+    {.resource = mmse::pdcch::PhichResource::kOne,
+     .duration = mmse::pdcch::PhichDuration::kNormal,
+     .mi = 1,
+     .subframe_ctx = frontend.control_subframe});
+if (phich_status != mmse::MmseStatus::kOk) {
+    return;
+}
+
 mmse::PdcchMmseInput in = mmse::pdcch::make_pdcch_mmse_input(grid, frontend);
 
 std::vector<float> xhat_re(capacity);
@@ -92,6 +108,7 @@ Upstream must provide:
 - `control_symbol_count`
 - `n_prb`
 - `prb_bitmap`
+- `control_subframe`
 - `reserved_control_res`
 - optional chain metadata through `PdcchChainMetadata`
 
@@ -99,6 +116,15 @@ Important rule:
 
 - `reserved_control_res` should contain non-PDCCH control REs such as `PCFICH` and `PHICH`
 - CRS REs should not be listed there because the SDK excludes CRS internally
+- if upstream already knows the occupied REs, it can still fill `reserved_control_res` directly
+- for the current 20 MHz FDD normal-CP boundary, callers can also use
+  explicit shared `LteControlSubframeContext` plus `PhichReservationConfig`
+- in TDD mode, `mi` must match the selected `subframe_ctx.ul_dl_config + subframe_ctx.subframe`
+- for extended PHICH duration, `TDD subframe 1/6` special-case is selected automatically
+- true `MBSFN` subframes should be marked through `subframe_ctx.kind = kMbsfn`
+- for the current 20 MHz FDD/TDD normal-CP helper boundary, callers can also use
+  `append_pcfich_reserved_control_re_list(...)` and
+  `append_phich_reserved_control_re_list(...)` before `make_pdcch_mmse_input(...)`
 
 ## Downstream Handoff
 
@@ -139,6 +165,7 @@ Current validated support:
 Important non-support:
 
 - `2 Tx port` LTE PDCCH
+- helper-based automatic PHICH reservation does not imply PHICH decoding support
 
 ## Build and Demo
 

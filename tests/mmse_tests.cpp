@@ -721,6 +721,10 @@ void test_pdcch_module_api_returns_chain_metadata_and_re_indices() {
     in.control_symbol_count = desc.control_symbol_count;
     in.n_prb = desc.n_prb;
     in.prb_bitmap = desc.prb_bitmap;
+    in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                           .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                           .ul_dl_config = 0U,
+                           .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
     in.control_re_exclusion_masks = desc.control_re_exclusion_masks;
     in.chain.request_id = 77U;
     in.chain.candidate_id = 5U;
@@ -741,7 +745,10 @@ void test_pdcch_module_api_returns_chain_metadata_and_re_indices() {
     out.capacity_re_metadata = cap;
 
     PdcchMmseResult meta{};
-    expect_true(ctx.run_pdcch(in, out, meta) == MmseStatus::kOk, "pdcch module api run");
+    const MmseStatus status = ctx.run_pdcch(in, out, meta);
+    if (status != MmseStatus::kOk) {
+        throw TestFailure{"pdcch module api run status=" + std::string(to_string(status))};
+    }
     expect_true(meta.n_re == 3400U, "pdcch module api RE count");
     expect_true(meta.chain.request_id == in.chain.request_id, "request id passthrough");
     expect_true(meta.chain.candidate_id == in.chain.candidate_id, "candidate id passthrough");
@@ -752,6 +759,84 @@ void test_pdcch_module_api_returns_chain_metadata_and_re_indices() {
     expect_true(meta.mod_order == 2U, "pdcch api qpsk");
     expect_true(indices[0] < kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz,
                 "grid index must be valid");
+}
+
+void test_pdcch_mmse_input_validator() {
+    GridBuffers buffers = make_zero_grid();
+    auto desc = make_pdcch_desc();
+    fill_identity_channel(buffers, desc, 1.0F, 0.0F);
+
+    PdcchMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = desc.n_tx_ports;
+    in.tx_mode = desc.tx_mode;
+    in.control_symbol_count = desc.control_symbol_count;
+    in.n_prb = desc.n_prb;
+    in.prb_bitmap = desc.prb_bitmap;
+    in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                           .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                           .ul_dl_config = 0U,
+                           .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+    expect_true(mmse::pdcch::validate_pdcch_mmse_input(in) == MmseStatus::kOk,
+                "pdcch input validator should accept consistent input");
+
+    expect_true(mmse::pdcch::validate_lte_control_subframe_context(
+                    in.control_subframe, in.sfn_subframe) == MmseStatus::kOk,
+                "lte control subframe validator should accept consistent input");
+
+    in.control_symbol_count = 0U;
+    expect_true(mmse::pdcch::validate_pdcch_mmse_input(in) == MmseStatus::kInvalidArgument,
+                "pdcch input validator should reject invalid control symbol count");
+}
+
+void test_pdcch_run_rejects_inconsistent_control_subframe() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "init must succeed");
+
+    GridBuffers buffers = make_zero_grid();
+    auto desc = make_pdcch_desc();
+    fill_identity_channel(buffers, desc, 1.0F, 0.0F);
+
+    PdcchMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = desc.n_tx_ports;
+    in.tx_mode = desc.tx_mode;
+    in.control_symbol_count = desc.control_symbol_count;
+    in.n_prb = desc.n_prb;
+    in.prb_bitmap = desc.prb_bitmap;
+    in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                           .subframe = 9U,
+                           .ul_dl_config = 0U,
+                           .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+    const std::uint32_t cap = 8000U;
+    std::vector<float> xre(cap);
+    std::vector<float> xim(cap);
+    std::vector<float> sinr(cap);
+    std::vector<std::uint16_t> indices(cap);
+    PdcchMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices = indices.data();
+    out.capacity_re_per_layer = cap;
+    out.capacity_re_metadata = cap;
+
+    PdcchMmseResult meta{};
+    expect_true(ctx.run_pdcch(in, out, meta) == MmseStatus::kInvalidArgument,
+                "run_pdcch should reject mismatched control_subframe.subframe");
+
+    in.control_subframe.subframe = static_cast<std::uint8_t>(in.sfn_subframe % 10U);
+    in.control_subframe.ul_dl_config = 1U;
+    expect_true(ctx.run_pdcch(in, out, meta) == MmseStatus::kInvalidArgument,
+                "run_pdcch should reject fdd control_subframe with ul_dl_config");
 }
 
 void test_pdcch_helper_mask_and_grid_index_decode() {
@@ -787,6 +872,250 @@ void test_pdcch_helper_apply_reserved_re_list() {
                 "non-reserved RE should remain clear");
 }
 
+void test_pdcch_helper_builds_pcfich_reserved_res() {
+    const auto reserved = mmse::pdcch::build_pcfich_reserved_control_re_list(0U);
+    const auto reserved_with_ctx = mmse::pdcch::build_pcfich_reserved_control_re_list(
+        0U, {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+             .subframe = 1U,
+             .ul_dl_config = 1U,
+             .kind = mmse::pdcch::LteControlSubframeKind::kMbsfn});
+    expect_true(reserved.size() == 16U, "pcfich should reserve 16 REs after CRS removal");
+    expect_true(reserved_with_ctx.size() == reserved.size(),
+                "pcfich shared-context helper should preserve RE count");
+    for (std::size_t i = 0; i < reserved.size(); ++i) {
+        expect_true(reserved_with_ctx[i].symbol == reserved[i].symbol,
+                    "pcfich shared-context symbol");
+        expect_true(reserved_with_ctx[i].prb == reserved[i].prb, "pcfich shared-context prb");
+        expect_true(reserved_with_ctx[i].tone_in_prb == reserved[i].tone_in_prb,
+                    "pcfich shared-context tone");
+    }
+
+    PdcchMmseInput in{};
+    mmse::pdcch::apply_reserved_control_re_list(in, reserved);
+    expect_true(mmse::pdcch::is_control_re_excluded(in, 0U, 0U, 1U), "pcfich reg 0 tone 1");
+    expect_true(mmse::pdcch::is_control_re_excluded(in, 0U, 0U, 2U), "pcfich reg 0 tone 2");
+    expect_true(mmse::pdcch::is_control_re_excluded(in, 0U, 0U, 4U), "pcfich reg 0 tone 4");
+    expect_true(mmse::pdcch::is_control_re_excluded(in, 0U, 0U, 5U), "pcfich reg 0 tone 5");
+    expect_true(!mmse::pdcch::is_control_re_excluded(in, 0U, 0U, 0U), "pcfich must not mark CRS");
+    expect_true(!mmse::pdcch::is_control_re_excluded(in, 0U, 0U, 3U), "pcfich must not mark CRS");
+}
+
+void test_pdcch_helper_builds_fdd_phich_reserved_res_properties() {
+    const auto reserved =
+        mmse::pdcch::build_fdd_phich_reserved_control_re_list(0U, mmse::pdcch::PhichResource::kOne);
+    expect_true(reserved.size() == 156U, "fdd normal PHICH reserved RE count");
+    for (const auto& re : reserved) {
+        expect_true(re.symbol == 0U, "fdd normal PHICH should stay in symbol 0");
+        expect_true(re.prb < kLteNumPrb20MHz, "fdd normal PHICH PRB range");
+        expect_true(re.tone_in_prb < kLteNumSubcarriersPerPrb, "fdd normal PHICH tone range");
+        expect_true(re.tone_in_prb % 6U != 0U && re.tone_in_prb % 6U != 3U,
+                    "fdd normal PHICH should not mark CRS");
+    }
+}
+
+void test_pdcch_helper_phich_config_contract() {
+    std::vector<mmse::pdcch::ReservedControlRe> reserved{};
+    const MmseStatus ok = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kNormal});
+    expect_true(ok == MmseStatus::kOk, "fdd normal phich config should be accepted");
+    expect_true(reserved.size() == 156U, "fdd normal phich config should preserve helper output");
+
+    reserved.clear();
+    const MmseStatus tdd_status = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kNormal,
+         .mi = 1U,
+         .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                          .subframe = 0U,
+                          .ul_dl_config = 3U}});
+    expect_true(tdd_status == MmseStatus::kOk, "tdd normal phich config should be accepted");
+    expect_true(reserved.size() == 156U, "tdd mi=1 phich config should match base helper output");
+
+    reserved.clear();
+    const MmseStatus tdd_mi2_status = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kNormal,
+         .mi = 2U,
+         .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                          .subframe = 5U,
+                          .ul_dl_config = 0U}});
+    expect_true(tdd_mi2_status == MmseStatus::kOk, "tdd mi=2 phich config should be accepted");
+    expect_true(reserved.size() > 156U, "tdd mi=2 phich config should reserve more REs");
+
+    reserved.clear();
+    const MmseStatus tdd_zero_status = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kNormal,
+         .mi = 0U,
+         .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                          .subframe = 2U,
+                          .ul_dl_config = 0U}});
+    expect_true(tdd_zero_status == MmseStatus::kOk,
+                "tdd subframe without phich should accept mi=0");
+    expect_true(reserved.empty(), "tdd subframe without phich should append no REs");
+
+    reserved.clear();
+    const MmseStatus bad_subframe_status = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kNormal,
+         .mi = 1U,
+         .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                          .subframe = 10U,
+                          .ul_dl_config = 0U}});
+    expect_true(bad_subframe_status == MmseStatus::kInvalidArgument,
+                "phich helper should reject out-of-range subframe");
+    expect_true(reserved.empty(), "invalid subframe should not append REs");
+
+    const MmseStatus bad_tdd_mi_status = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kNormal,
+         .mi = 1U,
+         .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                          .subframe = 2U,
+                          .ul_dl_config = 0U}});
+    expect_true(bad_tdd_mi_status == MmseStatus::kInvalidArgument,
+                "tdd phich helper should reject mismatched mi/subframe");
+    expect_true(reserved.empty(), "mismatched mi/subframe should not append REs");
+
+    const MmseStatus bad_tdd_cfg_status = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kNormal,
+         .mi = 1U,
+         .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                          .subframe = 0U,
+                          .ul_dl_config = 7U}});
+    expect_true(bad_tdd_cfg_status == MmseStatus::kInvalidArgument,
+                "tdd phich helper should reject out-of-range ul-dl config");
+    expect_true(reserved.empty(), "invalid ul-dl config should not append REs");
+
+    const MmseStatus extended_status = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kExtended,
+         .mi = 1U,
+         .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                          .subframe = 0U,
+                          .ul_dl_config = 0U}});
+    expect_true(extended_status == MmseStatus::kOk,
+                "extended fdd phich helper contract should be accepted");
+    expect_true(!reserved.empty(), "extended fdd phich helper should append REs");
+
+    bool saw_symbol1_or_2 = false;
+    for (const auto& re : reserved) {
+        expect_true(re.symbol <= 2U, "extended phich should stay within first three symbols");
+        if (re.symbol == 1U || re.symbol == 2U) {
+            saw_symbol1_or_2 = true;
+        }
+    }
+    expect_true(saw_symbol1_or_2, "extended fdd phich should touch later control symbols");
+}
+
+void test_pdcch_helper_extended_phich_special_case_distribution() {
+    std::vector<mmse::pdcch::ReservedControlRe> reserved{};
+    const MmseStatus status = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kExtended,
+         .mi = 1U,
+         .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                          .subframe = 1U,
+                          .ul_dl_config = 1U,
+                          .kind = mmse::pdcch::LteControlSubframeKind::kMbsfn}});
+    expect_true(status == MmseStatus::kOk, "extended special-case phich helper should be accepted");
+    expect_true(!reserved.empty(), "extended special-case phich helper should append REs");
+
+    for (const auto& re : reserved) {
+        expect_true(re.symbol <= 1U, "extended special-case phich should stay within symbols 0/1");
+    }
+}
+
+void test_pdcch_helper_extended_tdd_sf1_automatic_special_case() {
+    std::vector<mmse::pdcch::ReservedControlRe> reserved{};
+    const MmseStatus status = mmse::pdcch::append_phich_reserved_control_re_list(
+        reserved, 0U,
+        {.resource = mmse::pdcch::PhichResource::kOne,
+         .duration = mmse::pdcch::PhichDuration::kExtended,
+         .mi = 1U,
+         .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                          .subframe = 1U,
+                          .ul_dl_config = 1U}});
+    expect_true(status == MmseStatus::kOk,
+                "extended tdd subframe 1 should auto-select special-case mapping");
+    expect_true(!reserved.empty(), "extended tdd subframe 1 should append REs");
+    for (const auto& re : reserved) {
+        expect_true(re.symbol <= 1U,
+                    "extended tdd subframe 1 special-case should stay within symbols 0/1");
+    }
+}
+
+void test_pdcch_helper_tdd_phich_affects_layout() {
+    auto desc = make_pdcch_desc();
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t base_n_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+
+    mmse::pdcch::FrontendPdcchIndication frontend{};
+    frontend.cell_id = desc.cell_id;
+    frontend.control_symbol_count = desc.control_symbol_count;
+    frontend.n_tx_ports = desc.n_tx_ports;
+    frontend.tx_mode = desc.tx_mode;
+    frontend.n_prb = desc.n_prb;
+    frontend.prb_bitmap = desc.prb_bitmap;
+    mmse::pdcch::append_pcfich_reserved_control_re_list(frontend);
+    expect_true(mmse::pdcch::append_phich_reserved_control_re_list(
+                    frontend, {.resource = mmse::pdcch::PhichResource::kOne,
+                               .duration = mmse::pdcch::PhichDuration::kNormal,
+                               .mi = 2U,
+                               .subframe_ctx = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                                                .subframe = 0U,
+                                                .ul_dl_config = 0U}}) == MmseStatus::kOk,
+                "tdd phich helper should append to frontend");
+
+    PdcchMmseInput in{};
+    mmse::pdcch::apply_reserved_control_re_list(in, frontend.reserved_control_res);
+    desc.control_re_exclusion_masks = in.control_re_exclusion_masks;
+    const std::uint32_t reserved_n_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    expect_true(reserved_n_re < base_n_re - 172U,
+                "tdd mi=2 helper should exclude more REs than fdd");
+}
+
+void test_pdcch_frontend_helper_auto_reserved_res_reduce_layout() {
+    auto desc = make_pdcch_desc();
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t base_n_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+
+    mmse::pdcch::FrontendPdcchIndication frontend{};
+    frontend.cell_id = desc.cell_id;
+    frontend.control_symbol_count = desc.control_symbol_count;
+    frontend.n_tx_ports = desc.n_tx_ports;
+    frontend.tx_mode = desc.tx_mode;
+    frontend.n_prb = desc.n_prb;
+    frontend.prb_bitmap = desc.prb_bitmap;
+    frontend.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                                 .subframe = 0U,
+                                 .ul_dl_config = 0U,
+                                 .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    mmse::pdcch::append_pcfich_reserved_control_re_list(frontend);
+    mmse::pdcch::append_fdd_phich_reserved_control_re_list(frontend,
+                                                           mmse::pdcch::PhichResource::kOne);
+
+    PdcchMmseInput in{};
+    mmse::pdcch::apply_reserved_control_re_list(in, frontend.reserved_control_res);
+    desc.control_re_exclusion_masks = in.control_re_exclusion_masks;
+
+    const std::uint32_t reserved_n_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    expect_true(frontend.reserved_control_res.size() == 172U,
+                "pcfich plus phich should add expected unique reserved REs");
+    expect_true(reserved_n_re == base_n_re - 172U, "auto reserved RE helper should reduce layout");
+}
+
 void test_pdcch_frontend_dto_builds_mmse_input() {
     GridBuffers buffers = make_zero_grid();
     auto grid = make_grid_view(buffers);
@@ -800,6 +1129,10 @@ void test_pdcch_frontend_dto_builds_mmse_input() {
     frontend.n_prb = 100U;
     frontend.prb_bitmap.fill(0xFFFFU);
     frontend.prb_bitmap.back() = 0x000FU;
+    frontend.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                                 .subframe = 9U,
+                                 .ul_dl_config = 0U,
+                                 .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
     frontend.chain.request_id = 55U;
     frontend.chain.candidate_id = 6U;
     frontend.chain.first_cce = 3U;
@@ -811,8 +1144,31 @@ void test_pdcch_frontend_dto_builds_mmse_input() {
     expect_true(in.sfn_subframe == frontend.sfn_subframe, "dto subframe passthrough");
     expect_true(in.cell_id == frontend.cell_id, "dto cell passthrough");
     expect_true(in.control_symbol_count == frontend.control_symbol_count, "dto cfi passthrough");
+    expect_true(in.control_subframe.subframe == frontend.control_subframe.subframe,
+                "dto control_subframe subframe passthrough");
+    expect_true(in.control_subframe.ul_dl_config == frontend.control_subframe.ul_dl_config,
+                "dto control_subframe ul_dl_config passthrough");
+    expect_true(in.control_subframe.kind == frontend.control_subframe.kind,
+                "dto control_subframe kind passthrough");
     expect_true(in.chain.request_id == frontend.chain.request_id, "dto chain passthrough");
     expect_true(mmse::pdcch::is_control_re_excluded(in, 0U, 1U, 2U), "dto reserved RE application");
+}
+
+void test_pdcch_frontend_control_subframe_drives_helpers() {
+    mmse::pdcch::FrontendPdcchIndication frontend{};
+    frontend.cell_id = 0U;
+    frontend.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd,
+                                 .subframe = 1U,
+                                 .ul_dl_config = 1U,
+                                 .kind = mmse::pdcch::LteControlSubframeKind::kMbsfn};
+
+    mmse::pdcch::append_pcfich_reserved_control_re_list(frontend);
+    const MmseStatus phich_status = mmse::pdcch::append_phich_reserved_control_re_list(
+        frontend, mmse::pdcch::PhichResource::kOne, mmse::pdcch::PhichDuration::kExtended, 1U);
+    expect_true(phich_status == MmseStatus::kOk,
+                "frontend control_subframe should drive phich helper");
+    expect_true(!frontend.reserved_control_res.empty(),
+                "frontend control_subframe-driven helpers should append reserved REs");
 }
 
 void test_pdcch_backend_dto_packs_equalized_output() {
@@ -1261,11 +1617,29 @@ int main() {
                   &test_pdcch_cpu_run_supports_single_port_and_rejects_two_port},
         std::pair{"pdcch_module_api_returns_chain_metadata_and_re_indices",
                   &test_pdcch_module_api_returns_chain_metadata_and_re_indices},
+        std::pair{"pdcch_mmse_input_validator", &test_pdcch_mmse_input_validator},
+        std::pair{"pdcch_run_rejects_inconsistent_control_subframe",
+                  &test_pdcch_run_rejects_inconsistent_control_subframe},
         std::pair{"pdcch_helper_mask_and_grid_index_decode",
                   &test_pdcch_helper_mask_and_grid_index_decode},
         std::pair{"pdcch_helper_apply_reserved_re_list", &test_pdcch_helper_apply_reserved_re_list},
+        std::pair{"pdcch_helper_builds_pcfich_reserved_res",
+                  &test_pdcch_helper_builds_pcfich_reserved_res},
+        std::pair{"pdcch_helper_builds_fdd_phich_reserved_res_properties",
+                  &test_pdcch_helper_builds_fdd_phich_reserved_res_properties},
+        std::pair{"pdcch_helper_phich_config_contract", &test_pdcch_helper_phich_config_contract},
+        std::pair{"pdcch_helper_extended_phich_special_case_distribution",
+                  &test_pdcch_helper_extended_phich_special_case_distribution},
+        std::pair{"pdcch_helper_extended_tdd_sf1_automatic_special_case",
+                  &test_pdcch_helper_extended_tdd_sf1_automatic_special_case},
+        std::pair{"pdcch_helper_tdd_phich_affects_layout",
+                  &test_pdcch_helper_tdd_phich_affects_layout},
+        std::pair{"pdcch_frontend_helper_auto_reserved_res_reduce_layout",
+                  &test_pdcch_frontend_helper_auto_reserved_res_reduce_layout},
         std::pair{"pdcch_frontend_dto_builds_mmse_input",
                   &test_pdcch_frontend_dto_builds_mmse_input},
+        std::pair{"pdcch_frontend_control_subframe_drives_helpers",
+                  &test_pdcch_frontend_control_subframe_drives_helpers},
         std::pair{"pdcch_backend_dto_packs_equalized_output",
                   &test_pdcch_backend_dto_packs_equalized_output},
         std::pair{"two_layer_scalar_golden_matches", &test_two_layer_scalar_golden_matches},
