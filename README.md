@@ -110,6 +110,8 @@ For chain integration, prefer the dedicated PDCCH module API over manually build
 Recommended single-header SDK entrypoint:
 
 - `#include "mmse/pdcch_chain_sdk.h"`
+- overall LTE channel overview: `docs/lte_pdcch_pdsch_channel_decode_overview.md`
+- docs index: `docs/README.md`
 - documentation index: `docs/pdcch_chain_sdk_interface.md` (`PDCCH Chain SDK v1`)
 - quick start: `docs/pdcch_chain_sdk_quick_start.md`
 - API reference: `docs/pdcch_chain_sdk_api_reference.md`
