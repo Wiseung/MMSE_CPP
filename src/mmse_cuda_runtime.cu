@@ -213,8 +213,7 @@ __global__ void estimate_residual_kernel(const float* grid_re0,
     }
 
     const std::uint32_t total_items =
-        min_u32(grid_meta->n_tx_ports, kLteNumTxPortsV1) *
-        min_u32(grid_meta->n_rx_ant, kLteNumRxAntV1) * kLteNumCrsSymbols *
+        kLteNumTxPortsV1 * min_u32(grid_meta->n_rx_ant, kLteNumRxAntV1) * kLteNumCrsSymbols *
         (kLteNumPilotTonesPerCrsSymbol - 2U);
 
     float local_sigma2 = 0.0F;
@@ -258,7 +257,7 @@ __global__ void estimate_channel_kernel(const float* grid_re0,
         return;
     }
 
-    const std::uint32_t tx_count = min_u32(grid_meta->n_tx_ports, kLteNumTxPortsV1);
+    const std::uint32_t tx_count = kLteNumTxPortsV1;
     const std::uint32_t rx_count = min_u32(grid_meta->n_rx_ant, kLteNumRxAntV1);
     const std::uint32_t total_h = tx_count * rx_count * kLteNumSymbolsNormalCp *
                                   grid_meta->n_subcarriers;
@@ -796,6 +795,59 @@ MmseStatus cuda_copy_grid_meta_h2d_async(const CudaDeviceBuffers& buffers,
                                           cudaMemcpyHostToDevice, stream));
 }
 
+MmseStatus cuda_copy_grid_meta_layout_slice_h2d_async(const CudaDeviceBuffers& buffers,
+                                                      const CudaGridMeta& grid_meta,
+                                                      std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const std::byte* base = reinterpret_cast<const std::byte*>(&grid_meta);
+    const std::size_t offset = offsetof(CudaGridMeta, n_valid_re);
+    const std::size_t bytes = offsetof(CudaGridMeta, prb_bitmap) + sizeof(grid_meta.prb_bitmap) - offset;
+    return map_cuda_error(cudaMemcpyAsync(reinterpret_cast<std::byte*>(buffers.grid_meta) + offset,
+                                          base + offset,
+                                          bytes,
+                                          cudaMemcpyHostToDevice,
+                                          stream));
+}
+
+MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffers,
+                                                 const CudaGridMeta& grid_meta,
+                                                 std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const std::byte* base = reinterpret_cast<const std::byte*>(&grid_meta);
+    const std::size_t header_offset = offsetof(CudaGridMeta, n_valid_re);
+    const std::size_t header_bytes =
+        offsetof(CudaGridMeta, grid_indices) - header_offset;
+    if (const cudaError_t status =
+            cudaMemcpyAsync(reinterpret_cast<std::byte*>(buffers.grid_meta) + header_offset,
+                            base + header_offset,
+                            header_bytes,
+                            cudaMemcpyHostToDevice,
+                            stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    if (const cudaError_t status =
+            cudaMemcpyAsync(reinterpret_cast<std::byte*>(buffers.grid_meta) + offsetof(CudaGridMeta, grid_indices),
+                            grid_meta.grid_indices,
+                            sizeof(grid_meta.grid_indices),
+                            cudaMemcpyHostToDevice,
+                            stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    if (const cudaError_t status =
+            cudaMemcpyAsync(reinterpret_cast<std::byte*>(buffers.grid_meta) +
+                                offsetof(CudaGridMeta, output_slot_by_grid_re),
+                            grid_meta.output_slot_by_grid_re,
+                            sizeof(grid_meta.output_slot_by_grid_re),
+                            cudaMemcpyHostToDevice,
+                            stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    return MmseStatus::kOk;
+}
+
 MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers& buffers,
                                       float sigma2,
                                       std::uintptr_t stream_handle) {
@@ -941,6 +993,7 @@ MmseStatus cuda_copy_outputs_d2h_async(const CudaDeviceBuffers& buffers,
     }
     return MmseStatus::kOk;
 }
+
 
 MmseStatus cuda_copy_estimate_d2h_async(const CudaDeviceBuffers& buffers,
                                         float* h_estimate,

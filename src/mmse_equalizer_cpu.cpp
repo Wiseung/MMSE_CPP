@@ -1,5 +1,7 @@
 #include "internal/mmse_internal.h"
+#include "mmse/pbch_module_api.h"
 #include "mmse/pdcch_module_api.h"
+#include "mmse/pcfich_module_api.h"
 
 #include <algorithm>
 #include <array>
@@ -36,6 +38,7 @@ std::array<Complex32, kLteNumCellIds * 10U * kLteNumTxPortsV1 * kLteNumCrsSymbol
                           kLteNumPilotTonesPerCrsSymbol>
     g_crs_table{};
 std::once_flag g_crs_table_once;
+std::uint64_t g_estimate_channel_call_count = 0;
 
 inline float clampf(float value, float lo, float hi) {
     return std::min(std::max(value, lo), hi);
@@ -57,6 +60,29 @@ inline bool control_re_excluded(const ExtractDescriptor& desc, std::uint32_t sym
         static_cast<std::size_t>(symbol) * kLteNumPrb20MHz + static_cast<std::size_t>(prb);
     return (desc.control_re_exclusion_masks[mask_idx] & (static_cast<std::uint16_t>(1U) << tone)) !=
            0U;
+}
+
+inline void reset_layout(ReLayout& layout) {
+    layout.n_re = 0U;
+    layout.n_segments = 0U;
+    layout.output_slot_by_grid_re.fill(std::numeric_limits<std::uint32_t>::max());
+}
+
+inline void append_layout_re(ReLayout& layout, std::uint32_t grid_idx) {
+    if (layout.output_slot_by_grid_re[grid_idx] != std::numeric_limits<std::uint32_t>::max()) {
+        return;
+    }
+    layout.grid_indices[layout.n_re] = static_cast<std::uint16_t>(grid_idx);
+    layout.output_slot_by_grid_re[grid_idx] = layout.n_re;
+    ++layout.n_re;
+}
+
+inline std::uint32_t pbch_prb_begin() {
+    return kLtePbchStartPrb;
+}
+
+inline std::uint32_t pbch_prb_end() {
+    return pbch_prb_begin() + kLtePbchNumPrb;
 }
 
 inline Complex32 grid_at(const PlanarGridViewF32& grid, std::uint32_t rx, std::uint32_t symbol,
@@ -176,6 +202,58 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
             return false;
         }
         break;
+    case MmseChannelType::kPbch:
+        if (desc.start_symbol != kLtePbchStartSymbolNormalCp) {
+            return false;
+        }
+        if (desc.control_symbol_count != 0U) {
+            return false;
+        }
+        if (desc.mod_order != 2U) {
+            return false;
+        }
+        if (desc.n_layers != 1U) {
+            return false;
+        }
+        if (desc.tx_mode != 1U && desc.tx_mode != 2U) {
+            return false;
+        }
+        if (desc.n_prb != kLtePbchNumPrb) {
+            return false;
+        }
+        for (std::uint32_t prb = 0; prb < kLteNumPrb20MHz; ++prb) {
+            const bool expected = prb >= pbch_prb_begin() && prb < pbch_prb_end();
+            if (bitmap_has_prb(desc, prb) != expected) {
+                return false;
+            }
+        }
+        break;
+    case MmseChannelType::kPcfich:
+        if (desc.start_symbol != 0U) {
+            return false;
+        }
+        if (desc.control_symbol_count == 0U ||
+            desc.control_symbol_count > kLteMaxControlSymbolsNormalCp) {
+            return false;
+        }
+        if (desc.mod_order != 2U) {
+            return false;
+        }
+        if (desc.n_layers != 1U) {
+            return false;
+        }
+        if (desc.tx_mode != 1U && desc.tx_mode != 2U) {
+            return false;
+        }
+        if (desc.n_prb != kLteNumPrb20MHz) {
+            return false;
+        }
+        for (std::uint32_t prb = 0; prb < kLteNumPrb20MHz; ++prb) {
+            if (!bitmap_has_prb(desc, prb)) {
+                return false;
+            }
+        }
+        break;
     default:
         return false;
     }
@@ -200,6 +278,42 @@ MmseStatus validate_output(const EqualizerOutputView& out) {
         return MmseStatus::kInvalidArgument;
     }
     return MmseStatus::kOk;
+}
+
+PreparedSubframeKey make_prepared_subframe_key(const PlanarGridViewF32& grid,
+                                               const ExtractDescriptor& desc,
+                                               std::uint32_t backend_mode) {
+    PreparedSubframeKey key{};
+    key.re = grid.re;
+    key.im = grid.im;
+    key.sfn_subframe = desc.sfn_subframe;
+    key.cell_id = desc.cell_id;
+    key.n_rx_ant = desc.n_rx_ant;
+    key.n_symbols = grid.n_symbols;
+    key.n_subcarriers = grid.n_subcarriers;
+    key.backend_mode = backend_mode;
+    return key;
+}
+
+bool prepared_subframe_key_equal(const PreparedSubframeKey& lhs, const PreparedSubframeKey& rhs) {
+    return lhs.re == rhs.re && lhs.im == rhs.im && lhs.sfn_subframe == rhs.sfn_subframe &&
+           lhs.cell_id == rhs.cell_id && lhs.n_rx_ant == rhs.n_rx_ant &&
+           lhs.n_symbols == rhs.n_symbols && lhs.n_subcarriers == rhs.n_subcarriers &&
+           lhs.backend_mode == rhs.backend_mode;
+}
+
+std::uint32_t channel_start_symbol(const ExtractDescriptor& desc) {
+    switch (desc.channel_type) {
+    case MmseChannelType::kPdsch:
+        return desc.start_symbol;
+    case MmseChannelType::kPdcch:
+    case MmseChannelType::kPcfich:
+        return 0U;
+    case MmseChannelType::kPbch:
+        return kLtePbchStartSymbolNormalCp;
+    default:
+        return desc.start_symbol;
+    }
 }
 
 std::uint32_t subframe_from_descriptor(const ExtractDescriptor& desc) {
@@ -299,9 +413,7 @@ void ensure_crs_tables() {
 }
 
 std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
-    layout.n_re = 0U;
-    layout.n_segments = 0U;
-    layout.output_slot_by_grid_re.fill(std::numeric_limits<std::uint32_t>::max());
+    reset_layout(layout);
 
     for (std::uint32_t symbol = desc.start_symbol; symbol < kLteNumSymbolsNormalCp; ++symbol) {
         std::uint32_t segment_begin = layout.n_re;
@@ -315,9 +427,7 @@ std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layo
                     continue;
                 }
                 const std::uint32_t grid_idx = symbol * kLteNumSubcarriers20MHz + sc;
-                layout.grid_indices[layout.n_re] = static_cast<std::uint16_t>(grid_idx);
-                layout.output_slot_by_grid_re[grid_idx] = layout.n_re;
-                ++layout.n_re;
+                append_layout_re(layout, grid_idx);
             }
         }
         if (layout.n_re > segment_begin) {
@@ -329,9 +439,7 @@ std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layo
 }
 
 std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
-    layout.n_re = 0U;
-    layout.n_segments = 0U;
-    layout.output_slot_by_grid_re.fill(std::numeric_limits<std::uint32_t>::max());
+    reset_layout(layout);
 
     for (std::uint32_t symbol = 0; symbol < desc.control_symbol_count; ++symbol) {
         const std::uint32_t segment_begin = layout.n_re;
@@ -346,9 +454,7 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
                     continue;
                 }
                 const std::uint32_t grid_idx = symbol * kLteNumSubcarriers20MHz + sc;
-                layout.grid_indices[layout.n_re] = static_cast<std::uint16_t>(grid_idx);
-                layout.output_slot_by_grid_re[grid_idx] = layout.n_re;
-                ++layout.n_re;
+                append_layout_re(layout, grid_idx);
             }
         }
         if (layout.n_re > segment_begin) {
@@ -358,6 +464,78 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
 
     layout.prb_segment_offsets[layout.n_segments] = layout.n_re;
     return layout.n_re;
+}
+
+std::uint32_t build_pbch_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
+    reset_layout(layout);
+
+    for (std::uint32_t symbol = kLtePbchStartSymbolNormalCp;
+         symbol < kLtePbchStartSymbolNormalCp + kLtePbchNumSymbols; ++symbol) {
+        const std::uint32_t segment_begin = layout.n_re;
+        for (std::uint32_t prb = pbch_prb_begin(); prb < pbch_prb_end(); ++prb) {
+            for (std::uint32_t tone = 0; tone < kLteNumSubcarriersPerPrb; ++tone) {
+                const std::uint32_t sc = prb * kLteNumSubcarriersPerPrb + tone;
+                const bool pbch_symbol_uses_crs_holes = symbol == kLtePbchStartSymbolNormalCp ||
+                                                        symbol == kLtePbchStartSymbolNormalCp + 1U;
+                const std::uint32_t v_shift = desc.cell_id % 6U;
+                const bool pbch_reserved_for_crs =
+                    pbch_symbol_uses_crs_holes &&
+                    (sc % 6U == v_shift || sc % 6U == ((v_shift + 3U) % 6U));
+                if (pbch_reserved_for_crs) {
+                    continue;
+                }
+                const std::uint32_t grid_idx = symbol * kLteNumSubcarriers20MHz + sc;
+                append_layout_re(layout, grid_idx);
+            }
+        }
+        if (layout.n_re > segment_begin) {
+            layout.prb_segment_offsets[layout.n_segments++] = segment_begin;
+        }
+    }
+
+    layout.prb_segment_offsets[layout.n_segments] = layout.n_re;
+    return layout.n_re;
+}
+
+std::uint32_t build_pcfich_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
+    reset_layout(layout);
+
+    const auto regs = mmse::pdcch::detail::pcfich_reg_coords(desc.cell_id);
+    const std::uint32_t vo = desc.cell_id % 3U;
+    const std::uint32_t segment_begin = layout.n_re;
+    for (const auto& reg : regs) {
+        const std::uint32_t tone_base = reg.reg_in_symbol_prb * 6U;
+        for (std::uint32_t local_tone = 0; local_tone < 6U; ++local_tone) {
+            if (local_tone == vo || local_tone == vo + 3U) {
+                continue;
+            }
+            const std::uint32_t tone = tone_base + local_tone;
+            const std::uint32_t grid_idx = reg.prb * kLteNumSubcarriersPerPrb + tone;
+            append_layout_re(layout, grid_idx);
+        }
+    }
+    if (layout.n_re > segment_begin) {
+        layout.prb_segment_offsets[layout.n_segments++] = segment_begin;
+    }
+    layout.prb_segment_offsets[layout.n_segments] = layout.n_re;
+    return layout.n_re;
+}
+
+std::uint32_t build_channel_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
+    switch (desc.channel_type) {
+    case MmseChannelType::kPdsch:
+        return build_data_re_layout(desc, layout);
+    case MmseChannelType::kPdcch:
+        return build_pdcch_re_layout(desc, layout);
+    case MmseChannelType::kPbch:
+        return build_pbch_re_layout(desc, layout);
+    case MmseChannelType::kPcfich:
+        return build_pcfich_re_layout(desc, layout);
+    default:
+        reset_layout(layout);
+        layout.prb_segment_offsets[0] = 0U;
+        return 0U;
+    }
 }
 
 std::uint32_t build_validation_re_samples(const ReLayout& layout, std::uint32_t start_symbol,
@@ -413,6 +591,7 @@ std::uint32_t build_validation_re_samples(const ReLayout& layout, std::uint32_t 
 
 void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                       HGridStorage& h_full, float& sigma2_estimate) {
+    ++g_estimate_channel_call_count;
     ensure_crs_tables();
     sigma2_estimate = 0.0F;
     std::uint32_t residual_count = 0U;
@@ -514,6 +693,14 @@ float update_sigma2_state(Sigma2State& state, float sigma2_estimate,
 
 float peek_sigma2_state(const Sigma2State& state, float sigma2_min) {
     return state.initialized ? std::max(state.value, sigma2_min) : sigma2_min;
+}
+
+void debug_reset_estimate_channel_call_count() {
+    g_estimate_channel_call_count = 0;
+}
+
+std::uint64_t debug_get_estimate_channel_call_count() {
+    return g_estimate_channel_call_count;
 }
 
 void pack_equalizer_inputs(const PlanarGridViewF32& grid, const HGridStorage& h_full,
@@ -644,6 +831,15 @@ using detail::Sigma2State;
 using detail::StaticThreadPool;
 
 struct MmseEqualizerCpuContext::Impl {
+    struct PreparedSubframeState {
+        detail::PreparedSubframeKey key{};
+        bool valid = false;
+        float sigma2 = 0.0F;
+        std::uint32_t prepared_subframe = 0;
+        std::uint16_t prepared_cell_id = 0;
+        std::uint8_t prepared_n_tx_ports = 0;
+    };
+
     struct RunTaskContext {
         Impl* impl = nullptr;
         ExtractDescriptor desc{};
@@ -652,6 +848,11 @@ struct MmseEqualizerCpuContext::Impl {
     };
 
     static void worker_task(void* raw_ctx, std::uint32_t begin, std::uint32_t end);
+    MmseStatus prepare_subframe_if_needed(const PlanarGridViewF32& grid,
+                                          const ExtractDescriptor& desc, float& sigma2);
+    MmseStatus run_channel_from_prepared_estimate(const PlanarGridViewF32& grid,
+                                                  const ExtractDescriptor& desc,
+                                                  EqualizerOutputView& out, float sigma2);
 
     MmseEqualizerCpuConfig config{};
     bool initialized = false;
@@ -659,6 +860,7 @@ struct MmseEqualizerCpuContext::Impl {
     HGridStorage h_full{};
     detail::PackedEqualizerInputs packed{};
     ReLayout layout{};
+    PreparedSubframeState prepared{};
     std::array<Sigma2State, kLteNumCellIds> sigma2_by_cell{};
     StaticThreadPool pool{};
     std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges{};
@@ -831,6 +1033,86 @@ std::uint32_t chunk_count(std::uint32_t workers, std::uint32_t total) {
 
 } // namespace
 
+MmseStatus MmseEqualizerCpuContext::Impl::prepare_subframe_if_needed(const PlanarGridViewF32& grid,
+                                                                     const ExtractDescriptor& desc,
+                                                                     float& sigma2) {
+    const detail::PreparedSubframeKey key = detail::make_prepared_subframe_key(grid, desc);
+    if (prepared.valid && detail::prepared_subframe_key_equal(prepared.key, key)) {
+        sigma2 = prepared.sigma2;
+        return MmseStatus::kOk;
+    }
+
+    float sigma2_estimate = 0.0F;
+    detail::estimate_channel(grid, desc, h_full, sigma2_estimate);
+    sigma2 = detail::update_sigma2_state(sigma2_by_cell[desc.cell_id], sigma2_estimate, config);
+    prepared.key = key;
+    prepared.valid = true;
+    prepared.sigma2 = sigma2;
+    prepared.prepared_subframe = desc.sfn_subframe;
+    prepared.prepared_cell_id = desc.cell_id;
+    prepared.prepared_n_tx_ports = desc.n_tx_ports;
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerCpuContext::Impl::run_channel_from_prepared_estimate(
+    const PlanarGridViewF32& grid, const ExtractDescriptor& desc, EqualizerOutputView& out,
+    float sigma2) {
+    const std::uint32_t n_re = detail::build_channel_re_layout(desc, layout);
+    if (out.capacity_re_per_layer < n_re) {
+        return MmseStatus::kBufferTooSmall;
+    }
+
+    detail::pack_equalizer_inputs(grid, h_full, layout, packed);
+
+    out.n_re_per_layer = n_re;
+    out.n_layers = desc.n_layers;
+    out.mod_order = desc.mod_order;
+
+    if (desc.channel_type == MmseChannelType::kPdcch && desc.n_tx_ports == 2U &&
+        desc.n_layers == 1U) {
+        std::vector<PdcchTdRePair> pairs{};
+        if (!build_pdcch_td_re_pairs(layout, pairs)) {
+            return MmseStatus::kUnsupportedConfig;
+        }
+        for (std::uint32_t i = 0; i < pairs.size(); ++i) {
+            const auto eq = demap_pdcch_transmit_diversity_from_grid(
+                h_full, grid, pairs[i].grid_index0, pairs[i].grid_index1, sigma2, config.det_floor,
+                config.g_min, config.gamma_max);
+            const std::uint32_t base = i * 2U;
+            out.x_hat_re[base] = eq.symbol0.xhat.re;
+            out.x_hat_im[base] = eq.symbol0.xhat.im;
+            out.sinr[base] = eq.symbol0.gamma;
+            out.x_hat_re[base + 1U] = eq.symbol1.xhat.re;
+            out.x_hat_im[base + 1U] = eq.symbol1.xhat.im;
+            out.sinr[base + 1U] = eq.symbol1.gamma;
+        }
+        return MmseStatus::kOk;
+    }
+
+    RunTaskContext worker_ctx{
+        .impl = this,
+        .desc = desc,
+        .out = &out,
+        .sigma2 = sigma2,
+    };
+
+    const std::uint32_t workers = chunk_count(pool.worker_count(), n_re == 0U ? 1U : n_re);
+    const std::uint32_t chunk = (n_re + workers - 1U) / workers;
+    for (std::uint32_t w = 0; w < workers; ++w) {
+        const std::uint32_t begin = w * chunk;
+        const std::uint32_t end = std::min(begin + chunk, n_re);
+        ranges[w] = {begin, end};
+    }
+    for (std::uint32_t w = workers; w < ranges.size(); ++w) {
+        ranges[w] = {0U, 0U};
+    }
+
+    pool.parallel_for(
+        std::span<const std::pair<std::uint32_t, std::uint32_t>>(ranges.data(), workers),
+        Impl::worker_task, &worker_ctx);
+    return MmseStatus::kOk;
+}
+
 void MmseEqualizerCpuContext::Impl::worker_task(void* raw_ctx, std::uint32_t begin,
                                                 std::uint32_t end) {
     auto* ctx = static_cast<RunTaskContext*>(raw_ctx);
@@ -887,65 +1169,135 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
         return MmseStatus::kUnsupportedConfig;
     }
 
-    const std::uint32_t n_re = (desc.channel_type == MmseChannelType::kPdcch)
-                                   ? detail::build_pdcch_re_layout(desc, impl_->layout)
-                                   : detail::build_data_re_layout(desc, impl_->layout);
-    if (out.capacity_re_per_layer < n_re) {
+    float sigma2 = 0.0F;
+    if (const MmseStatus status = impl_->prepare_subframe_if_needed(grid, desc, sigma2);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    return impl_->run_channel_from_prepared_estimate(grid, desc, out, sigma2);
+}
+
+MmseStatus MmseEqualizerCpuContext::run_pbch(const PbchMmseInput& in, PbchMmseOutputView& out,
+                                             PbchMmseResult& meta) {
+    if (const MmseStatus status = mmse::pbch::validate_pbch_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = in.n_tx_ports;
+    desc.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    desc.n_layers = 1U;
+    desc.tx_mode = in.tx_mode;
+    desc.channel_type = MmseChannelType::kPbch;
+    desc.start_symbol = kLtePbchStartSymbolNormalCp;
+    desc.control_symbol_count = 0U;
+    desc.mod_order = 2U;
+    desc.n_prb = kLtePbchNumPrb;
+    desc.prb_bitmap.fill(0U);
+    for (std::uint32_t prb = kLtePbchStartPrb; prb < kLtePbchStartPrb + kLtePbchNumPrb; ++prb) {
+        desc.prb_bitmap[prb / 16U] |= static_cast<std::uint16_t>(1U << (prb % 16U));
+    }
+    desc.pmi = -1;
+
+    EqualizerOutputView base_out{};
+    base_out.x_hat_re = out.x_hat_re;
+    base_out.x_hat_im = out.x_hat_im;
+    base_out.sinr = out.sinr;
+    base_out.capacity_re_per_layer = out.capacity_re_per_layer;
+
+    const MmseStatus status = run(in.grid, desc, base_out);
+    if (status != MmseStatus::kOk) {
+        return status;
+    }
+    if (out.re_grid_indices == nullptr || out.capacity_re_metadata < base_out.n_re_per_layer) {
         return MmseStatus::kBufferTooSmall;
     }
 
-    float sigma2_estimate = 0.0F;
-    detail::estimate_channel(grid, desc, impl_->h_full, sigma2_estimate);
-    const float sigma2 = detail::update_sigma2_state(impl_->sigma2_by_cell[desc.cell_id],
-                                                     sigma2_estimate, impl_->config);
-    detail::pack_equalizer_inputs(grid, impl_->h_full, impl_->layout, impl_->packed);
-
-    out.n_re_per_layer = n_re;
-    out.n_layers = desc.n_layers;
-    out.mod_order = desc.mod_order;
-
-    if (desc.channel_type == MmseChannelType::kPdcch && desc.n_tx_ports == 2U &&
-        desc.n_layers == 1U) {
-        std::vector<PdcchTdRePair> pairs{};
-        if (!build_pdcch_td_re_pairs(impl_->layout, pairs)) {
-            return MmseStatus::kUnsupportedConfig;
-        }
-        for (std::uint32_t i = 0; i < pairs.size(); ++i) {
-            const auto eq = demap_pdcch_transmit_diversity_from_grid(
-                impl_->h_full, grid, pairs[i].grid_index0, pairs[i].grid_index1, sigma2,
-                impl_->config.det_floor, impl_->config.g_min, impl_->config.gamma_max);
-            const std::uint32_t base = i * 2U;
-            out.x_hat_re[base] = eq.symbol0.xhat.re;
-            out.x_hat_im[base] = eq.symbol0.xhat.im;
-            out.sinr[base] = eq.symbol0.gamma;
-            out.x_hat_re[base + 1U] = eq.symbol1.xhat.re;
-            out.x_hat_im[base + 1U] = eq.symbol1.xhat.im;
-            out.sinr[base + 1U] = eq.symbol1.gamma;
-        }
-        return MmseStatus::kOk;
+    for (std::uint32_t i = 0; i < base_out.n_re_per_layer; ++i) {
+        out.re_grid_indices[i] = impl_->layout.grid_indices[i];
     }
 
-    Impl::RunTaskContext worker_ctx{
-        .impl = impl_,
-        .desc = desc,
-        .out = &out,
-        .sigma2 = sigma2,
-    };
+    meta = {};
+    meta.n_re = base_out.n_re_per_layer;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.n_symbols = in.grid.n_symbols;
+    meta.n_subcarriers = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.start_prb = kLtePbchStartPrb;
+    meta.n_prb = kLtePbchNumPrb;
+    meta.start_symbol = kLtePbchStartSymbolNormalCp;
+    meta.n_tx_ports = in.n_tx_ports;
+    meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    meta.n_layers = base_out.n_layers;
+    meta.tx_mode = in.tx_mode;
+    meta.mod_order = base_out.mod_order;
+    meta.sigma2 =
+        detail::peek_sigma2_state(impl_->sigma2_by_cell[in.cell_id], impl_->config.sigma2_min);
+    meta.chain = in.chain;
+    return MmseStatus::kOk;
+}
 
-    const std::uint32_t workers = chunk_count(impl_->pool.worker_count(), n_re == 0U ? 1U : n_re);
-    const std::uint32_t chunk = (n_re + workers - 1U) / workers;
-    for (std::uint32_t w = 0; w < workers; ++w) {
-        const std::uint32_t begin = w * chunk;
-        const std::uint32_t end = std::min(begin + chunk, n_re);
-        impl_->ranges[w] = {begin, end};
-    }
-    for (std::uint32_t w = workers; w < impl_->ranges.size(); ++w) {
-        impl_->ranges[w] = {0U, 0U};
+MmseStatus MmseEqualizerCpuContext::run_pcfich(const PcfichMmseInput& in, PcfichMmseOutputView& out,
+                                               PcfichMmseResult& meta) {
+    if (const MmseStatus status = mmse::pcfich::validate_pcfich_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
     }
 
-    impl_->pool.parallel_for(
-        std::span<const std::pair<std::uint32_t, std::uint32_t>>(impl_->ranges.data(), workers),
-        Impl::worker_task, &worker_ctx);
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = in.n_tx_ports;
+    desc.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    desc.n_layers = 1U;
+    desc.tx_mode = in.tx_mode;
+    desc.channel_type = MmseChannelType::kPcfich;
+    desc.start_symbol = 0U;
+    desc.control_symbol_count = 1U;
+    desc.mod_order = 2U;
+    desc.n_prb = kLteNumPrb20MHz;
+    desc.prb_bitmap.fill(0xFFFFU);
+    desc.prb_bitmap.back() = 0x000FU;
+    desc.pmi = -1;
+
+    EqualizerOutputView base_out{};
+    base_out.x_hat_re = out.x_hat_re;
+    base_out.x_hat_im = out.x_hat_im;
+    base_out.sinr = out.sinr;
+    base_out.capacity_re_per_layer = out.capacity_re_per_layer;
+
+    const MmseStatus status = run(in.grid, desc, base_out);
+    if (status != MmseStatus::kOk) {
+        return status;
+    }
+    if (out.re_grid_indices == nullptr || out.capacity_re_metadata < base_out.n_re_per_layer) {
+        return MmseStatus::kBufferTooSmall;
+    }
+
+    for (std::uint32_t i = 0; i < base_out.n_re_per_layer; ++i) {
+        out.re_grid_indices[i] = impl_->layout.grid_indices[i];
+    }
+
+    meta = {};
+    meta.n_re = base_out.n_re_per_layer;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.n_symbols = in.grid.n_symbols;
+    meta.n_subcarriers = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.n_prb = kLteNumPrb20MHz;
+    meta.start_symbol = 0U;
+    meta.reg_count = static_cast<std::uint8_t>(kLtePcfichNumRegs);
+    meta.n_tx_ports = in.n_tx_ports;
+    meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    meta.n_layers = base_out.n_layers;
+    meta.tx_mode = in.tx_mode;
+    meta.mod_order = base_out.mod_order;
+    meta.sigma2 =
+        detail::peek_sigma2_state(impl_->sigma2_by_cell[in.cell_id], impl_->config.sigma2_min);
+    meta.chain = in.chain;
     return MmseStatus::kOk;
 }
 
@@ -1059,6 +1411,12 @@ MmseStatus MmseEqualizerCpuContext::run_pdcch_td(const PdcchMmseInput& in,
         }
     }
 
+    float sigma2 = 0.0F;
+    if (const MmseStatus status = impl_->prepare_subframe_if_needed(in.grid, desc, sigma2);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
     const std::uint32_t n_source_re = detail::build_pdcch_re_layout(desc, impl_->layout);
     std::vector<PdcchTdRePair> pairs{};
     if (!build_pdcch_td_re_pairs(impl_->layout, pairs)) {
@@ -1068,11 +1426,6 @@ MmseStatus MmseEqualizerCpuContext::run_pdcch_td(const PdcchMmseInput& in,
     if (out.capacity_symbols < n_symbols) {
         return MmseStatus::kBufferTooSmall;
     }
-
-    float sigma2_estimate = 0.0F;
-    detail::estimate_channel(in.grid, desc, impl_->h_full, sigma2_estimate);
-    const float sigma2 = detail::update_sigma2_state(impl_->sigma2_by_cell[in.cell_id],
-                                                     sigma2_estimate, impl_->config);
 
     for (std::uint32_t i = 0; i < pairs.size(); ++i) {
         const PdcchTdRePair& pair = pairs[i];

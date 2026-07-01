@@ -82,6 +82,16 @@ MmseStatus cuda_copy_grid_meta_h2d_async(const CudaDeviceBuffers&, const CudaGri
     return MmseStatus::kUnsupportedConfig;
 }
 
+MmseStatus cuda_copy_grid_meta_layout_slice_h2d_async(const CudaDeviceBuffers&, const CudaGridMeta&,
+                                                      std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers&, const CudaGridMeta&,
+                                                 std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
 MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers&, float, std::uintptr_t) {
     return MmseStatus::kUnsupportedConfig;
 }

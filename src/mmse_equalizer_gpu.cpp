@@ -1,5 +1,7 @@
 #include "mmse/mmse_equalizer.h"
+#include "mmse/pbch_module_api.h"
 #include "mmse/pdcch_module_api.h"
+#include "mmse/pcfich_module_api.h"
 
 #include <algorithm>
 #include <array>
@@ -46,6 +48,12 @@ bool use_device_owned_sigma2(const MmseEqualizerGpuConfig& config) {
 
 struct MmseEqualizerGpuContext::Impl {
     using Clock = std::chrono::steady_clock;
+    struct PreparedSubframeState {
+        detail::PreparedSubframeKey key{};
+        bool valid = false;
+        std::uint32_t slot_index = 0;
+        float sigma2 = 0.0F;
+    };
 
     struct StreamState {
         std::uint32_t ordinal = 0;
@@ -125,12 +133,15 @@ struct MmseEqualizerGpuContext::Impl {
     MmseStatus configure_staging_buffers();
     MmseStatus initialize_slot_storage(HostPinnedSlot& slot);
     MmseStatus initialize_slot_device_buffers(HostPinnedSlot& slot);
-    MmseStatus stage_inputs(const PlanarGridViewF32& grid);
+    MmseStatus stage_inputs(const PlanarGridViewF32& grid, const ExtractDescriptor& desc);
+    MmseStatus prepare_subframe_if_needed(const PlanarGridViewF32& grid,
+                                          const ExtractDescriptor& desc);
     MmseStatus validate_estimate_stub(const ExtractDescriptor& desc,
                                       const HostPinnedSlot& slot) const;
     MmseStatus validate_equalize_stub(const HostPinnedSlot& slot) const;
     MmseStatus execute_backend(const ExtractDescriptor& desc);
-    MmseStatus execute_cuda_transport_stub(const ExtractDescriptor& desc, HostPinnedSlot& slot);
+    MmseStatus execute_cuda_transport_stub(const ExtractDescriptor& desc, HostPinnedSlot& slot,
+                                           bool reuse_estimate);
     MmseStatus stage_outputs(EqualizerOutputView& out) const;
     static double elapsed_us(const Clock::time_point& start, const Clock::time_point& end);
 
@@ -141,6 +152,7 @@ struct MmseEqualizerGpuContext::Impl {
     std::array<detail::Sigma2State, kLteNumCellIds> sigma2_by_cell{};
     MmseEqualizerCpuContext cpu_fallback{};
     StagingBuffers buffers{};
+    PreparedSubframeState prepared{};
     MmseGpuHostProfileSnapshot last_host_profile{};
 };
 
@@ -329,6 +341,7 @@ void MmseEqualizerGpuContext::Impl::reset_runtime_state() {
     buffers.completed_slot = 0;
     buffers.next_sequence = 1;
     buffers.ring_ready = false;
+    prepared = {};
 }
 
 MmseStatus MmseEqualizerGpuContext::Impl::configure_device_state() {
@@ -551,9 +564,17 @@ MmseStatus MmseEqualizerGpuContext::Impl::configure_staging_buffers() {
     return MmseStatus::kOk;
 }
 
-MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& grid) {
+MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& grid,
+                                                       const ExtractDescriptor& desc) {
     if (!buffers.ring_ready) {
         return MmseStatus::kInternalError;
+    }
+
+    const detail::PreparedSubframeKey key =
+        detail::make_prepared_subframe_key(grid, desc, static_cast<std::uint32_t>(config.backend));
+    if (prepared.valid && detail::prepared_subframe_key_equal(prepared.key, key)) {
+        buffers.active_slot = prepared.slot_index;
+        return MmseStatus::kOk;
     }
 
     auto& slot = buffers.slots[buffers.next_stage_slot];
@@ -602,7 +623,16 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& 
 
     buffers.active_slot = buffers.next_stage_slot;
     buffers.next_stage_slot = (buffers.next_stage_slot + 1U) % kPinnedRingSlotCount;
+    prepared.key = key;
+    prepared.valid = false;
+    prepared.slot_index = buffers.active_slot;
     return MmseStatus::kOk;
+}
+
+MmseStatus
+MmseEqualizerGpuContext::Impl::prepare_subframe_if_needed(const PlanarGridViewF32& grid,
+                                                          const ExtractDescriptor& desc) {
+    return stage_inputs(grid, desc);
 }
 
 MmseStatus MmseEqualizerGpuContext::Impl::validate_estimate_stub(const ExtractDescriptor& desc,
@@ -695,7 +725,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::validate_equalize_stub(const HostPinne
 }
 
 MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const ExtractDescriptor& desc,
-                                                                      HostPinnedSlot& slot) {
+                                                                      HostPinnedSlot& slot,
+                                                                      bool reuse_estimate) {
     if (!detail::cuda_backend_compiled() || !device.cuda_runtime_available ||
         !slot.device_buffers_ready || slot.stream_handle == 0U) {
         return MmseStatus::kUnsupportedConfig;
@@ -721,18 +752,14 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     last_host_profile.stream_gpu_us = 0.0;
 
     const Clock::time_point layout_start = Clock::now();
-    if (desc.channel_type == MmseChannelType::kPdcch) {
-        detail::build_pdcch_re_layout(desc, slot.layout);
-    } else {
-        detail::build_data_re_layout(desc, slot.layout);
-    }
+    detail::build_channel_re_layout(desc, slot.layout);
     last_host_profile.layout_build_us = elapsed_us(layout_start, Clock::now());
 
     const Clock::time_point grid_meta_pack_start = Clock::now();
     slot.grid_meta.n_valid_re = slot.layout.n_re;
     slot.grid_meta.first_valid_grid_idx = slot.layout.n_re == 0U ? 0U : slot.layout.grid_indices[0];
     slot.grid_meta.subframe = detail::subframe_from_descriptor(desc);
-    slot.grid_meta.start_symbol = desc.start_symbol;
+    slot.grid_meta.start_symbol = detail::channel_start_symbol(desc);
     slot.grid_meta.n_layers = desc.n_layers;
     slot.grid_meta.n_tx_ports = desc.n_tx_ports;
     slot.grid_meta.channel_type = static_cast<std::uint32_t>(desc.channel_type);
@@ -799,75 +826,91 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         }
     }
     last_host_profile.grid_meta_pack_us = elapsed_us(grid_meta_pack_start, Clock::now());
-
-    const Clock::time_point grid_h2d_start = Clock::now();
-    if (const MmseStatus status = detail::cuda_copy_grid_h2d_async(
-            slot.device, slot.transport_re, slot.transport_im, slot.grid_meta,
-            slot.grid_plane_bytes, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    if (const MmseStatus status =
-            detail::cuda_event_record(slot.gpu_event_stream_start, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    last_host_profile.grid_h2d_us = elapsed_us(grid_h2d_start, Clock::now());
-    slot.h2d_submitted = true;
-
-    if (use_device_owned_sigma2(config)) {
-        const detail::Sigma2State& sigma2_state = sigma2_by_cell[desc.cell_id];
-        const float sigma2_seed = sigma2_state.initialized ? sigma2_state.value : 0.0F;
+    if (!reuse_estimate) {
+        const Clock::time_point grid_h2d_start = Clock::now();
+        if (const MmseStatus status = detail::cuda_copy_grid_h2d_async(
+                slot.device, slot.transport_re, slot.transport_im, slot.grid_meta,
+                slot.grid_plane_bytes, slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
         if (const MmseStatus status =
-                detail::cuda_copy_sigma2_h2d_async(slot.device, sigma2_seed, slot.stream_handle);
+                detail::cuda_event_record(slot.gpu_event_stream_start, slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        last_host_profile.grid_h2d_us = elapsed_us(grid_h2d_start, Clock::now());
+        slot.h2d_submitted = true;
+
+        if (use_device_owned_sigma2(config)) {
+            const detail::Sigma2State& sigma2_state = sigma2_by_cell[desc.cell_id];
+            const float sigma2_seed = sigma2_state.initialized ? sigma2_state.value : 0.0F;
+            if (const MmseStatus status = detail::cuda_copy_sigma2_h2d_async(
+                    slot.device, sigma2_seed, slot.stream_handle);
+                status != MmseStatus::kOk) {
+                return status;
+            }
+        }
+
+        const Clock::time_point estimate_launch_start = Clock::now();
+        if (const MmseStatus status = detail::cuda_launch_estimate_stub(
+                slot.device, slot.stream_handle, slot.gpu_event_residual_done);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        if (const MmseStatus status =
+                detail::cuda_event_record(slot.gpu_event_estimate_done, slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        last_host_profile.estimate_launch_us = elapsed_us(estimate_launch_start, Clock::now());
+        slot.kernel_submitted = true;
+
+        if (!use_device_owned_sigma2(config)) {
+            float sigma2_estimate = 0.0F;
+            const Clock::time_point sigma2_d2h_start = Clock::now();
+            if (const MmseStatus status = detail::cuda_copy_sigma2_d2h_async(
+                    slot.device, sigma2_estimate, slot.stream_handle);
+                status != MmseStatus::kOk) {
+                return status;
+            }
+            last_host_profile.sigma2_d2h_us = elapsed_us(sigma2_d2h_start, Clock::now());
+            const Clock::time_point sigma2_sync_start = Clock::now();
+            if (const MmseStatus status = detail::cuda_stream_synchronize(slot.stream_handle);
+                status != MmseStatus::kOk) {
+                return status;
+            }
+            last_host_profile.sigma2_mid_sync_us = elapsed_us(sigma2_sync_start, Clock::now());
+            const Clock::time_point sigma2_host_update_start = Clock::now();
+            slot.grid_meta.sigma2 = detail::update_sigma2_state(
+                sigma2_by_cell[desc.cell_id], sigma2_estimate, make_cpu_fallback_config(config));
+            prepared.sigma2 = slot.grid_meta.sigma2;
+            prepared.valid = true;
+            last_host_profile.sigma2_host_update_us =
+                elapsed_us(sigma2_host_update_start, Clock::now());
+            const Clock::time_point sigma2_h2d_start = Clock::now();
+            if (const MmseStatus status = detail::cuda_copy_sigma2_h2d_async(
+                    slot.device, slot.grid_meta.sigma2, slot.stream_handle);
+                status != MmseStatus::kOk) {
+                return status;
+            }
+            last_host_profile.sigma2_h2d_us = elapsed_us(sigma2_h2d_start, Clock::now());
+        }
+    } else {
+        slot.grid_meta.sigma2 = prepared.sigma2;
+        if (const MmseStatus status = detail::cuda_copy_grid_meta_dynamic_h2d_async(
+                slot.device, slot.grid_meta, slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        if (const MmseStatus status =
+                detail::cuda_event_record(slot.gpu_event_stream_start, slot.stream_handle);
             status != MmseStatus::kOk) {
             return status;
         }
     }
 
     const std::uint32_t completion_value = static_cast<std::uint32_t>(slot.sequence & 0xFFFFFFFFU);
-    const Clock::time_point estimate_launch_start = Clock::now();
-    if (const MmseStatus status = detail::cuda_launch_estimate_stub(slot.device, slot.stream_handle,
-                                                                    slot.gpu_event_residual_done);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    if (const MmseStatus status =
-            detail::cuda_event_record(slot.gpu_event_estimate_done, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
-    }
-    last_host_profile.estimate_launch_us = elapsed_us(estimate_launch_start, Clock::now());
-    slot.kernel_submitted = true;
-
-    if (!use_device_owned_sigma2(config)) {
-        float sigma2_estimate = 0.0F;
-        const Clock::time_point sigma2_d2h_start = Clock::now();
-        if (const MmseStatus status = detail::cuda_copy_sigma2_d2h_async(
-                slot.device, sigma2_estimate, slot.stream_handle);
-            status != MmseStatus::kOk) {
-            return status;
-        }
-        last_host_profile.sigma2_d2h_us = elapsed_us(sigma2_d2h_start, Clock::now());
-        const Clock::time_point sigma2_sync_start = Clock::now();
-        if (const MmseStatus status = detail::cuda_stream_synchronize(slot.stream_handle);
-            status != MmseStatus::kOk) {
-            return status;
-        }
-        last_host_profile.sigma2_mid_sync_us = elapsed_us(sigma2_sync_start, Clock::now());
-        const Clock::time_point sigma2_host_update_start = Clock::now();
-        slot.grid_meta.sigma2 = detail::update_sigma2_state(
-            sigma2_by_cell[desc.cell_id], sigma2_estimate, make_cpu_fallback_config(config));
-        last_host_profile.sigma2_host_update_us =
-            elapsed_us(sigma2_host_update_start, Clock::now());
-        const Clock::time_point sigma2_h2d_start = Clock::now();
-        if (const MmseStatus status = detail::cuda_copy_sigma2_h2d_async(
-                slot.device, slot.grid_meta.sigma2, slot.stream_handle);
-            status != MmseStatus::kOk) {
-            return status;
-        }
-        last_host_profile.sigma2_h2d_us = elapsed_us(sigma2_h2d_start, Clock::now());
-    }
     const Clock::time_point equalize_launch_start = Clock::now();
     if (const MmseStatus status = detail::cuda_launch_equalize_stub(
             slot.device, slot.grid_meta.n_valid_re, completion_value, slot.stream_handle);
@@ -896,21 +939,32 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
             return status;
         }
     }
-    const Clock::time_point scratch_d2h_start = Clock::now();
-    if (const MmseStatus status = detail::cuda_copy_scratch_d2h_async(
-            slot.device, slot.scratch_host.data(), scratch_float_count() * sizeof(float),
-            slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
+    const bool need_scratch_d2h = deep_validation_enabled() || use_device_owned_sigma2(config);
+    if (need_scratch_d2h) {
+        const Clock::time_point scratch_d2h_start = Clock::now();
+        if (const MmseStatus status = detail::cuda_copy_scratch_d2h_async(
+                slot.device, slot.scratch_host.data(), scratch_float_count() * sizeof(float),
+                slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        last_host_profile.scratch_d2h_us = elapsed_us(scratch_d2h_start, Clock::now());
+    } else {
+        last_host_profile.scratch_d2h_us = 0.0;
     }
-    last_host_profile.scratch_d2h_us = elapsed_us(scratch_d2h_start, Clock::now());
-    const Clock::time_point completion_d2h_start = Clock::now();
-    if (const MmseStatus status = detail::cuda_copy_completion_d2h_async(
-            slot.device, slot.completion_value, slot.stream_handle);
-        status != MmseStatus::kOk) {
-        return status;
+    if (deep_validation_enabled()) {
+        const Clock::time_point completion_d2h_start = Clock::now();
+        if (const MmseStatus status = detail::cuda_copy_completion_d2h_async(
+                slot.device, slot.completion_value, slot.stream_handle);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        last_host_profile.completion_d2h_us = elapsed_us(completion_d2h_start, Clock::now());
+    } else {
+        last_host_profile.completion_d2h_us = 0.0;
+        slot.completion_ready = true;
+        slot.completion_value = completion_value;
     }
-    last_host_profile.completion_d2h_us = elapsed_us(completion_d2h_start, Clock::now());
     if (const MmseStatus status =
             detail::cuda_event_record(slot.gpu_event_stream_done, slot.stream_handle);
         status != MmseStatus::kOk) {
@@ -937,6 +991,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         detail::Sigma2State& sigma2_state = sigma2_by_cell[desc.cell_id];
         sigma2_state.value = slot.grid_meta.sigma2;
         sigma2_state.initialized = true;
+        prepared.sigma2 = slot.grid_meta.sigma2;
+        prepared.valid = true;
     }
 
     if (deep_validation_enabled()) {
@@ -954,13 +1010,14 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
             return status;
         }
     }
-    if (!(slot.scratch_host[3] >= config.sigma2_min)) {
-        return MmseStatus::kInternalError;
-    }
-
-    slot.completion_ready = (slot.completion_value == completion_value);
-    if (!slot.completion_ready) {
-        return MmseStatus::kInternalError;
+    if (deep_validation_enabled()) {
+        if (!(slot.scratch_host[3] >= config.sigma2_min)) {
+            return MmseStatus::kInternalError;
+        }
+        slot.completion_ready = (slot.completion_value == completion_value);
+        if (!slot.completion_ready) {
+            return MmseStatus::kInternalError;
+        }
     }
     return MmseStatus::kOk;
 }
@@ -982,7 +1039,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_backend(const ExtractDescripto
             !device.streams[slot.stream_ordinal].ready) {
             return MmseStatus::kInternalError;
         }
-        status = execute_cuda_transport_stub(desc, slot);
+        status = execute_cuda_transport_stub(
+            desc, slot, prepared.valid && prepared.slot_index == buffers.active_slot);
         break;
     case MmseGpuBackend::kAuto:
         status = cpu_fallback.run(slot.grid_view, desc, slot.out_view);
@@ -1090,7 +1148,8 @@ MmseStatus MmseEqualizerGpuContext::run(const PlanarGridViewF32& grid,
     if (const MmseStatus status = detail::validate_output(out); status != MmseStatus::kOk) {
         return status;
     }
-    if (const MmseStatus status = impl_->stage_inputs(grid); status != MmseStatus::kOk) {
+    if (const MmseStatus status = impl_->prepare_subframe_if_needed(grid, desc);
+        status != MmseStatus::kOk) {
         return status;
     }
     if (const MmseStatus status = impl_->execute_backend(desc); status != MmseStatus::kOk) {
@@ -1099,6 +1158,130 @@ MmseStatus MmseEqualizerGpuContext::run(const PlanarGridViewF32& grid,
     if (const MmseStatus status = impl_->stage_outputs(out); status != MmseStatus::kOk) {
         return status;
     }
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerGpuContext::run_pbch(const PbchMmseInput& in, PbchMmseOutputView& out,
+                                             PbchMmseResult& meta) {
+    if (const MmseStatus status = mmse::pbch::validate_pbch_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = in.n_tx_ports;
+    desc.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    desc.n_layers = 1U;
+    desc.tx_mode = in.tx_mode;
+    desc.channel_type = MmseChannelType::kPbch;
+    desc.start_symbol = kLtePbchStartSymbolNormalCp;
+    desc.control_symbol_count = 0U;
+    desc.mod_order = 2U;
+    desc.n_prb = kLtePbchNumPrb;
+    desc.prb_bitmap.fill(0U);
+    for (std::uint32_t prb = kLtePbchStartPrb; prb < kLtePbchStartPrb + kLtePbchNumPrb; ++prb) {
+        desc.prb_bitmap[prb / 16U] |= static_cast<std::uint16_t>(1U << (prb % 16U));
+    }
+    desc.pmi = -1;
+
+    EqualizerOutputView base_out{};
+    base_out.x_hat_re = out.x_hat_re;
+    base_out.x_hat_im = out.x_hat_im;
+    base_out.sinr = out.sinr;
+    base_out.capacity_re_per_layer = out.capacity_re_per_layer;
+
+    const MmseStatus status = run(in.grid, desc, base_out);
+    if (status != MmseStatus::kOk) {
+        return status;
+    }
+    if (out.re_grid_indices == nullptr || out.capacity_re_metadata < base_out.n_re_per_layer) {
+        return MmseStatus::kBufferTooSmall;
+    }
+
+    const auto& slot = impl_->buffers.slots[impl_->buffers.completed_slot];
+    for (std::uint32_t i = 0; i < base_out.n_re_per_layer; ++i) {
+        out.re_grid_indices[i] = slot.layout.grid_indices[i];
+    }
+
+    meta = {};
+    meta.n_re = base_out.n_re_per_layer;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.n_symbols = in.grid.n_symbols;
+    meta.n_subcarriers = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.start_prb = kLtePbchStartPrb;
+    meta.n_prb = kLtePbchNumPrb;
+    meta.start_symbol = kLtePbchStartSymbolNormalCp;
+    meta.n_tx_ports = in.n_tx_ports;
+    meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    meta.n_layers = base_out.n_layers;
+    meta.tx_mode = in.tx_mode;
+    meta.mod_order = base_out.mod_order;
+    meta.sigma2 = slot.grid_meta.sigma2;
+    meta.chain = in.chain;
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerGpuContext::run_pcfich(const PcfichMmseInput& in, PcfichMmseOutputView& out,
+                                               PcfichMmseResult& meta) {
+    if (const MmseStatus status = mmse::pcfich::validate_pcfich_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = in.n_tx_ports;
+    desc.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    desc.n_layers = 1U;
+    desc.tx_mode = in.tx_mode;
+    desc.channel_type = MmseChannelType::kPcfich;
+    desc.start_symbol = 0U;
+    desc.control_symbol_count = 1U;
+    desc.mod_order = 2U;
+    desc.n_prb = kLteNumPrb20MHz;
+    desc.prb_bitmap.fill(0xFFFFU);
+    desc.prb_bitmap.back() = 0x000FU;
+    desc.pmi = -1;
+
+    EqualizerOutputView base_out{};
+    base_out.x_hat_re = out.x_hat_re;
+    base_out.x_hat_im = out.x_hat_im;
+    base_out.sinr = out.sinr;
+    base_out.capacity_re_per_layer = out.capacity_re_per_layer;
+
+    const MmseStatus status = run(in.grid, desc, base_out);
+    if (status != MmseStatus::kOk) {
+        return status;
+    }
+    if (out.re_grid_indices == nullptr || out.capacity_re_metadata < base_out.n_re_per_layer) {
+        return MmseStatus::kBufferTooSmall;
+    }
+
+    const auto& slot = impl_->buffers.slots[impl_->buffers.completed_slot];
+    for (std::uint32_t i = 0; i < base_out.n_re_per_layer; ++i) {
+        out.re_grid_indices[i] = slot.layout.grid_indices[i];
+    }
+
+    meta = {};
+    meta.n_re = base_out.n_re_per_layer;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.n_symbols = in.grid.n_symbols;
+    meta.n_subcarriers = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.n_prb = kLteNumPrb20MHz;
+    meta.start_symbol = 0U;
+    meta.reg_count = static_cast<std::uint8_t>(kLtePcfichNumRegs);
+    meta.n_tx_ports = in.n_tx_ports;
+    meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    meta.n_layers = base_out.n_layers;
+    meta.tx_mode = in.tx_mode;
+    meta.mod_order = base_out.mod_order;
+    meta.sigma2 = slot.grid_meta.sigma2;
+    meta.chain = in.chain;
     return MmseStatus::kOk;
 }
 

@@ -8,8 +8,12 @@
 #include <vector>
 
 #include "mmse/mmse_equalizer.h"
+#include "mmse/pbch_chain_dto.h"
+#include "mmse/pbch_module_api.h"
 #include "mmse/pdcch_chain_dto.h"
 #include "mmse/pdcch_module_api.h"
+#include "mmse/pcfich_chain_dto.h"
+#include "mmse/pcfich_module_api.h"
 #include "internal/mmse_internal.h"
 
 using mmse::EqualizerOutputView;
@@ -158,6 +162,44 @@ ExtractDescriptor make_pdcch_desc() {
     desc.prb_bitmap.fill(0xFFFFU);
     desc.prb_bitmap.back() = 0x000FU;
     desc.control_re_exclusion_masks.fill(0U);
+    return desc;
+}
+
+ExtractDescriptor make_pbch_desc() {
+    ExtractDescriptor desc{};
+    desc.cell_id = 0;
+    desc.n_tx_ports = 1;
+    desc.n_rx_ant = 2;
+    desc.n_layers = 1;
+    desc.tx_mode = 1;
+    desc.channel_type = MmseChannelType::kPbch;
+    desc.start_symbol = kLtePbchStartSymbolNormalCp;
+    desc.control_symbol_count = 0;
+    desc.mod_order = 2;
+    desc.n_prb = kLtePbchNumPrb;
+    desc.sfn_subframe = 0;
+    desc.prb_bitmap.fill(0U);
+    for (std::uint32_t prb = kLtePbchStartPrb; prb < kLtePbchStartPrb + kLtePbchNumPrb; ++prb) {
+        desc.prb_bitmap[prb / 16U] |= static_cast<std::uint16_t>(1U << (prb % 16U));
+    }
+    return desc;
+}
+
+ExtractDescriptor make_pcfich_desc() {
+    ExtractDescriptor desc{};
+    desc.cell_id = 0;
+    desc.n_tx_ports = 1;
+    desc.n_rx_ant = 2;
+    desc.n_layers = 1;
+    desc.tx_mode = 1;
+    desc.channel_type = MmseChannelType::kPcfich;
+    desc.start_symbol = 0;
+    desc.control_symbol_count = 1;
+    desc.mod_order = 2;
+    desc.n_prb = 100;
+    desc.sfn_subframe = 0;
+    desc.prb_bitmap.fill(0xFFFFU);
+    desc.prb_bitmap.back() = 0x000FU;
     return desc;
 }
 
@@ -714,6 +756,38 @@ void test_pdcch_layout_excludes_crs_and_reserved_res() {
     expect_true(n_re_reserved == n_re - 4U, "reserved control REs must be excluded");
 }
 
+void test_pbch_layout_matches_lte_center_72_subcarriers() {
+    ExtractDescriptor desc = make_pbch_desc();
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_re = mmse::detail::build_channel_re_layout(desc, layout);
+    expect_true(n_re == 240U, "pbch layout should expose 240 RE");
+    for (std::uint32_t i = 0; i < n_re; ++i) {
+        const std::uint32_t grid_idx = layout.grid_indices[i];
+        const std::uint32_t symbol = grid_idx / kLteNumSubcarriers20MHz;
+        const std::uint32_t sc = grid_idx % kLteNumSubcarriers20MHz;
+        expect_true(symbol >= kLtePbchStartSymbolNormalCp &&
+                        symbol < kLtePbchStartSymbolNormalCp + kLtePbchNumSymbols,
+                    "pbch symbol range");
+        expect_true(sc >= kLtePbchStartPrb * kLteNumSubcarriersPerPrb &&
+                        sc < (kLtePbchStartPrb + kLtePbchNumPrb) * kLteNumSubcarriersPerPrb,
+                    "pbch subcarrier range");
+    }
+}
+
+void test_pcfich_layout_matches_four_regs_without_crs() {
+    ExtractDescriptor desc = make_pcfich_desc();
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_re = mmse::detail::build_channel_re_layout(desc, layout);
+    expect_true(n_re == 16U, "pcfich layout should expose 16 RE after CRS removal");
+    for (std::uint32_t i = 0; i < n_re; ++i) {
+        const std::uint32_t grid_idx = layout.grid_indices[i];
+        const std::uint32_t symbol = grid_idx / kLteNumSubcarriers20MHz;
+        const std::uint32_t sc = grid_idx % kLteNumSubcarriers20MHz;
+        expect_true(symbol == 0U, "pcfich should stay in symbol 0");
+        expect_true(!mmse::detail::is_crs_re(desc, 0U, sc), "pcfich layout must exclude CRS");
+    }
+}
+
 void test_pdcch_cpu_run_supports_single_port_and_generic_two_port_layout() {
     MmseEqualizerCpuContext ctx;
     MmseEqualizerCpuConfig config{};
@@ -741,6 +815,311 @@ void test_pdcch_cpu_run_supports_single_port_and_generic_two_port_layout() {
     expect_true(ctx.run(grid, two_port, out) == MmseStatus::kOk,
                 "generic run should allow two-port pdcch backend path");
     expect_true(out.n_re_per_layer == 3200U, "two-port generic pdcch RE count");
+}
+
+void test_pbch_frontend_dto_builds_mmse_input() {
+    GridBuffers buffers = make_zero_grid();
+    const PlanarGridViewF32 grid = make_grid_view(buffers);
+
+    mmse::pbch::FrontendPbchIndication frontend{};
+    frontend.sfn_subframe = 5U;
+    frontend.cell_id = 23U;
+    frontend.n_tx_ports = 1U;
+    frontend.tx_mode = 1U;
+    frontend.chain.request_id = 111U;
+
+    const PbchMmseInput in = mmse::pbch::make_pbch_mmse_input(grid, frontend);
+    expect_true(in.grid.n_symbols == grid.n_symbols, "pbch dto grid passthrough");
+    expect_true(in.sfn_subframe == frontend.sfn_subframe, "pbch dto subframe");
+    expect_true(in.cell_id == frontend.cell_id, "pbch dto cell");
+    expect_true(in.chain.request_id == frontend.chain.request_id, "pbch dto chain");
+}
+
+void test_pcfich_frontend_dto_builds_mmse_input() {
+    GridBuffers buffers = make_zero_grid();
+    const PlanarGridViewF32 grid = make_grid_view(buffers);
+
+    mmse::pcfich::FrontendPcfichIndication frontend{};
+    frontend.sfn_subframe = 6U;
+    frontend.cell_id = 41U;
+    frontend.n_tx_ports = 1U;
+    frontend.tx_mode = 1U;
+    frontend.chain.request_id = 222U;
+
+    const PcfichMmseInput in = mmse::pcfich::make_pcfich_mmse_input(grid, frontend);
+    expect_true(in.grid.n_symbols == grid.n_symbols, "pcfich dto grid passthrough");
+    expect_true(in.sfn_subframe == frontend.sfn_subframe, "pcfich dto subframe");
+    expect_true(in.cell_id == frontend.cell_id, "pcfich dto cell");
+    expect_true(in.chain.request_id == frontend.chain.request_id, "pcfich dto chain");
+}
+
+void test_pbch_backend_dto_packs_equalized_output() {
+    PbchMmseResult meta{};
+    meta.n_re = 3U;
+    meta.sfn_subframe = 7U;
+    meta.cell_id = 10U;
+    meta.start_prb = kLtePbchStartPrb;
+    meta.n_prb = kLtePbchNumPrb;
+    meta.start_symbol = kLtePbchStartSymbolNormalCp;
+    meta.n_tx_ports = 1U;
+    meta.n_rx_ant = 2U;
+    meta.n_layers = 1U;
+    meta.tx_mode = 1U;
+    meta.mod_order = 2U;
+    meta.sigma2 = 0.25F;
+    meta.chain.request_id = 333U;
+
+    std::array<float, 3> xre = {1.0F, 2.0F, 3.0F};
+    std::array<float, 3> xim = {0.1F, 0.2F, 0.3F};
+    std::array<float, 3> sinr = {10.0F, 11.0F, 12.0F};
+    std::array<std::uint16_t, 3> indices = {100U, 101U, 102U};
+    PbchMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices = indices.data();
+
+    const auto backend = mmse::pbch::make_backend_pbch_equalized_indication(meta, out);
+    expect_true(backend.re_grid_indices.size() == 3U, "pbch backend dto size");
+    expect_true(backend.x_hat_re[1] == 2.0F, "pbch backend dto xhat");
+    expect_true(backend.sigma2 == meta.sigma2, "pbch backend dto sigma2");
+    expect_true(backend.chain.request_id == meta.chain.request_id, "pbch backend dto chain");
+}
+
+void test_pcfich_backend_dto_packs_equalized_output() {
+    PcfichMmseResult meta{};
+    meta.n_re = 3U;
+    meta.sfn_subframe = 8U;
+    meta.cell_id = 11U;
+    meta.n_prb = kLteNumPrb20MHz;
+    meta.start_symbol = 0U;
+    meta.reg_count = static_cast<std::uint8_t>(kLtePcfichNumRegs);
+    meta.n_tx_ports = 1U;
+    meta.n_rx_ant = 2U;
+    meta.n_layers = 1U;
+    meta.tx_mode = 1U;
+    meta.mod_order = 2U;
+    meta.sigma2 = 0.5F;
+    meta.chain.request_id = 444U;
+
+    std::array<float, 3> xre = {4.0F, 5.0F, 6.0F};
+    std::array<float, 3> xim = {0.4F, 0.5F, 0.6F};
+    std::array<float, 3> sinr = {13.0F, 14.0F, 15.0F};
+    std::array<std::uint16_t, 3> indices = {10U, 11U, 12U};
+    PcfichMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices = indices.data();
+
+    const auto backend = mmse::pcfich::make_backend_pcfich_equalized_indication(meta, out);
+    expect_true(backend.re_grid_indices.size() == 3U, "pcfich backend dto size");
+    expect_true(backend.x_hat_im[2] == 0.6F, "pcfich backend dto imag");
+    expect_true(backend.reg_count == meta.reg_count, "pcfich backend dto reg count");
+    expect_true(backend.chain.request_id == meta.chain.request_id, "pcfich backend dto chain");
+}
+
+void test_pbch_cpu_run_returns_equalized_pbch_surface() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "pbch cpu init");
+
+    GridBuffers buffers = make_zero_grid();
+    auto desc = make_pbch_desc();
+    fill_identity_channel(buffers, desc, 1.0F, 0.0F);
+
+    PbchMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = desc.n_tx_ports;
+    in.tx_mode = desc.tx_mode;
+    in.chain.request_id = 555U;
+
+    std::vector<float> xre(300U);
+    std::vector<float> xim(300U);
+    std::vector<float> sinr(300U);
+    std::vector<std::uint16_t> indices(300U);
+    PbchMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices = indices.data();
+    out.capacity_re_per_layer = 300U;
+    out.capacity_re_metadata = 300U;
+
+    PbchMmseResult meta{};
+    expect_true(ctx.run_pbch(in, out, meta) == MmseStatus::kOk, "pbch cpu run");
+    expect_true(meta.n_re == 240U, "pbch cpu n_re");
+    expect_true(meta.start_prb == kLtePbchStartPrb, "pbch cpu start prb");
+    expect_true(meta.chain.request_id == in.chain.request_id, "pbch cpu chain");
+}
+
+void test_pcfich_cpu_run_returns_equalized_pcfich_surface() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "pcfich cpu init");
+
+    GridBuffers buffers = make_zero_grid();
+    auto desc = make_pcfich_desc();
+    fill_identity_channel(buffers, desc, 1.0F, 0.0F);
+
+    PcfichMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = desc.n_tx_ports;
+    in.tx_mode = desc.tx_mode;
+    in.chain.request_id = 666U;
+
+    std::vector<float> xre(64U);
+    std::vector<float> xim(64U);
+    std::vector<float> sinr(64U);
+    std::vector<std::uint16_t> indices(64U);
+    PcfichMmseOutputView out{};
+    out.x_hat_re = xre.data();
+    out.x_hat_im = xim.data();
+    out.sinr = sinr.data();
+    out.re_grid_indices = indices.data();
+    out.capacity_re_per_layer = 64U;
+    out.capacity_re_metadata = 64U;
+
+    PcfichMmseResult meta{};
+    expect_true(ctx.run_pcfich(in, out, meta) == MmseStatus::kOk, "pcfich cpu run");
+    expect_true(meta.n_re == 16U, "pcfich cpu n_re");
+    expect_true(meta.reg_count == kLtePcfichNumRegs, "pcfich cpu reg count");
+    expect_true(meta.chain.request_id == in.chain.request_id, "pcfich cpu chain");
+}
+
+void test_cpu_shared_estimate_reuses_once_per_subframe() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "shared-estimate cpu init");
+
+    GridBuffers buffers = make_zero_grid();
+    auto pdsch_desc = make_fullband_desc();
+    pdsch_desc.sfn_subframe = 0U;
+    auto pbch_in = PbchMmseInput{.grid = make_grid_view(buffers),
+                                 .sfn_subframe = 0U,
+                                 .cell_id = pdsch_desc.cell_id,
+                                 .n_tx_ports = 1U,
+                                 .tx_mode = 1U};
+    auto pcfich_in = PcfichMmseInput{.grid = make_grid_view(buffers),
+                                     .sfn_subframe = 0U,
+                                     .cell_id = pdsch_desc.cell_id,
+                                     .n_tx_ports = 1U,
+                                     .tx_mode = 1U};
+    auto pdcch_desc = make_pdcch_desc();
+    pdcch_desc.sfn_subframe = 0U;
+    PdcchMmseInput pdcch_in{};
+    pdcch_in.grid = make_grid_view(buffers);
+    pdcch_in.sfn_subframe = pdcch_desc.sfn_subframe;
+    pdcch_in.cell_id = pdcch_desc.cell_id;
+    pdcch_in.n_tx_ports = 1U;
+    pdcch_in.tx_mode = 1U;
+    pdcch_in.control_symbol_count = pdcch_desc.control_symbol_count;
+    pdcch_in.n_prb = pdcch_desc.n_prb;
+    pdcch_in.prb_bitmap = pdcch_desc.prb_bitmap;
+    pdcch_in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                                 .subframe = 0U,
+                                 .ul_dl_config = 0U,
+                                 .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+    std::vector<float> pdsch_re(40000U);
+    std::vector<float> pdsch_im(40000U);
+    std::vector<float> pdsch_sinr(40000U);
+    EqualizerOutputView pdsch_out{pdsch_re.data(), pdsch_im.data(), pdsch_sinr.data(), 20000U};
+
+    std::vector<float> pbch_re(256U), pbch_im(256U), pbch_sinr(256U);
+    std::vector<std::uint16_t> pbch_idx(256U);
+    PbchMmseOutputView pbch_out{pbch_re.data(),  pbch_im.data(), pbch_sinr.data(),
+                                pbch_idx.data(), 256U,           256U};
+    PbchMmseResult pbch_meta{};
+
+    std::vector<float> pcfich_re(32U), pcfich_im(32U), pcfich_sinr(32U);
+    std::vector<std::uint16_t> pcfich_idx(32U);
+    PcfichMmseOutputView pcfich_out{
+        pcfich_re.data(), pcfich_im.data(), pcfich_sinr.data(), pcfich_idx.data(), 32U, 32U};
+    PcfichMmseResult pcfich_meta{};
+
+    std::vector<float> pdcch_re(4000U), pdcch_im(4000U), pdcch_sinr(4000U);
+    std::vector<std::uint16_t> pdcch_idx(4000U);
+    PdcchMmseOutputView pdcch_out{pdcch_re.data(),  pdcch_im.data(), pdcch_sinr.data(),
+                                  pdcch_idx.data(), 4000U,           4000U};
+    PdcchMmseResult pdcch_meta{};
+
+    mmse::detail::debug_reset_estimate_channel_call_count();
+    expect_true(ctx.run_pbch(pbch_in, pbch_out, pbch_meta) == MmseStatus::kOk, "pbch run");
+    expect_true(ctx.run_pcfich(pcfich_in, pcfich_out, pcfich_meta) == MmseStatus::kOk,
+                "pcfich run");
+    expect_true(ctx.run_pdcch(pdcch_in, pdcch_out, pdcch_meta) == MmseStatus::kOk, "pdcch run");
+    expect_true(ctx.run(make_grid_view(buffers), pdsch_desc, pdsch_out) == MmseStatus::kOk,
+                "pdsch run");
+    expect_true(mmse::detail::debug_get_estimate_channel_call_count() == 1U,
+                "estimate should be reused across same-subframe channel wrappers");
+}
+
+void test_gpu_shared_estimate_skips_second_estimate_path() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig config{};
+    config.backend = MmseGpuBackend::kCuda;
+    expect_true(gpu.init(config) == MmseStatus::kOk, "gpu shared-estimate init");
+
+    GridBuffers buffers = make_zero_grid();
+    auto pdsch_desc = make_fullband_desc();
+    pdsch_desc.sfn_subframe = 0U;
+    fill_identity_channel(buffers, pdsch_desc, 1.0F, 1.0F);
+    auto grid = make_grid_view(buffers);
+
+    PbchMmseInput pbch_in{};
+    pbch_in.grid = grid;
+    pbch_in.sfn_subframe = 0U;
+    pbch_in.cell_id = pdsch_desc.cell_id;
+    pbch_in.n_tx_ports = 1U;
+    pbch_in.tx_mode = 1U;
+
+    auto pdcch_desc = make_pdcch_desc();
+    pdcch_desc.sfn_subframe = 0U;
+    PdcchMmseInput pdcch_in{};
+    pdcch_in.grid = grid;
+    pdcch_in.sfn_subframe = 0U;
+    pdcch_in.cell_id = pdcch_desc.cell_id;
+    pdcch_in.n_tx_ports = 1U;
+    pdcch_in.tx_mode = 1U;
+    pdcch_in.control_symbol_count = pdcch_desc.control_symbol_count;
+    pdcch_in.n_prb = pdcch_desc.n_prb;
+    pdcch_in.prb_bitmap = pdcch_desc.prb_bitmap;
+    pdcch_in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                                 .subframe = 0U,
+                                 .ul_dl_config = 0U,
+                                 .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+    std::vector<float> pbch_re(256U), pbch_im(256U), pbch_sinr(256U);
+    std::vector<std::uint16_t> pbch_idx(256U);
+    PbchMmseOutputView pbch_out{pbch_re.data(),  pbch_im.data(), pbch_sinr.data(),
+                                pbch_idx.data(), 256U,           256U};
+    PbchMmseResult pbch_meta{};
+
+    std::vector<float> pdcch_re(4000U), pdcch_im(4000U), pdcch_sinr(4000U);
+    std::vector<std::uint16_t> pdcch_idx(4000U);
+    PdcchMmseOutputView pdcch_out{pdcch_re.data(),  pdcch_im.data(), pdcch_sinr.data(),
+                                  pdcch_idx.data(), 4000U,           4000U};
+    PdcchMmseResult pdcch_meta{};
+
+    expect_true(gpu.run_pbch(pbch_in, pbch_out, pbch_meta) == MmseStatus::kOk, "gpu pbch run");
+    const MmseGpuHostProfileSnapshot first = gpu.last_host_profile();
+    expect_true(gpu.run_pdcch(pdcch_in, pdcch_out, pdcch_meta) == MmseStatus::kOk, "gpu pdcch run");
+    const MmseGpuHostProfileSnapshot second = gpu.last_host_profile();
+
+    expect_true(first.estimate_launch_us > 0.0, "first run should estimate");
+    expect_true(second.estimate_launch_us < 1.0, "second run should skip estimate launch");
+    expect_true(second.grid_h2d_us < 1.0, "second run should skip grid h2d");
+    expect_true(second.sigma2_d2h_us < 1.0, "second run should skip sigma2 d2h");
+#endif
 }
 
 void test_pdcch_td_cpu_run_recovers_qpsk_symbols() {
@@ -2017,6 +2396,25 @@ int main() {
         std::pair{"single_layer_path", &test_single_layer_path},
         std::pair{"pdcch_layout_excludes_crs_and_reserved_res",
                   &test_pdcch_layout_excludes_crs_and_reserved_res},
+        std::pair{"pbch_layout_matches_lte_center_72_subcarriers",
+                  &test_pbch_layout_matches_lte_center_72_subcarriers},
+        std::pair{"pcfich_layout_matches_four_regs_without_crs",
+                  &test_pcfich_layout_matches_four_regs_without_crs},
+        std::pair{"pbch_frontend_dto_builds_mmse_input", &test_pbch_frontend_dto_builds_mmse_input},
+        std::pair{"pcfich_frontend_dto_builds_mmse_input",
+                  &test_pcfich_frontend_dto_builds_mmse_input},
+        std::pair{"pbch_backend_dto_packs_equalized_output",
+                  &test_pbch_backend_dto_packs_equalized_output},
+        std::pair{"pcfich_backend_dto_packs_equalized_output",
+                  &test_pcfich_backend_dto_packs_equalized_output},
+        std::pair{"pbch_cpu_run_returns_equalized_pbch_surface",
+                  &test_pbch_cpu_run_returns_equalized_pbch_surface},
+        std::pair{"pcfich_cpu_run_returns_equalized_pcfich_surface",
+                  &test_pcfich_cpu_run_returns_equalized_pcfich_surface},
+        std::pair{"cpu_shared_estimate_reuses_once_per_subframe",
+                  &test_cpu_shared_estimate_reuses_once_per_subframe},
+        std::pair{"gpu_shared_estimate_skips_second_estimate_path",
+                  &test_gpu_shared_estimate_skips_second_estimate_path},
         std::pair{"pdcch_cpu_run_supports_single_port_and_generic_two_port_layout",
                   &test_pdcch_cpu_run_supports_single_port_and_generic_two_port_layout},
         std::pair{"pdcch_td_scalar_demap_recovers_qpsk_symbols",
