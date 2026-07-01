@@ -128,4 +128,11 @@ if(MMSE_BUILD_BENCH)
     install(TARGETS mmse_cuda_profile
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
+
+    add_executable(mmse_channel_budget bench/mmse_channel_budget.cpp)
+    target_link_libraries(mmse_channel_budget PRIVATE mmse_cpp)
+    target_include_directories(mmse_channel_budget PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    install(TARGETS mmse_channel_budget
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
 endif()

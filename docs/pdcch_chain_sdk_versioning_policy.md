@@ -15,6 +15,7 @@ still applies specifically to `run_pdcch(...)` and its per-RE DTO semantics.
 
 Related pages:
 
+- [LTE Equalized Channel SDK Documentation](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
 - [Documentation Index](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)
 - [Quick Start](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
 - [API Reference](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)

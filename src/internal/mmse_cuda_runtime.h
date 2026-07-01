@@ -124,6 +124,12 @@ MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
 MmseStatus cuda_copy_grid_meta_h2d_async(const CudaDeviceBuffers& buffers,
                                          const CudaGridMeta& grid_meta,
                                          std::uintptr_t stream_handle);
+MmseStatus cuda_copy_grid_meta_layout_slice_h2d_async(const CudaDeviceBuffers& buffers,
+                                                      const CudaGridMeta& grid_meta,
+                                                      std::uintptr_t stream_handle);
+MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffers,
+                                                 const CudaGridMeta& grid_meta,
+                                                 std::uintptr_t stream_handle);
 
 MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers& buffers, float sigma2,
                                       std::uintptr_t stream_handle);

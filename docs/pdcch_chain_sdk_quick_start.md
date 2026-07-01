@@ -13,6 +13,7 @@ Current interface version:
 
 Related pages:
 
+- [LTE Equalized Channel SDK Documentation](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
 - [Documentation Index](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)
 - [API Reference](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
 - [Versioning Policy](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)

@@ -87,6 +87,17 @@ struct ReLayout {
     std::uint32_t n_segments = 0;
 };
 
+struct PreparedSubframeKey {
+    std::array<const float*, 2> re{};
+    std::array<const float*, 2> im{};
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_subcarriers = 0;
+    std::uint32_t backend_mode = 0;
+};
+
 struct Sigma2State {
     float value = kDefaultSigma2Min;
     bool initialized = false;
@@ -127,6 +138,11 @@ void ensure_crs_tables();
 bool descriptor_supported(const ExtractDescriptor& desc);
 MmseStatus validate_grid(const PlanarGridViewF32& grid);
 MmseStatus validate_output(const EqualizerOutputView& out);
+PreparedSubframeKey make_prepared_subframe_key(const PlanarGridViewF32& grid,
+                                               const ExtractDescriptor& desc,
+                                               std::uint32_t backend_mode = 0U);
+bool prepared_subframe_key_equal(const PreparedSubframeKey& lhs, const PreparedSubframeKey& rhs);
+std::uint32_t channel_start_symbol(const ExtractDescriptor& desc);
 std::uint32_t subframe_from_descriptor(const ExtractDescriptor& desc);
 std::uint32_t crs_frequency_offset(std::uint16_t cell_id, std::uint8_t port, std::uint8_t symbol);
 std::uint32_t crs_subcarrier(std::uint16_t cell_id, std::uint8_t port, std::uint8_t symbol,
@@ -135,6 +151,9 @@ bool is_crs_re(std::uint16_t cell_id, std::uint8_t symbol, std::uint32_t sc);
 bool is_crs_re(const ExtractDescriptor& desc, std::uint8_t symbol, std::uint32_t sc);
 std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layout);
 std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& layout);
+std::uint32_t build_pbch_re_layout(const ExtractDescriptor& desc, ReLayout& layout);
+std::uint32_t build_pcfich_re_layout(const ExtractDescriptor& desc, ReLayout& layout);
+std::uint32_t build_channel_re_layout(const ExtractDescriptor& desc, ReLayout& layout);
 std::uint32_t build_validation_re_samples(const ReLayout& layout, std::uint32_t start_symbol,
                                           std::uint32_t n_symbols, std::uint32_t n_subcarriers,
                                           std::uint32_t* out_re_slots, std::uint32_t max_slots);
@@ -156,6 +175,8 @@ void estimate_channel(
 float update_sigma2_state(Sigma2State& state, float sigma2_estimate,
                           const MmseEqualizerCpuConfig& config);
 float peek_sigma2_state(const Sigma2State& state, float sigma2_min);
+void debug_reset_estimate_channel_call_count();
+std::uint64_t debug_get_estimate_channel_call_count();
 
 void pack_equalizer_inputs(
     const PlanarGridViewF32& grid,

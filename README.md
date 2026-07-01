@@ -107,11 +107,17 @@ Current support boundary:
 For chain integration, prefer the dedicated PDCCH module API over manually building a generic
 `ExtractDescriptor`.
 
-Recommended single-header SDK entrypoint:
+Recommended single-header SDK entrypoints:
 
-- `#include "mmse/pdcch_chain_sdk.h"`
+- PDCCH-only surface: `#include "mmse/pdcch_chain_sdk.h"`
+- unified LTE equalized-channel surface for `PBCH/PDCCH/PCFICH`:
+  `#include "mmse/lte_chain_sdk.h"`
 - overall LTE channel overview: `docs/lte_pdcch_pdsch_channel_decode_overview.md`
 - docs index: `docs/README.md`
+- LTE SDK landing page: `docs/lte_equalized_channel_sdk_interface.md` (`LTE Equalized Channel SDK v1`)
+- PBCH quick start: `docs/pbch_chain_sdk_quick_start.md`
+- PCFICH quick start/API reference: `docs/pcfich_chain_sdk_quick_start_api_reference.md`
+- LTE MMSE budget report: `docs/lte_mmse_budget_report_2026-07-01.md`
 - documentation index: `docs/pdcch_chain_sdk_interface.md` (`PDCCH Chain SDK v1`)
 - quick start: `docs/pdcch_chain_sdk_quick_start.md`
 - API reference: `docs/pdcch_chain_sdk_api_reference.md`
@@ -139,3 +145,26 @@ Downstream-facing output:
 
 This keeps the current module focused on channel estimation and equalization while preserving the
 resource-location and candidate metadata needed by downstream PDCCH-specific stages.
+
+### LTE Unified DTO Surface
+
+For integrations that want one LTE-facing header instead of a PDCCH-specific one, use:
+
+- `#include "mmse/lte_chain_sdk.h"`
+
+This unified header exports:
+
+- `mmse::pbch::*`
+  - `FrontendPbchIndication`
+  - `make_pbch_mmse_input(...)`
+  - `MmseEqualizerCpuContext::run_pbch(...)`
+  - `MmseEqualizerGpuContext::run_pbch(...)`
+  - `make_backend_pbch_equalized_indication(...)`
+- `mmse::pdcch::*`
+  - existing DTO and helper surface
+- `mmse::pcfich::*`
+  - `FrontendPcfichIndication`
+  - `make_pcfich_mmse_input(...)`
+  - `MmseEqualizerCpuContext::run_pcfich(...)`
+  - `MmseEqualizerGpuContext::run_pcfich(...)`
+  - `make_backend_pcfich_equalized_indication(...)`

@@ -58,6 +58,8 @@ enum class MmseGpuValidationPolicy : std::uint8_t {
 enum class MmseChannelType : std::uint8_t {
     kPdsch = 0,
     kPdcch,
+    kPbch,
+    kPcfich,
 };
 
 struct PlanarGridViewF32 {
@@ -93,6 +95,32 @@ struct PdcchChainMetadata {
     std::uint8_t aggregation_level = 0;
 };
 
+struct PbchChainMetadata {
+    std::uint64_t request_id = 0;
+};
+
+struct PcfichChainMetadata {
+    std::uint64_t request_id = 0;
+};
+
+struct PbchMmseInput {
+    PlanarGridViewF32 grid{};
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    std::uint8_t n_tx_ports = 1;
+    std::uint8_t tx_mode = 1;
+    PbchChainMetadata chain{};
+};
+
+struct PcfichMmseInput {
+    PlanarGridViewF32 grid{};
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    std::uint8_t n_tx_ports = 1;
+    std::uint8_t tx_mode = 1;
+    PcfichChainMetadata chain{};
+};
+
 struct PdcchMmseInput {
     PlanarGridViewF32 grid{};
     std::uint32_t sfn_subframe = 0;
@@ -118,6 +146,24 @@ struct EqualizerOutputView {
     std::uint8_t mod_order = 0;
 };
 
+struct PbchMmseOutputView {
+    float* x_hat_re = nullptr;
+    float* x_hat_im = nullptr;
+    float* sinr = nullptr;
+    std::uint16_t* re_grid_indices = nullptr;
+    std::uint32_t capacity_re_per_layer = 0;
+    std::uint32_t capacity_re_metadata = 0;
+};
+
+struct PcfichMmseOutputView {
+    float* x_hat_re = nullptr;
+    float* x_hat_im = nullptr;
+    float* sinr = nullptr;
+    std::uint16_t* re_grid_indices = nullptr;
+    std::uint32_t capacity_re_per_layer = 0;
+    std::uint32_t capacity_re_metadata = 0;
+};
+
 struct PdcchMmseOutputView {
     float* x_hat_re = nullptr;
     float* x_hat_im = nullptr;
@@ -134,6 +180,42 @@ struct PdcchTdMmseOutputView {
     std::uint16_t* re_grid_indices0 = nullptr;
     std::uint16_t* re_grid_indices1 = nullptr;
     std::uint32_t capacity_symbols = 0;
+};
+
+struct PbchMmseResult {
+    std::uint32_t n_re = 0;
+    std::uint32_t sfn_subframe = 0;
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_subcarriers = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t start_prb = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t start_symbol = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t mod_order = 0;
+    float sigma2 = 0.0F;
+    PbchChainMetadata chain{};
+};
+
+struct PcfichMmseResult {
+    std::uint32_t n_re = 0;
+    std::uint32_t sfn_subframe = 0;
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_subcarriers = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t start_symbol = 0;
+    std::uint8_t reg_count = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t mod_order = 0;
+    float sigma2 = 0.0F;
+    PcfichChainMetadata chain{};
 };
 
 struct PdcchMmseResult {

@@ -14,6 +14,11 @@ inline constexpr std::uint32_t kLteNumCrsSymbols = 4;
 inline constexpr std::uint32_t kLteNumPilotTonesPerCrsSymbol = 200;
 inline constexpr std::uint32_t kLteNumCellIds = 504;
 inline constexpr std::uint32_t kLteMaxControlSymbolsNormalCp = 3;
+inline constexpr std::uint32_t kLtePbchNumPrb = 6;
+inline constexpr std::uint32_t kLtePbchStartPrb = (kLteNumPrb20MHz - kLtePbchNumPrb) / 2U;
+inline constexpr std::uint32_t kLtePbchStartSymbolNormalCp = 7;
+inline constexpr std::uint32_t kLtePbchNumSymbols = 4;
+inline constexpr std::uint32_t kLtePcfichNumRegs = 4;
 
 inline constexpr float kDefaultDetFloor = 1.0e-6F;
 inline constexpr float kDefaultSigma2Min = 1.0e-4F;

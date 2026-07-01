@@ -1,6 +1,6 @@
 # PDCCH Chain SDK Documentation
 
-This page is the stable documentation entrypoint for the LTE PDCCH CE/MMSE SDK.
+This page is the PDCCH-specific subpage under the broader LTE equalized-channel SDK.
 
 Primary include:
 
@@ -11,6 +11,10 @@ Primary include:
 Current interface version:
 
 - `PDCCH Chain SDK v1`
+
+Parent page:
+
+- [LTE Equalized Channel SDK Documentation](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
 
 Documentation set:
 
