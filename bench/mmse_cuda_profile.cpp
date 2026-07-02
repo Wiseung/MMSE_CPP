@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -446,6 +447,26 @@ std::string bytes_to_mib_string(std::size_t bytes) {
     return oss.str();
 }
 
+std::string current_profile_date() {
+    const std::time_t now = std::time(nullptr);
+    std::tm local_tm{};
+#if defined(_WIN32)
+    if (localtime_s(&local_tm, &now) != 0) {
+        return "unknown";
+    }
+#else
+    if (localtime_r(&now, &local_tm) == nullptr) {
+        return "unknown";
+    }
+#endif
+
+    char buffer[11] = {};
+    if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &local_tm) == 0U) {
+        return "unknown";
+    }
+    return buffer;
+}
+
 void print_process_memory(const char* label, const ProcessMemorySample& sample) {
     std::cout << label << ".working_set_bytes=" << sample.working_set_bytes << '\n';
     std::cout << label << ".private_bytes=" << sample.private_bytes << '\n';
@@ -523,6 +544,7 @@ int main(int argc, char** argv) {
     return 1;
 #else
     const Options options = parse_options(argc, argv);
+    const std::string profile_date = current_profile_date();
     if (!detail::cuda_backend_compiled()) {
         std::cerr << "CUDA backend is not compiled\n";
         return 1;
@@ -642,7 +664,7 @@ int main(int argc, char** argv) {
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "[profile]\n";
-    std::cout << "profile.date=2026-06-24\n";
+    std::cout << "profile.date=" << profile_date << '\n';
     std::cout << "profile.mode=gpu_cuda_release_sanity\n";
     std::cout << "profile.init_ms=" << init_ms << '\n';
     std::cout << "profile.warmup_subframes=" << options.warmup_subframes << '\n';
