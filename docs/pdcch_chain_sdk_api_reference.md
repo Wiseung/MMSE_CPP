@@ -1,41 +1,41 @@
-# PDCCH Chain SDK API Reference
+# PDCCH Chain SDK API 参考
 
-This page is the field-level and call-level reference for the LTE PDCCH CE/MMSE SDK.
+本页是 LTE PDCCH CE/MMSE SDK 的字段级与调用级参考文档。
 
-Primary include:
+主要包含头文件：
 
 ```cpp
 #include "mmse/pdcch_chain_sdk.h"
 ```
 
-Interface version:
+接口版本：
 
 - `PDCCH Chain SDK v1`
 
-Related pages:
+相关页面：
 
-- [LTE Equalized Channel SDK Documentation](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
-- [Documentation Index](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)
-- [Quick Start](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
-- [Versioning Policy](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
+- [LTE Equalized Channel SDK 文档](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
+- [文档首页](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)
+- [快速开始](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
+- [版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
 
-## Table of Contents
+## 目录
 
-- [API Summary](#api-summary)
-- [Field Index](#field-index)
-- [Status Code Index](#status-code-index)
-- [1. Public entrypoints](#1-public-entrypoints)
-- [2. DTO definitions](#2-dto-definitions)
-- [3. Base grid type](#3-base-grid-type)
-- [4. Helper semantics](#4-helper-semantics)
-- [5. Boundary conditions](#5-boundary-conditions)
-- [6. Capacity requirements](#6-capacity-requirements)
-- [7. Error codes](#7-error-codes)
-- [8. Recommended call flow](#8-recommended-call-flow)
+- [API 摘要](#api-摘要)
+- [字段索引](#字段索引)
+- [状态码索引](#状态码索引)
+- [1. 公开入口](#1-公开入口)
+- [2. DTO 定义](#2-dto-定义)
+- [3. 基础网格类型](#3-基础网格类型)
+- [4. Helper 语义](#4-helper-语义)
+- [5. 边界条件](#5-边界条件)
+- [6. 容量要求](#6-容量要求)
+- [7. 错误码](#7-错误码)
+- [8. 推荐调用流程](#8-推荐调用流程)
 
-## API Summary
+## API 摘要
 
-Primary runtime calls:
+主要运行时调用：
 
 - `MmseEqualizerCpuContext::init`
 - `MmseEqualizerCpuContext::run_pdcch`
@@ -44,27 +44,27 @@ Primary runtime calls:
 - `MmseEqualizerGpuContext::run_pdcch`
 - `MmseEqualizerGpuContext::run_pdcch_td`
 
-Primary DTO flow:
+主要 DTO 流程：
 
-1. upstream builds `mmse::pdcch::FrontendPdcchIndication`
-2. helper converts it into `mmse::PdcchMmseInput`
-3. CE/MMSE stage fills `mmse::PdcchMmseOutputView` and `mmse::PdcchMmseResult`
-4. helper packs them into `mmse::pdcch::BackendPdcchEqualizedIndication`
+1. 上游构造 `mmse::pdcch::FrontendPdcchIndication`
+2. helper 把它转换成 `mmse::PdcchMmseInput`
+3. CE/MMSE 阶段填充 `mmse::PdcchMmseOutputView` 和 `mmse::PdcchMmseResult`
+4. helper 把它们打包成 `mmse::pdcch::BackendPdcchEqualizedIndication`
 
-Additive `2 Tx port` TD flow:
+新增 `2 Tx port` TD 流程：
 
-1. upstream builds `mmse::pdcch::FrontendPdcchIndication`
-2. helper converts it into `mmse::PdcchMmseInput`
-3. TD CE/MMSE stage fills `mmse::PdcchTdMmseOutputView` and `mmse::PdcchTdMmseResult`
-4. helper packs them into `mmse::pdcch::BackendPdcchTdEqualizedIndication`
+1. 上游构造 `mmse::pdcch::FrontendPdcchIndication`
+2. helper 把它转换成 `mmse::PdcchMmseInput`
+3. TD CE/MMSE 阶段填充 `mmse::PdcchTdMmseOutputView` 和 `mmse::PdcchTdMmseResult`
+4. helper 把它们打包成 `mmse::pdcch::BackendPdcchTdEqualizedIndication`
 
-## Field Index
+## 字段索引
 
-This index is intended for fast lookup of field ownership and semantics.
+这个索引用于快速定位字段归属和语义。
 
-### Frontend DTO Fields
+### 前端 DTO 字段
 
-| Field                  | Owner type                | See section                                 |
+| 字段                   | 所属类型                  | 对应章节                                    |
 | ---------------------- | ------------------------- | ------------------------------------------- |
 | `sfn_subframe`         | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
 | `cell_id`              | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
@@ -77,26 +77,26 @@ This index is intended for fast lookup of field ownership and semantics.
 | `reserved_control_res` | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
 | `chain`                | `FrontendPdcchIndication` | [2.3](#23-mmsepdcchfrontendpdcchindication) |
 
-### Reserved RE Fields
+### 保留 RE 字段
 
-| Field         | Owner type          | See section                           |
+| 字段          | 所属类型            | 对应章节                              |
 | ------------- | ------------------- | ------------------------------------- |
 | `symbol`      | `ReservedControlRe` | [2.1](#21-mmsepdcchreservedcontrolre) |
 | `prb`         | `ReservedControlRe` | [2.1](#21-mmsepdcchreservedcontrolre) |
 | `tone_in_prb` | `ReservedControlRe` | [2.1](#21-mmsepdcchreservedcontrolre) |
 
-### Chain Metadata Fields
+### 链路元数据字段
 
-| Field               | Owner type           | See section                       |
+| 字段                | 所属类型             | 对应章节                          |
 | ------------------- | -------------------- | --------------------------------- |
 | `request_id`        | `PdcchChainMetadata` | [2.2](#22-mmsepdcchchainmetadata) |
 | `candidate_id`      | `PdcchChainMetadata` | [2.2](#22-mmsepdcchchainmetadata) |
 | `first_cce`         | `PdcchChainMetadata` | [2.2](#22-mmsepdcchchainmetadata) |
 | `aggregation_level` | `PdcchChainMetadata` | [2.2](#22-mmsepdcchchainmetadata) |
 
-### Low-level Input Fields
+### 低层输入字段
 
-| Field                        | Owner type       | See section                   |
+| 字段                         | 所属类型         | 对应章节                      |
 | ---------------------------- | ---------------- | ----------------------------- |
 | `grid`                       | `PdcchMmseInput` | [2.4](#24-mmsepdcchmmseinput) |
 | `sfn_subframe`               | `PdcchMmseInput` | [2.4](#24-mmsepdcchmmseinput) |
@@ -109,9 +109,9 @@ This index is intended for fast lookup of field ownership and semantics.
 | `control_re_exclusion_masks` | `PdcchMmseInput` | [2.4](#24-mmsepdcchmmseinput) |
 | `chain`                      | `PdcchMmseInput` | [2.4](#24-mmsepdcchmmseinput) |
 
-### Output View Fields
+### 输出 View 字段
 
-| Field                   | Owner type            | See section                        |
+| 字段                    | 所属类型              | 对应章节                           |
 | ----------------------- | --------------------- | ---------------------------------- |
 | `x_hat_re`              | `PdcchMmseOutputView` | [2.5](#25-mmsepdcchmmseoutputview) |
 | `x_hat_im`              | `PdcchMmseOutputView` | [2.5](#25-mmsepdcchmmseoutputview) |
@@ -120,9 +120,9 @@ This index is intended for fast lookup of field ownership and semantics.
 | `capacity_re_per_layer` | `PdcchMmseOutputView` | [2.5](#25-mmsepdcchmmseoutputview) |
 | `capacity_re_metadata`  | `PdcchMmseOutputView` | [2.5](#25-mmsepdcchmmseoutputview) |
 
-### Result Metadata Fields
+### 结果元数据字段
 
-| Field                  | Owner type        | See section                    |
+| 字段                   | 所属类型          | 对应章节                       |
 | ---------------------- | ----------------- | ------------------------------ |
 | `n_re`                 | `PdcchMmseResult` | [2.6](#26-mmsepdcchmmseresult) |
 | `sfn_subframe`         | `PdcchMmseResult` | [2.6](#26-mmsepdcchmmseresult) |
@@ -140,9 +140,9 @@ This index is intended for fast lookup of field ownership and semantics.
 | `prb_bitmap`           | `PdcchMmseResult` | [2.6](#26-mmsepdcchmmseresult) |
 | `chain`                | `PdcchMmseResult` | [2.6](#26-mmsepdcchmmseresult) |
 
-### Backend DTO Fields
+### 后端 DTO 字段
 
-| Field                  | Owner type                        | See section                                         |
+| 字段                   | 所属类型                          | 对应章节                                            |
 | ---------------------- | --------------------------------- | --------------------------------------------------- |
 | `sfn_subframe`         | `BackendPdcchEqualizedIndication` | [2.7](#27-mmsepdcchbackendpdcchequalizedindication) |
 | `cell_id`              | `BackendPdcchEqualizedIndication` | [2.7](#27-mmsepdcchbackendpdcchequalizedindication) |
@@ -160,9 +160,9 @@ This index is intended for fast lookup of field ownership and semantics.
 | `sinr`                 | `BackendPdcchEqualizedIndication` | [2.7](#27-mmsepdcchbackendpdcchequalizedindication) |
 | `re_grid_indices`      | `BackendPdcchEqualizedIndication` | [2.7](#27-mmsepdcchbackendpdcchequalizedindication) |
 
-### Grid Fields
+### 网格字段
 
-| Field           | Owner type          | See section            |
+| 字段            | 所属类型            | 对应章节               |
 | --------------- | ------------------- | ---------------------- |
 | `re`            | `PlanarGridViewF32` | [3](#3-base-grid-type) |
 | `im`            | `PlanarGridViewF32` | [3](#3-base-grid-type) |
@@ -170,20 +170,20 @@ This index is intended for fast lookup of field ownership and semantics.
 | `n_symbols`     | `PlanarGridViewF32` | [3](#3-base-grid-type) |
 | `n_subcarriers` | `PlanarGridViewF32` | [3](#3-base-grid-type) |
 
-## Status Code Index
+## 状态码索引
 
-| Status code                      | Summary                                               | Detailed section    |
-| -------------------------------- | ----------------------------------------------------- | ------------------- |
-| `MmseStatus::kOk`                | call succeeded                                        | [7](#7-error-codes) |
-| `MmseStatus::kNotInitialized`    | context was not initialized before use                | [7](#7-error-codes) |
-| `MmseStatus::kInvalidArgument`   | caller-provided pointer/config/input argument invalid | [7](#7-error-codes) |
-| `MmseStatus::kUnsupportedConfig` | request outside current LTE PDCCH support boundary    | [7](#7-error-codes) |
-| `MmseStatus::kBufferTooSmall`    | caller output capacity insufficient                   | [7](#7-error-codes) |
-| `MmseStatus::kInternalError`     | runtime/internal transport or validation failure      | [7](#7-error-codes) |
+| 状态码                           | 摘要                                 | 详细章节            |
+| -------------------------------- | ------------------------------------ | ------------------- |
+| `MmseStatus::kOk`                | 调用成功                             | [7](#7-error-codes) |
+| `MmseStatus::kNotInitialized`    | 使用前未初始化 context               | [7](#7-error-codes) |
+| `MmseStatus::kInvalidArgument`   | 调用方提供的指针、配置或输入参数非法 | [7](#7-error-codes) |
+| `MmseStatus::kUnsupportedConfig` | 请求超出当前 LTE PDCCH 支持边界      | [7](#7-error-codes) |
+| `MmseStatus::kBufferTooSmall`    | 调用方输出容量不足                   | [7](#7-error-codes) |
+| `MmseStatus::kInternalError`     | 运行时 / 内部传输或校验失败          | [7](#7-error-codes) |
 
-## 1. Public entrypoints
+## 1. 公开入口
 
-CPU:
+CPU：
 
 ```cpp
 mmse::MmseEqualizerCpuContext::init(const MmseEqualizerCpuConfig& config)
@@ -197,7 +197,7 @@ mmse::MmseEqualizerCpuContext::run_pdcch_td(
     PdcchTdMmseResult& meta)
 ```
 
-GPU:
+GPU：
 
 ```cpp
 mmse::MmseEqualizerGpuContext::init(const MmseEqualizerGpuConfig& config)
@@ -211,7 +211,7 @@ mmse::MmseEqualizerGpuContext::run_pdcch_td(
     PdcchTdMmseResult& meta)
 ```
 
-DTO / helper utilities:
+DTO / helper 工具：
 
 ```cpp
 mmse::pdcch::make_pdcch_mmse_input(...)
@@ -223,28 +223,28 @@ mmse::pdcch::append_phich_reserved_control_re_list(...)
 mmse::pdcch::append_fdd_phich_reserved_control_re_list(...)
 ```
 
-## 2. DTO definitions
+## 2. DTO 定义
 
 ### 2.1 `mmse::pdcch::ReservedControlRe`
 
-One control-region RE that upstream has identified as reserved by a non-PDCCH channel.
+表示一个由上游识别为非 PDCCH 信道占用的控制区 RE。
 
-| Field         | Type       | Meaning                               | Unit         | Valid range                                            |
-| ------------- | ---------- | ------------------------------------- | ------------ | ------------------------------------------------------ |
-| `symbol`      | `uint32_t` | OFDM symbol index inside the subframe | symbol index | `0..13`, practical SDK use `0..control_symbol_count-1` |
-| `prb`         | `uint32_t` | PRB index                             | PRB index    | `0..99`                                                |
-| `tone_in_prb` | `uint32_t` | tone index inside one PRB             | tone index   | `0..11`                                                |
+| 字段          | 类型       | 含义                    | 单位         | 合法范围                                          |
+| ------------- | ---------- | ----------------------- | ------------ | ------------------------------------------------- |
+| `symbol`      | `uint32_t` | 子帧内 OFDM symbol 索引 | symbol index | `0..13`，实际通常使用 `0..control_symbol_count-1` |
+| `prb`         | `uint32_t` | PRB 索引                | PRB index    | `0..99`                                           |
+| `tone_in_prb` | `uint32_t` | 一个 PRB 内的 tone 索引 | tone index   | `0..11`                                           |
 
-Notes:
+说明：
 
-- CRS REs should not be listed here. The SDK excludes CRS internally.
-- Typical use is to mark `PCFICH` and `PHICH` occupied REs.
+- 不应在这里列出 CRS RE，SDK 会在内部自动排除 CRS
+- 典型用途是标记 `PCFICH` 与 `PHICH` 占用的 RE
 
 ### 2.1a `mmse::pdcch::PhichResource`
 
-Helper enum used by automatic FDD PHICH reservation generation.
+用于自动生成 FDD PHICH 保留信息的 helper 枚举。
 
-| Value       | Meaning        |
+| 枚举值      | 含义           |
 | ----------- | -------------- |
 | `kOneSixth` | LTE `Ng = 1/6` |
 | `kHalf`     | LTE `Ng = 1/2` |
@@ -253,202 +253,202 @@ Helper enum used by automatic FDD PHICH reservation generation.
 
 ### 2.1b `mmse::pdcch::PhichDuplexMode`
 
-Helper enum used by automatic PHICH reservation generation.
+用于自动生成 PHICH 保留信息的 helper 枚举。
 
-| Value  | Meaning |
+| 枚举值 | 含义    |
 | ------ | ------- |
 | `kFdd` | LTE FDD |
 | `kTdd` | LTE TDD |
 
 ### 2.1c `mmse::pdcch::PhichDuration`
 
-Helper enum used by automatic PHICH reservation generation.
+用于自动生成 PHICH 保留信息的 helper 枚举。
 
-| Value       | Meaning               |
-| ----------- | --------------------- |
-| `kNormal`   | normal PHICH duration |
-| `kExtended` | extended duration     |
+| 枚举值      | 含义                |
+| ----------- | ------------------- |
+| `kNormal`   | 普通 PHICH 持续长度 |
+| `kExtended` | 扩展 PHICH 持续长度 |
 
 ### 2.1d `mmse::pdcch::PhichSubframeKind`
 
-Structured subframe-kind enum for PHICH helper inputs.
+用于 PHICH helper 输入的结构化子帧类型枚举。
 
-| Value      | Meaning          |
-| ---------- | ---------------- |
-| `kRegular` | regular subframe |
-| `kMbsfn`   | MBSFN subframe   |
+| 枚举值     | 含义       |
+| ---------- | ---------- |
+| `kRegular` | 普通子帧   |
+| `kMbsfn`   | MBSFN 子帧 |
 
 ### 2.1e `mmse::pdcch::LteControlSubframeContext`
 
-Structured LTE control-subframe context shared by `PCFICH/PHICH` helpers.
+`PCFICH/PHICH` helper 共享的 LTE 控制子帧上下文。
 
-| Field          | Type                | Meaning              |
-| -------------- | ------------------- | -------------------- |
-| `duplex_mode`  | `PhichDuplexMode`   | LTE duplex mode      |
-| `subframe`     | `uint8_t`           | subframe index       |
-| `ul_dl_config` | `uint8_t`           | LTE TDD UL-DL config |
-| `kind`         | `PhichSubframeKind` | regular vs MBSFN     |
+| 字段           | 类型                | 含义                  |
+| -------------- | ------------------- | --------------------- |
+| `duplex_mode`  | `PhichDuplexMode`   | LTE 双工模式          |
+| `subframe`     | `uint8_t`           | 子帧索引              |
+| `ul_dl_config` | `uint8_t`           | LTE TDD 上下行配置    |
+| `kind`         | `PhichSubframeKind` | 普通 / MBSFN 子帧类型 |
 
 ### 2.1f `mmse::pdcch::PhichReservationConfig`
 
-Helper config object for automatic PHICH reservation generation.
+用于自动生成 PHICH 保留信息的 helper 配置对象。
 
-| Field          | Type                        | Meaning            |
+| 字段           | 类型                        | 含义               |
 | -------------- | --------------------------- | ------------------ |
 | `resource`     | `PhichResource`             | LTE `Ng`           |
 | `duration`     | `PhichDuration`             | LTE PHICH duration |
 | `mi`           | `uint8_t`                   | LTE PHICH `M_i`    |
-| `subframe_ctx` | `LteControlSubframeContext` | subframe context   |
+| `subframe_ctx` | `LteControlSubframeContext` | 子帧上下文         |
 
 ### 2.2 `mmse::PdcchChainMetadata`
 
-Opaque chain metadata carried through the CE/MMSE stage and returned to downstream.
+贯穿 CE/MMSE 阶段并返回给下游的透明链路元数据。
 
-| Field               | Type       | Meaning                           | Unit      | Valid range    |
-| ------------------- | ---------- | --------------------------------- | --------- | -------------- |
-| `request_id`        | `uint64_t` | caller-defined correlation id     | none      | any            |
-| `candidate_id`      | `uint32_t` | caller-defined PDCCH candidate id | none      | any            |
-| `first_cce`         | `uint16_t` | caller-defined first CCE index    | CCE index | caller-defined |
-| `aggregation_level` | `uint8_t`  | caller-defined aggregation level  | CCE count | caller-defined |
+| 字段                | 类型       | 含义                       | 单位      | 合法范围     |
+| ------------------- | ---------- | -------------------------- | --------- | ------------ |
+| `request_id`        | `uint64_t` | 调用方自定义关联 ID        | none      | 任意         |
+| `candidate_id`      | `uint32_t` | 调用方自定义 PDCCH 候选 ID | none      | 任意         |
+| `first_cce`         | `uint16_t` | 调用方自定义首个 CCE 索引  | CCE index | 调用方自定义 |
+| `aggregation_level` | `uint8_t`  | 调用方自定义聚合级别       | CCE count | 调用方自定义 |
 
-Notes:
+说明：
 
-- The CE/MMSE module does not interpret these fields.
-- They are preserved for downstream logic.
+- CE/MMSE 模块本身不解释这些字段
+- 它们会完整保留给下游逻辑使用
 
 ### 2.3 `mmse::pdcch::FrontendPdcchIndication`
 
-Formal upstream DTO used to describe one PDCCH equalization request.
+正式的上游 DTO，用于描述一次 PDCCH 均衡请求。
 
-| Field                  | Type                        | Meaning                                  | Unit               | Valid range                     |
-| ---------------------- | --------------------------- | ---------------------------------------- | ------------------ | ------------------------------- |
-| `sfn_subframe`         | `uint32_t`                  | radio time index                         | SFN\*10 + subframe | caller-defined non-negative     |
-| `cell_id`              | `uint16_t`                  | LTE physical cell ID                     | none               | `0..503`                        |
-| `n_tx_ports`           | `uint8_t`                   | transmit CRS port count for this request | ports              | current SDK support: `1`        |
-| `tx_mode`              | `uint8_t`                   | LTE transmission mode tag                | none               | current SDK support: `1` or `2` |
-| `control_symbol_count` | `uint8_t`                   | LTE control-region size                  | OFDM symbols       | `1..3`                          |
-| `n_prb`                | `uint16_t`                  | PRB count enabled in bitmap              | PRBs               | `1..100`                        |
-| `prb_bitmap`           | `array<uint16_t,7>`         | active PRBs                              | bitmap             | exactly `n_prb` bits set        |
-| `control_subframe`     | `LteControlSubframeContext` | shared LTE control-subframe context      | context            | helper-defined                  |
-| `reserved_control_res` | `vector<ReservedControlRe>` | non-PDCCH control REs                    | RE list            | zero or more                    |
-| `chain`                | `PdcchChainMetadata`        | passthrough metadata                     | none               | any                             |
+| 字段                   | 类型                        | 含义                      | 单位               | 合法范围                       |
+| ---------------------- | --------------------------- | ------------------------- | ------------------ | ------------------------------ |
+| `sfn_subframe`         | `uint32_t`                  | 无线时间索引              | SFN\*10 + subframe | 调用方给定的非负值             |
+| `cell_id`              | `uint16_t`                  | LTE 物理小区 ID           | none               | `0..503`                       |
+| `n_tx_ports`           | `uint8_t`                   | 本次请求的 CRS 发射端口数 | ports              | 当前 SDK 支持 `1`              |
+| `tx_mode`              | `uint8_t`                   | LTE 发射模式标签          | none               | 当前 SDK 支持 `1` 或 `2`       |
+| `control_symbol_count` | `uint8_t`                   | LTE 控制区大小            | OFDM symbols       | `1..3`                         |
+| `n_prb`                | `uint16_t`                  | 位图中启用的 PRB 数       | PRBs               | `1..100`                       |
+| `prb_bitmap`           | `array<uint16_t,7>`         | 激活 PRB 位图             | bitmap             | 必须恰好有 `n_prb` 个 bit 置位 |
+| `control_subframe`     | `LteControlSubframeContext` | 共享 LTE 控制子帧上下文   | context            | helper 定义范围                |
+| `reserved_control_res` | `vector<ReservedControlRe>` | 非 PDCCH 控制 RE 列表     | RE list            | 零个或多个                     |
+| `chain`                | `PdcchChainMetadata`        | 透传元数据                | none               | 任意                           |
 
 ### 2.4 `mmse::PdcchMmseInput`
 
-Low-level module input after helper conversion.
+helper 转换后的低层模块输入。
 
-| Field                        | Type                        | Meaning                             | Unit               | Valid range                     |
-| ---------------------------- | --------------------------- | ----------------------------------- | ------------------ | ------------------------------- |
-| `grid`                       | `PlanarGridViewF32`         | FFT grid input                      | complex float32    | see `PlanarGridViewF32`         |
-| `sfn_subframe`               | `uint32_t`                  | radio time index                    | SFN\*10 + subframe | non-negative                    |
-| `cell_id`                    | `uint16_t`                  | LTE physical cell ID                | none               | `0..503`                        |
-| `n_tx_ports`                 | `uint8_t`                   | transmit port count                 | ports              | current SDK support: `1`        |
-| `tx_mode`                    | `uint8_t`                   | transmission mode tag               | none               | current SDK support: `1` or `2` |
-| `control_symbol_count`       | `uint8_t`                   | LTE control region size             | OFDM symbols       | `1..3`                          |
-| `n_prb`                      | `uint16_t`                  | active PRB count                    | PRBs               | `1..100`                        |
-| `prb_bitmap`                 | `array<uint16_t,7>`         | active PRBs                         | bitmap             | exactly `n_prb` bits set        |
-| `control_subframe`           | `LteControlSubframeContext` | shared LTE control-subframe context | context            | helper-defined                  |
-| `control_re_exclusion_masks` | `array<uint16_t,300>`       | per-symbol/per-PRB RE mask          | bitmask            | 12 bits used per entry          |
-| `chain`                      | `PdcchChainMetadata`        | passthrough metadata                | none               | any                             |
+| 字段                         | 类型                        | 含义                       | 单位               | 合法范围                       |
+| ---------------------------- | --------------------------- | -------------------------- | ------------------ | ------------------------------ |
+| `grid`                       | `PlanarGridViewF32`         | FFT 网格输入               | complex float32    | 见 `PlanarGridViewF32`         |
+| `sfn_subframe`               | `uint32_t`                  | 无线时间索引               | SFN\*10 + subframe | 非负                           |
+| `cell_id`                    | `uint16_t`                  | LTE 物理小区 ID            | none               | `0..503`                       |
+| `n_tx_ports`                 | `uint8_t`                   | 发射端口数                 | ports              | 当前 SDK 支持 `1`              |
+| `tx_mode`                    | `uint8_t`                   | 发射模式标签               | none               | 当前 SDK 支持 `1` 或 `2`       |
+| `control_symbol_count`       | `uint8_t`                   | LTE 控制区大小             | OFDM symbols       | `1..3`                         |
+| `n_prb`                      | `uint16_t`                  | 激活 PRB 数                | PRBs               | `1..100`                       |
+| `prb_bitmap`                 | `array<uint16_t,7>`         | 激活 PRB 位图              | bitmap             | 必须恰好有 `n_prb` 个 bit 置位 |
+| `control_subframe`           | `LteControlSubframeContext` | 共享 LTE 控制子帧上下文    | context            | helper 定义范围                |
+| `control_re_exclusion_masks` | `array<uint16_t,300>`       | 按 symbol / PRB 的 RE mask | bitmask            | 每项只使用 12 bit              |
+| `chain`                      | `PdcchChainMetadata`        | 透传元数据                 | none               | 任意                           |
 
-Mask mapping:
+Mask 映射：
 
 - index = `symbol * 100 + prb`
-- bit `0..11` corresponds to `tone_in_prb`
+- bit `0..11` 对应 `tone_in_prb`
 
 ### 2.5 `mmse::PdcchMmseOutputView`
 
-Caller-owned write target for one `run_pdcch` invocation.
+`run_pdcch` 的调用方持有写入目标。
 
-| Field                   | Type        | Meaning                                        | Unit         | Required |
-| ----------------------- | ----------- | ---------------------------------------------- | ------------ | -------- |
-| `x_hat_re`              | `float*`    | equalized symbol real part                     | float32      | yes      |
-| `x_hat_im`              | `float*`    | equalized symbol imag part                     | float32      | yes      |
-| `sinr`                  | `float*`    | post-equalization SINR                         | linear ratio | yes      |
-| `re_grid_indices`       | `uint16_t*` | source RE locations in LTE grid                | grid index   | yes      |
-| `capacity_re_per_layer` | `uint32_t`  | writable capacity for `x_hat_re/x_hat_im/sinr` | RE count     | yes      |
-| `capacity_re_metadata`  | `uint32_t`  | writable capacity for `re_grid_indices`        | RE count     | yes      |
+| 字段                    | 类型        | 含义                              | 单位         | 必需 |
+| ----------------------- | ----------- | --------------------------------- | ------------ | ---- |
+| `x_hat_re`              | `float*`    | 均衡后符号实部                    | float32      | 是   |
+| `x_hat_im`              | `float*`    | 均衡后符号虚部                    | float32      | 是   |
+| `sinr`                  | `float*`    | 均衡后 SINR                       | linear ratio | 是   |
+| `re_grid_indices`       | `uint16_t*` | LTE 网格中的源 RE 位置            | grid index   | 是   |
+| `capacity_re_per_layer` | `uint32_t`  | `x_hat_re/x_hat_im/sinr` 可写容量 | RE count     | 是   |
+| `capacity_re_metadata`  | `uint32_t`  | `re_grid_indices` 可写容量        | RE count     | 是   |
 
 ### 2.6 `mmse::PdcchMmseResult`
 
-Per-call metadata returned by `run_pdcch`.
+`run_pdcch` 返回的逐调用元数据。
 
-| Field                  | Type                 | Meaning                         | Unit               |
-| ---------------------- | -------------------- | ------------------------------- | ------------------ |
-| `n_re`                 | `uint32_t`           | number of equalized PDCCH REs   | RE count           |
-| `sfn_subframe`         | `uint32_t`           | radio time index                | SFN\*10 + subframe |
-| `n_symbols`            | `uint32_t`           | grid symbol dimension           | symbols            |
-| `n_subcarriers`        | `uint32_t`           | grid subcarrier dimension       | subcarriers        |
-| `cell_id`              | `uint16_t`           | LTE cell id                     | none               |
-| `n_prb`                | `uint16_t`           | active PRB count                | PRBs               |
-| `n_tx_ports`           | `uint8_t`            | transmit port count             | ports              |
-| `n_rx_ant`             | `uint8_t`            | receive antenna count           | antennas           |
-| `n_layers`             | `uint8_t`            | output layer count              | layers             |
-| `tx_mode`              | `uint8_t`            | transmission mode               | none               |
-| `control_symbol_count` | `uint8_t`            | LTE control-region size         | OFDM symbols       |
-| `mod_order`            | `uint8_t`            | modulation order in bits/symbol | bits/symbol        |
-| `sigma2`               | `float`              | runtime noise variance estimate | linear power       |
-| `prb_bitmap`           | `array<uint16_t,7>`  | active PRBs                     | bitmap             |
-| `chain`                | `PdcchChainMetadata` | passthrough metadata            | none               |
+| 字段                   | 类型                 | 含义                       | 单位               |
+| ---------------------- | -------------------- | -------------------------- | ------------------ |
+| `n_re`                 | `uint32_t`           | 均衡后的 PDCCH RE 数       | RE count           |
+| `sfn_subframe`         | `uint32_t`           | 无线时间索引               | SFN\*10 + subframe |
+| `n_symbols`            | `uint32_t`           | 网格 symbol 维度           | symbols            |
+| `n_subcarriers`        | `uint32_t`           | 网格子载波维度             | subcarriers        |
+| `cell_id`              | `uint16_t`           | LTE 小区 ID                | none               |
+| `n_prb`                | `uint16_t`           | 激活 PRB 数                | PRBs               |
+| `n_tx_ports`           | `uint8_t`            | 发射端口数                 | ports              |
+| `n_rx_ant`             | `uint8_t`            | 接收天线数                 | antennas           |
+| `n_layers`             | `uint8_t`            | 输出层数                   | layers             |
+| `tx_mode`              | `uint8_t`            | 发射模式                   | none               |
+| `control_symbol_count` | `uint8_t`            | LTE 控制区大小             | OFDM symbols       |
+| `mod_order`            | `uint8_t`            | 调制阶数，单位 bits/symbol | bits/symbol        |
+| `sigma2`               | `float`              | 运行时噪声方差估计         | linear power       |
+| `prb_bitmap`           | `array<uint16_t,7>`  | 激活 PRB 位图              | bitmap             |
+| `chain`                | `PdcchChainMetadata` | 透传元数据                 | none               |
 
 ### 2.7 `mmse::pdcch::BackendPdcchEqualizedIndication`
 
-Formal downstream owning DTO produced by helper packing.
+helper 打包得到的正式下游 owning DTO。
 
-| Field                  | Type                 | Meaning                         | Unit               |
-| ---------------------- | -------------------- | ------------------------------- | ------------------ |
-| `sfn_subframe`         | `uint32_t`           | radio time index                | SFN\*10 + subframe |
-| `cell_id`              | `uint16_t`           | LTE cell id                     | none               |
-| `n_prb`                | `uint16_t`           | active PRB count                | PRBs               |
-| `n_tx_ports`           | `uint8_t`            | transmit port count             | ports              |
-| `n_rx_ant`             | `uint8_t`            | receive antenna count           | antennas           |
-| `n_layers`             | `uint8_t`            | output layer count              | layers             |
-| `tx_mode`              | `uint8_t`            | transmission mode               | none               |
-| `control_symbol_count` | `uint8_t`            | LTE control-region size         | OFDM symbols       |
-| `mod_order`            | `uint8_t`            | modulation order                | bits/symbol        |
-| `sigma2`               | `float`              | runtime noise variance estimate | linear power       |
-| `chain`                | `PdcchChainMetadata` | passthrough metadata            | none               |
-| `x_hat_re`             | `vector<float>`      | equalized real part             | float32            |
-| `x_hat_im`             | `vector<float>`      | equalized imag part             | float32            |
-| `sinr`                 | `vector<float>`      | per-RE SINR                     | linear ratio       |
-| `re_grid_indices`      | `vector<uint16_t>`   | LTE grid source indices         | grid index         |
+| 字段                   | 类型                 | 含义               | 单位               |
+| ---------------------- | -------------------- | ------------------ | ------------------ |
+| `sfn_subframe`         | `uint32_t`           | 无线时间索引       | SFN\*10 + subframe |
+| `cell_id`              | `uint16_t`           | LTE 小区 ID        | none               |
+| `n_prb`                | `uint16_t`           | 激活 PRB 数        | PRBs               |
+| `n_tx_ports`           | `uint8_t`            | 发射端口数         | ports              |
+| `n_rx_ant`             | `uint8_t`            | 接收天线数         | antennas           |
+| `n_layers`             | `uint8_t`            | 输出层数           | layers             |
+| `tx_mode`              | `uint8_t`            | 发射模式           | none               |
+| `control_symbol_count` | `uint8_t`            | LTE 控制区大小     | OFDM symbols       |
+| `mod_order`            | `uint8_t`            | 调制阶数           | bits/symbol        |
+| `sigma2`               | `float`              | 运行时噪声方差估计 | linear power       |
+| `chain`                | `PdcchChainMetadata` | 透传元数据         | none               |
+| `x_hat_re`             | `vector<float>`      | 均衡后实部         | float32            |
+| `x_hat_im`             | `vector<float>`      | 均衡后虚部         | float32            |
+| `sinr`                 | `vector<float>`      | 按 RE 的 SINR      | linear ratio       |
+| `re_grid_indices`      | `vector<uint16_t>`   | LTE 网格源索引     | grid index         |
 
-Invariant:
+不变量：
 
 - `x_hat_re.size() == x_hat_im.size() == sinr.size() == re_grid_indices.size()`
 
-## 3. Base grid type
+## 3. 基础网格类型
 
 ### `mmse::PlanarGridViewF32`
 
-| Field           | Meaning                    | Unit           | Constraint                  |
-| --------------- | -------------------------- | -------------- | --------------------------- |
-| `re[0..1]`      | real planes per RX antenna | float32 arrays | non-null                    |
-| `im[0..1]`      | imag planes per RX antenna | float32 arrays | non-null                    |
-| `n_rx_ant`      | receive antenna count      | antennas       | current SDK requires `2`    |
-| `n_symbols`     | grid symbol count          | symbols        | current SDK requires `14`   |
-| `n_subcarriers` | grid width                 | subcarriers    | current SDK requires `1200` |
+| 字段            | 含义                   | 单位           | 约束                 |
+| --------------- | ---------------------- | -------------- | -------------------- |
+| `re[0..1]`      | 每个 RX 天线的实部平面 | float32 arrays | 非空                 |
+| `im[0..1]`      | 每个 RX 天线的虚部平面 | float32 arrays | 非空                 |
+| `n_rx_ant`      | 接收天线数             | antennas       | 当前 SDK 要求 `2`    |
+| `n_symbols`     | 网格 symbol 数         | symbols        | 当前 SDK 要求 `14`   |
+| `n_subcarriers` | 网格宽度               | subcarriers    | 当前 SDK 要求 `1200` |
 
-Memory layout:
+内存布局：
 
-- one plane is indexed as `symbol * 1200 + subcarrier`
-- all values are linear float32 complex planes
+- 一个平面的索引方式是 `symbol * 1200 + subcarrier`
+- 所有值都以线性 float32 复数平面存储
 
-## 4. Helper semantics
+## 4. Helper 语义
 
 ### `make_pdcch_mmse_input(grid, frontend)`
 
-Builds `PdcchMmseInput` from one grid and one frontend DTO.
+从一份网格和一份 frontend DTO 构建 `PdcchMmseInput`。
 
-Behavior:
+行为：
 
-- copies `FrontendPdcchIndication` fields
-- copies `control_subframe` into `PdcchMmseInput`
-- converts `reserved_control_res` into `control_re_exclusion_masks`
-- `run_pdcch` later calls the centralized `PdcchMmseInput` validator on the low-level request
-- does not validate LTE semantics by itself; validation happens in `run_pdcch`
+- 复制 `FrontendPdcchIndication` 字段
+- 把 `control_subframe` 复制到 `PdcchMmseInput`
+- 把 `reserved_control_res` 转换成 `control_re_exclusion_masks`
+- 后续 `run_pdcch` 会对这份低层请求调用集中式 `PdcchMmseInput` 校验器
+- 该 helper 本身不验证 LTE 语义；语义校验发生在 `run_pdcch`
 
-Validator family:
+校验器族：
 
 - `validate_lte_control_subframe_context(...)`
 - `validate_phich_reservation_config(...)`
@@ -456,181 +456,178 @@ Validator family:
 
 ### `append_pcfich_reserved_control_re_list(...)`
 
-Builds and appends the LTE PCFICH-occupied control REs into `reserved_control_res`.
+构建并追加 LTE PCFICH 占用的控制 RE 到 `reserved_control_res`。
 
-Behavior:
+行为：
 
-- accepts the shared `LteControlSubframeContext`
-- `FrontendPdcchIndication` overload defaults to `frontend.control_subframe`
-- targets the current 20 MHz normal-CP helper boundary
-- marks only non-CRS REs inside the four PCFICH REGs
-- preserves existing caller-provided entries
-- de-duplicates repeated REs
+- 接收共享的 `LteControlSubframeContext`
+- `FrontendPdcchIndication` 重载默认使用 `frontend.control_subframe`
+- 面向当前 20 MHz normal-CP helper 支持边界
+- 只标记四个 PCFICH REG 中非 CRS 的 RE
+- 保留调用方已提供的条目
+- 自动去重
 
 ### `append_phich_reserved_control_re_list(...)`
 
-Builds and appends PHICH-occupied control REs into `reserved_control_res` using an explicit
-`PhichReservationConfig`.
+使用显式 `PhichReservationConfig` 构建并追加 PHICH 占用的控制 RE 到 `reserved_control_res`。
 
-Behavior:
+行为：
 
-- returns `mmse::MmseStatus::kOk` when the helper supports the requested config
-- returns `mmse::MmseStatus::kInvalidArgument` for malformed helper inputs such as
-  `subframe > 9`, `ul_dl_config > 6`, or mismatched TDD `mi`
-- current validated helper support is `FDD/TDD + normal CP + normal/extended PHICH duration`
-- in TDD mode, `mi` must match the selected `subframe_ctx.ul_dl_config + subframe_ctx.subframe`
-- for extended duration, `TDD subframe 1/6` special-case is selected automatically
-- true `MBSFN` subframes are selected through `subframe_ctx.kind = kMbsfn`
-- `FrontendPdcchIndication` convenience overloads can read the same context from
-  `frontend.control_subframe`
-- preserves existing caller-provided entries
-- de-duplicates repeated REs
+- 当 helper 支持所请求配置时，返回 `mmse::MmseStatus::kOk`
+- 对于非法 helper 输入，例如 `subframe > 9`、`ul_dl_config > 6` 或 TDD `mi` 不匹配时，
+  返回 `mmse::MmseStatus::kInvalidArgument`
+- 当前已验证 helper 支持范围为 `FDD/TDD + normal CP + normal/extended PHICH duration`
+- 在 TDD 模式下，`mi` 必须与 `subframe_ctx.ul_dl_config + subframe_ctx.subframe` 匹配
+- 对 extended duration，`TDD subframe 1/6` 特例会自动选中
+- 真实 `MBSFN` 子帧通过 `subframe_ctx.kind = kMbsfn` 选择
+- `FrontendPdcchIndication` 的便捷重载可以从 `frontend.control_subframe` 读取同一份上下文
+- 保留调用方已提供的条目
+- 自动去重
 
 ### `append_fdd_phich_reserved_control_re_list(...)`
 
-Builds and appends LTE FDD normal-duration PHICH-occupied control REs into
-`reserved_control_res`.
+构建并追加 LTE FDD normal-duration PHICH 占用的控制 RE 到 `reserved_control_res`。
 
-Behavior:
+行为：
 
-- convenience wrapper over `append_phich_reserved_control_re_list(...)`
-- targets the current 20 MHz FDD normal-CP helper boundary
-- consumes `PhichResource` to derive the PHICH group count
-- marks only non-CRS REs inside the selected PHICH REGs
-- preserves existing caller-provided entries
-- de-duplicates repeated REs
+- 是 `append_phich_reserved_control_re_list(...)` 的便捷包装
+- 面向当前 20 MHz FDD normal-CP helper 支持边界
+- 消费 `PhichResource` 以推导 PHICH group 数
+- 只标记选定 PHICH REG 内非 CRS 的 RE
+- 保留调用方已提供的条目
+- 自动去重
 
 ### `make_backend_pdcch_equalized_indication(meta, out)`
 
-Builds one owning downstream DTO from:
+从下面两项构建一个 owning 的下游 DTO：
 
 - `PdcchMmseResult`
 - `PdcchMmseOutputView`
 
-Behavior:
+行为：
 
-- copies metadata
-- deep-copies `x_hat_re`, `x_hat_im`, `sinr`, `re_grid_indices`
-- output vector sizes are exactly `meta.n_re`
+- 复制元数据
+- 深拷贝 `x_hat_re`、`x_hat_im`、`sinr` 和 `re_grid_indices`
+- 输出向量大小严格等于 `meta.n_re`
 
 ### `decode_re_grid_index(grid_index)`
 
-Decodes one LTE grid index into:
+把一个 LTE 网格索引解码为：
 
 - `symbol`
 - `subcarrier`
 - `prb`
 - `tone_in_prb`
 
-Formula:
+公式：
 
 - `symbol = grid_index / 1200`
 - `subcarrier = grid_index % 1200`
 - `prb = subcarrier / 12`
 - `tone_in_prb = subcarrier % 12`
 
-## 5. Boundary conditions
+## 5. 边界条件
 
-Current SDK support boundary:
+当前 SDK 支持边界：
 
-- LTE only
-- 20 MHz only
-- normal CP only
+- 仅 LTE
+- 仅 20 MHz
+- 仅 normal CP
 - `n_rx_ant == 2`
 - `n_symbols == 14`
 - `n_subcarriers == 1200`
-- PDCCH only
+- 仅 PDCCH
 - `control_symbol_count in [1, 3]`
-- `mod_order == 2` for PDCCH
+- 对 PDCCH 而言 `mod_order == 2`
 - `n_layers == 1`
 - `n_tx_ports == 1`
 - `tx_mode == 1 or 2`
 
-Important non-support:
+重要的不支持项：
 
-- legacy `run_pdcch(...)` rejects `2 Tx port` LTE PDCCH because its frozen contract is per-RE
-- `2 Tx port` transmit-diversity is supported only through additive `run_pdcch_td(...)`
-- SDK does not decode `PCFICH` or `PHICH`
-- helper-based automatic PHICH reservation is limited to the documented FDD normal-CP boundary
+- 传统 `run_pdcch(...)` 会拒绝 `2 Tx port` LTE PDCCH，因为其冻结契约是 per-RE
+- `2 Tx port` 发射分集只通过新增的 `run_pdcch_td(...)` 支持
+- SDK 不负责解码 `PCFICH` 或 `PHICH`
+- 基于 helper 的自动 PHICH 保留只限于文档化的 FDD normal-CP 边界
 
-## 6. Capacity requirements
+## 6. 容量要求
 
-Before calling `run_pdcch`, caller must provide enough output capacity:
+调用 `run_pdcch` 之前，调用方必须提供足够的输出容量：
 
 - `capacity_re_per_layer >= expected_n_re`
 - `capacity_re_metadata >= expected_n_re`
 
-If capacity is too small, the call returns `kBufferTooSmall`.
+如果容量不足，调用会返回 `kBufferTooSmall`。
 
-If exact `expected_n_re` is unknown, allocate conservatively for LTE normal-CP control-region use.
+如果暂时无法精确知道 `expected_n_re`，则应针对 LTE normal-CP 控制区场景做保守分配。
 
-## 7. Error codes
+## 7. 错误码
 
 ### `mmse::MmseStatus::kOk`
 
-Call succeeded.
+调用成功。
 
 ### `mmse::MmseStatus::kNotInitialized`
 
-Cause:
+原因：
 
-- `run_pdcch` called before `init`
+- 在调用 `run_pdcch` 前没有先调用 `init`
 
-Action:
+处理建议：
 
-- call `init(...)` first
+- 先调用 `init(...)`
 
 ### `mmse::MmseStatus::kInvalidArgument`
 
-Typical causes:
+典型原因：
 
-- null output pointers in `PdcchMmseOutputView`
-- invalid config values in `MmseEqualizerCpuConfig` or `MmseEqualizerGpuConfig`
-- invalid grid pointer layout
+- `PdcchMmseOutputView` 中存在空指针
+- `MmseEqualizerCpuConfig` 或 `MmseEqualizerGpuConfig` 中配置值非法
+- 网格指针布局非法
 
-Action:
+处理建议：
 
-- check pointers and config ranges
+- 检查指针和配置取值范围
 
 ### `mmse::MmseStatus::kUnsupportedConfig`
 
-Typical causes:
+典型原因：
 
-- non-LTE grid dimensions
+- 非 LTE 网格维度
 - `cell_id > 503`
-- `control_symbol_count` outside `1..3`
-- `mod_order != 2` for PDCCH
+- `control_symbol_count` 不在 `1..3`
+- 对 PDCCH 而言 `mod_order != 2`
 - `n_tx_ports != 1`
 - `n_layers != 1`
-- unsupported backend selection
+- backend 选择不受支持
 
-Action:
+处理建议：
 
-- constrain the request to the supported LTE PDCCH boundary
+- 把请求限制在当前支持的 LTE PDCCH 边界内
 
 ### `mmse::MmseStatus::kBufferTooSmall`
 
-Typical causes:
+典型原因：
 
 - `capacity_re_per_layer < n_re`
 - `capacity_re_metadata < n_re`
 
-Action:
+处理建议：
 
-- allocate larger output buffers
+- 分配更大的输出缓冲区
 
 ### `mmse::MmseStatus::kInternalError`
 
-Typical causes:
+典型原因：
 
-- internal transport or validation failure
-- unexpected CUDA runtime state mismatch
+- 内部传输或校验失败
+- 意外的 CUDA 运行时状态不一致
 
-Action:
+处理建议：
 
-- treat as runtime failure and inspect logs / debug validation path
+- 视为运行时失败，并结合日志或 debug 校验路径定位
 
-## 8. Recommended call flow
+## 8. 推荐调用流程
 
 ```cpp
 #include "mmse/pdcch_chain_sdk.h"

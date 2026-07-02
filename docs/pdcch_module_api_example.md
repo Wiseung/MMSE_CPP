@@ -1,32 +1,31 @@
-# PDCCH Module API Example
+# PDCCH Module API 集成示例
 
-This document shows the intended integration boundary for the current PDCCH MMSE module in
-`G:\MMSE_CPP`.
+本文说明当前 `G:\MMSE_CPP` 中 PDCCH MMSE 模块的预期集成边界。
 
-The module only does:
+该模块只负责：
 
-- CRS-based channel estimation
-- PDCCH RE extraction inside the LTE control region
-- MMSE equalization
+- 基于 CRS 的信道估计
+- LTE 控制区内的 PDCCH RE 提取
+- MMSE 均衡
 
-The module does not do:
+该模块不负责：
 
-- PCFICH decoding
-- PHICH decoding
-- REG/CCE regrouping
-- DCI blind detection or channel decoding
+- PCFICH 译码
+- PHICH 译码
+- REG/CCE 重组
+- DCI 盲检索或信道译码
 
-For `2 Tx port` LTE PDCCH transmit diversity, use the additive TD call surface
-`run_pdcch_td(...)` instead of the legacy single-RE `run_pdcch(...)` surface shown below.
+对于 `2 Tx port` 的 LTE PDCCH 发射分集场景，请使用新增 TD 调用面
+`run_pdcch_td(...)`，而不是下面展示的传统单 RE `run_pdcch(...)` 接口面。
 
-## 1. Upstream: how to fill `control_re_exclusion_masks`
+## 1. 上游：如何填充 `control_re_exclusion_masks`
 
-Upstream should first determine:
+上游首先应确定：
 
-- `control_symbol_count` from PCFICH/CFI or from a trusted external controller
-- which control-region REs are occupied by non-PDCCH channels such as `PCFICH` and `PHICH`
+- `control_symbol_count`，来源可以是 `PCFICH/CFI` 或可信的外部控制器
+- 控制区内哪些 RE 被非 PDCCH 信道占用，例如 `PCFICH` 和 `PHICH`
 
-Then fill `PdcchMmseInput` and mark those REs as excluded.
+然后填充 `PdcchMmseInput`，并把这些 RE 标记为排除。
 
 ```cpp
 #include "mmse/pdcch_chain_sdk.h"
@@ -50,16 +49,16 @@ if (phich_status != mmse::MmseStatus::kOk) {
 mmse::PdcchMmseInput in = mmse::pdcch::make_pdcch_mmse_input(fft_grid_view, frontend);
 ```
 
-Expected meaning of each reserved RE:
+每个 reserved RE 的预期含义：
 
-- `symbol`: OFDM symbol index inside the subframe
-- `prb`: PRB index in `0..99`
-- `tone_in_prb`: tone index inside one PRB in `0..11`
+- `symbol`：子帧内的 OFDM symbol 索引
+- `prb`：`0..99` 范围内的 PRB 索引
+- `tone_in_prb`：单个 PRB 内 `0..11` 的 tone 索引
 
-The current module automatically excludes CRS REs. Upstream should only mark non-PDCCH control REs
-that still remain after that, typically `PCFICH` and `PHICH`.
+当前模块会自动排除 CRS RE。上游只需要标记除此之外仍然残留的非 PDCCH 控制 RE，
+典型就是 `PCFICH` 和 `PHICH`。
 
-## 2. Module call
+## 2. 模块调用
 
 ```cpp
 mmse::MmseEqualizerCpuContext ctx;
@@ -84,7 +83,7 @@ mmse::PdcchMmseResult meta{};
 const mmse::MmseStatus status = ctx.run_pdcch(in, out, meta);
 ```
 
-For `2 Tx port` transmit diversity, allocate the additive TD output instead:
+对于 `2 Tx port` 发射分集，请改为分配新增 TD 输出：
 
 ```cpp
 std::vector<float> xhat_re(capacity_symbols);
@@ -105,9 +104,9 @@ mmse::PdcchTdMmseResult td_meta{};
 const mmse::MmseStatus td_status = ctx.run_pdcch_td(in, td_out, td_meta);
 ```
 
-## 3. Downstream: how to consume `re_grid_indices`
+## 3. 下游：如何消费 `re_grid_indices`
 
-Downstream should first pack the module output into the formal backend DTO, then consume that DTO.
+下游应先把模块输出打包成正式的 backend DTO，再消费该 DTO。
 
 ```cpp
 mmse::pdcch::BackendPdcchEqualizedIndication backend =
@@ -129,11 +128,11 @@ for (std::size_t i = 0; i < backend.re_grid_indices.size(); ++i) {
     item.first_cce = backend.chain.first_cce;
     item.aggregation_level = backend.chain.aggregation_level;
 
-downstream_consume(item);
+    downstream_consume(item);
 }
 ```
 
-For the TD surface:
+对于 TD 接口面：
 
 ```cpp
 mmse::pdcch::BackendPdcchTdEqualizedIndication td_backend =
@@ -156,37 +155,37 @@ for (std::size_t i = 0; i < td_backend.x_hat_re.size(); ++i) {
 }
 ```
 
-This is the intended handoff contract:
+这就是预期的透传契约：
 
-- the current module can be converted into one formal backend DTO
-- the backend DTO carries equalized soft symbols, per-RE SINR, and `re_grid_indices`
-- downstream uses `re_grid_indices` to rebuild REG/CCE or any other required ordering
-- chain metadata is preserved end to end through `PdcchChainMetadata`
+- 当前模块可以转换成一个正式 backend DTO
+- backend DTO 持有均衡后的软符号、按 RE 的 SINR，以及 `re_grid_indices`
+- 下游使用 `re_grid_indices` 恢复 REG/CCE 或其它所需顺序
+- 链路元数据通过 `PdcchChainMetadata` 端到端透传
 
-## 4. Practical rules
+## 4. 实用规则
 
-- Upstream should treat `control_re_exclusion_masks` as the list of non-PDCCH control REs
-- Upstream should not mark CRS REs there; CRS is already excluded internally
-- If upstream wants helper-generated control-channel reservation, it should pass shared
-  `LteControlSubframeContext` through `FrontendPdcchIndication::control_subframe`, plus
-  `Ng + duration + mi` through `PhichReservationConfig`
-- In TDD mode, `mi` must match the selected `subframe_ctx.ul_dl_config + subframe_ctx.subframe`
-- For extended duration, `TDD subframe 1/6` special-case is selected automatically
-- True `MBSFN` subframes should be marked through `subframe_ctx.kind = kMbsfn`
-- Downstream should not assume output order equals CCE order
-- Downstream should use `re_grid_indices` to rebuild any required ordering
-- `run_pdcch(...)` remains the `1 Tx port` per-RE surface
-- `run_pdcch_td(...)` is the additive `2 Tx port` transmit-diversity surface with
-  `re_grid_indices0/re_grid_indices1` RE-pair mapping
+- 上游应把 `control_re_exclusion_masks` 当作非 PDCCH 控制 RE 的列表
+- 上游不应把 CRS RE 标进去；CRS 已由内部自动排除
+- 如果上游希望由 helper 自动生成控制信道保留信息，则应通过
+  `FrontendPdcchIndication::control_subframe` 传入共享的 `LteControlSubframeContext`，
+  并通过 `PhichReservationConfig` 传入 `Ng + duration + mi`
+- 在 TDD 模式下，`mi` 必须和选定的 `subframe_ctx.ul_dl_config + subframe_ctx.subframe` 匹配
+- 对 extended duration，`TDD subframe 1/6` 特例会自动选中
+- 真实 `MBSFN` 子帧应通过 `subframe_ctx.kind = kMbsfn` 标记
+- 下游不应假定输出顺序天然等于 CCE 顺序
+- 下游应使用 `re_grid_indices` 恢复任何需要的排序
+- `run_pdcch(...)` 仍然是 `1 Tx port` 的 per-RE 接口面
+- `run_pdcch_td(...)` 是新增的 `2 Tx port` 发射分集接口面，并通过
+  `re_grid_indices0/re_grid_indices1` 提供 RE 对映射
 
-## 5. Compilable demo
+## 5. 可编译 demo
 
-The repo also provides a small compilable demo:
+仓库还提供了一个小型可编译 demo：
 
-- source: `bench/pdcch_module_demo.cpp`
-- target: `pdcch_module_demo`
+- 源文件：`bench/pdcch_module_demo.cpp`
+- 目标：`pdcch_module_demo`
 
-Build and run:
+构建并运行：
 
 ```powershell
 cmake --build build --config Debug --target pdcch_module_demo
