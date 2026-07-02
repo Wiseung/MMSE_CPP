@@ -1,0 +1,218 @@
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage[UTF8,fontset=windows]{ctex}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc, fit, backgrounds, shapes.geometric}
+
+\begin{document}
+\begin{tikzpicture}[
+    font=\small,
+    >=Latex,
+    flow/.style={-Latex, very thick, draw=gray!65},
+    returnflow/.style={-Latex, thick, dashed, draw=orange!80!black},
+    box/.style={draw, rounded corners=6pt, very thick, align=center, minimum height=10mm},
+    inputbox/.style={box, fill=blue!14, draw=blue!55!black, text width=6.3cm},
+    stepbox/.style={box, fill=green!12, draw=green!45!black, text width=6.3cm},
+    extractbox/.style={box, fill=orange!11, draw=orange!70!black, text width=6.3cm},
+    outputbox/.style={box, fill=gray!16, draw=gray!65!black, text width=6.3cm},
+    sidepanel/.style={draw, rounded corners=10pt, very thick, draw=gray!30, fill=gray!4},
+    smalltag/.style={draw=orange!80!black, rounded corners=4pt, thick, fill=orange!6, font=\bfseries\footnotesize, align=center, inner sep=3pt},
+    sidehead/.style={font=\bfseries\large, text=blue!45!black},
+    sidebody/.style={align=left, font=\small, text width=8.9cm},
+    sidenote/.style={align=left, font=\scriptsize, text width=8.9cm, text=gray!70!black},
+    dotlabel/.style={circle, draw=teal!60!black, fill=white, very thick, minimum size=6.2mm, inner sep=0pt, font=\bfseries\small},
+    legendbox/.style={draw, rounded corners=4pt, thin, fill=white, align=left, font=\scriptsize, inner sep=4pt},
+    res/.style={draw=gray!55, thin},
+    q/.style={font=\bfseries\footnotesize, text=teal!60!black}
+]
+
+\node[font=\bfseries\LARGE, text=blue!45!black] (title) at (0, 1.2) {LTE PDCCH 信道流程图};
+\node[font=\small, text=orange!80!black] at (0, 0.35)
+    {左侧：接收主干流程 \quad 右侧：子帧位置示意与 MIB / CFI / DCI 说明};
+
+% Left main chain
+\node[inputbox] (in0) at (-6.1, -1.4) {输入：下行资源网格\\
+去 CP + FFT 后的每子帧复数 RE\\
+\texttt{grid[n\_sym][n\_sc]}，其中 $n\_sc = N^{DL}_{RB}\times 12$};
+\node[smalltag] (tag0) at ($(in0.south)+(0,-0.9)$) {RE count: $14 \times N^{DL}_{RB} \times 12$（输入资源网格）\\
+complex bytes: $14 \times N^{DL}_{RB} \times 12 \times 8$（Complex32）};
+
+\node[extractbox] (s1) at ($(tag0.south)+(0,-1.2)$) {同步与先验准备\\
+PCI / 小区定时 / CRS 位置已知\\
+PBCH 解出的 MIB 提供带宽与 PHICH 配置};
+\node[smalltag] (tag1) at ($(s1.south)+(0,-0.9)$) {payload bits: 24（MIB 本体）\\
+fields used here: $N^{DL}_{RB}$、Ng、PHICH duration};
+
+\node[extractbox] (s2) at ($(tag1.south)+(0,-1.2)$) {读取 PCFICH，得到 CFI\\
+确定控制区长度\\
+即本子帧前若干个 OFDM 符号属于控制区};
+\node[smalltag] (tag2) at ($(s2.south)+(0,-0.9)$) {control symbols: 前 1--3 个 OFDM 符号\\
+RE count (PCFICH): 16 \quad complex bytes: 128（Complex32）};
+
+\node[stepbox] (s3) at ($(tag2.south)+(0,-1.2)$) {构造有效 PDCCH 资源\\
+控制区内排除 CRS / PCFICH / PHICH\\
+保留可用于 PDCCH 的 REG / RE};
+\node[smalltag] (tag3) at ($(s3.south)+(0,-0.9)$) {RE count: $4 \times N_{REG,\mathrm{valid}}$\\
+example RE count: 20MHz, CFI=3 时基线 3,400，典型保留后约 3,228\\
+complex bytes / Rx: $\approx 3,228 \times 8 = 25,824$（Complex32）};
+
+\node[stepbox] (s4) at ($(tag3.south)+(0,-1.2)$) {CRS 信道估计 + MMSE 均衡\\
+在有效控制区 RE 上生成软符号\\
+输出 $\hat{x}$ 与每 RE 的 SINR};
+\node[smalltag] (tag4) at ($(s4.south)+(0,-0.9)$) {RE count: 与有效 PDCCH RE 相同\\
+complex bytes ($\hat{x}$): $\approx 3,228 \times 8 = 25,824$（Complex32）\\
+float bytes (SINR): $\approx 3,228 \times 4 = 12,912$（float）};
+
+\node[stepbox] (s5) at ($(tag4.south)+(0,-1.2)$) {REG 交织恢复与 CCE 组合\\
+按 LTE 规则重组控制资源\\
+形成盲检索候选的 CCE 集合};
+\node[smalltag] (tag5) at ($(s5.south)+(0,-0.9)$) {RE count / CCE: 36 个 QPSK 符号\\
+coded bits / CCE: 72\\
+LLR bytes / CCE: $72 \times 4 = 288$（float）};
+
+\node[stepbox] (s6) at ($(tag5.south)+(0,-1.2)$) {搜索空间与候选生成\\
+按聚合级别 $L = 1 / 2 / 4 / 8$ CCE\\
+生成公共搜索空间与 UE 专用搜索空间候选};
+\node[smalltag] (tag6) at ($(s6.south)+(0,-0.9)$) {aggregation level: $L=1/2/4/8$\\
+coded bits / candidate: $72L$\\
+LLR bytes / candidate: $288L$（float）};
+
+\node[stepbox] (s7) at ($(tag6.south)+(0,-1.2)$) {候选译码\\
+解扰 $\rightarrow$ 速率恢复 $\rightarrow$ 尾咬卷积译码\\
+CRC 与 RNTI 掩码校验};
+\node[smalltag] (tag7) at ($(s7.south)+(0,-0.9)$) {soft bits / candidate: $72L$\\
+LLR bytes / candidate: $288L$（float）\\
+decoder output: DCI 载荷 + CRC16 校验};
+
+\node[draw=blue!55!black, diamond, aspect=2.0, very thick, fill=blue!8, align=center, text width=4.0cm]
+    (judge) at ($(tag7.south)+(0,-1.5)$) {CRC-RNTI 通过？};
+
+\node[outputbox] (out0) at ($(judge.south)+(0,-2.0)$) {输出 DCI\\
+RNTI / DCI format / 聚合级别 / CCE 位置\\
+RB 分配 / MCS / HARQ / RV / NDI / TPC 等};
+
+\draw[flow] (in0) -- (tag0);
+\draw[flow] (tag0) -- (s1);
+\draw[flow] (s1) -- (tag1);
+\draw[flow] (tag1) -- (s2);
+\draw[flow] (s2) -- (tag2);
+\draw[flow] (tag2) -- (s3);
+\draw[flow] (s3) -- (tag3);
+\draw[flow] (tag3) -- (s4);
+\draw[flow] (s4) -- (tag4);
+\draw[flow] (tag4) -- (s5);
+\draw[flow] (s5) -- (tag5);
+\draw[flow] (tag5) -- (s6);
+\draw[flow] (s6) -- (tag6);
+\draw[flow] (tag6) -- (s7);
+\draw[flow] (s7) -- (tag7);
+\draw[flow] (tag7) -- (judge);
+\draw[flow] (judge) -- node[right, font=\scriptsize, text=orange!80!black] {是} (out0);
+\draw[returnflow] ($(judge.east)+(0.2,0)$) -- ++(1.2,0) |- node[pos=0.18, left, align=left, font=\scriptsize, text=orange!80!black, fill=white, inner sep=1pt]
+    {否：下一候选\\下一 RNTI 假设} ($(s6.east)+(0.3,0)$);
+
+% Right side panel
+\begin{scope}[on background layer]
+\node[sidepanel, minimum width=11.0cm, minimum height=32.6cm, anchor=north west]
+    (panel) at (0.9, -0.4) {};
+\end{scope}
+
+\node[sidehead, anchor=north] at ($(panel.north)+(0,-0.6)$) {控制区位置与关键字段说明};
+\node[font=\small\bfseries, text=orange!80!black, anchor=north]
+    at ($(panel.north)+(0,-1.3)$) {MIB 决定系统边界，CFI 决定控制区范围，DCI 是最终调度结果};
+
+% Resource map
+\node[q, anchor=west] at ($(panel.north west)+(0.6,-2.4)$) {1. 子帧位置示意（频域简化视图）};
+\node[sidenote, anchor=west] at ($(panel.north west)+(0.6,-3.15)$)
+    {横向为 OFDM 符号 0--13，纵向为频域 RB。图中只标出与 PDCCH 相关的位置关系，不按精确像素比例绘制。};
+
+\coordinate (mapNW) at ($(panel.north west)+(0.9,-4.65)$);
+\def\cellw{0.58}
+\def\cellh{0.42}
+\def\mapw{14}
+\def\maph{8}
+
+% grid frame
+\draw[draw=gray!55, thick] (mapNW) rectangle ++({\mapw*\cellw},{-\maph*\cellh});
+\foreach \x in {1,...,13} {
+    \draw[res] ($(mapNW)+(\x*\cellw,0)$) -- ++(0,{-\maph*\cellh});
+}
+\foreach \y in {1,...,7} {
+    \draw[res] ($(mapNW)+(0,-\y*\cellh)$) -- ++({\mapw*\cellw},0);
+}
+\foreach \x in {0,...,13} {
+    \node[font=\scriptsize, anchor=south] at ($(mapNW)+(\x*\cellw+0.5*\cellw,0.08)$) {\x};
+}
+\node[font=\scriptsize, anchor=east] at ($(mapNW)+(-0.12,-0.5*\maph*\cellh)$) {频域};
+\node[font=\scriptsize, anchor=south] at ($(mapNW)+(0.5*\mapw*\cellw,0.48)$) {OFDM symbol index};
+
+% Control region shading
+\fill[blue!10] ($(mapNW)+(0,0)$) rectangle ++({3*\cellw},{-\maph*\cellh});
+\node[font=\scriptsize, text=blue!55!black, anchor=west] at ($(mapNW)+(0.15,-0.22)$) {控制区};
+
+% PBCH center 6RB area in symbols 7-10
+\fill[orange!25] ($(mapNW)+(7*\cellw,-2*\cellh)$) rectangle ++({4*\cellw},{-4*\cellh});
+\node[font=\scriptsize, text=orange!80!black, align=center] at ($(mapNW)+(9*\cellw,-4.05*\cellh)$) {PBCH\\中心 6RB\\子帧 0};
+
+% PCFICH marks
+\foreach \x in {0.35, 1.25, 1.95, 2.7} {
+    \fill[teal!45] ($(mapNW)+(\x*\cellw,-0.55*\cellh)$) circle (1.6pt);
+}
+
+% PHICH hint
+\fill[purple!24] ($(mapNW)+(0.1*\cellw,-1.2*\cellh)$) rectangle ++({1.3*\cellw},{-1.2*\cellh});
+
+% PDCCH usable area indication
+\draw[green!55!black, very thick, dashed] ($(mapNW)+(0.1*\cellw,-0.1*\cellh)$)
+    rectangle ++({2.8*\cellw},{-7.8*\cellh});
+
+% legend and compact notes
+\node[legendbox, anchor=north west, text width=8.95cm] at ($(mapNW)+(0.0,-\maph*\cellh-0.40)$) {
+    \fcolorbox{blue!55!black}{blue!10}{\rule{0pt}{1.6mm}\rule{7mm}{0pt}} 控制区（由 CFI 决定） \quad
+    \fcolorbox{orange!80!black}{orange!25}{\rule{0pt}{1.6mm}\rule{7mm}{0pt}} PBCH / MIB 位置\\
+    \fcolorbox{purple!70!black}{purple!24}{\rule{0pt}{1.6mm}\rule{7mm}{0pt}} PHICH 保留区 \quad
+    \textcolor{green!55!black}{\tikz[baseline=-0.5ex]{\draw[green!55!black, dashed, very thick] (0,0) rectangle (0.75,0.18);}} PDCCH 搜索边界示意\\[2pt]
+    PCFICH：位于 symbol 0 的 4 个 REG；PHICH：位于控制区内，位置受 Ng / 持续长度约束；\\
+    PDCCH：只在控制区内搜索，并扣除 CRS / PCFICH / PHICH 占用 RE 后形成候选。\\
+    图中绿色虚线只表示“搜索边界的大致范围”，不表示真实可用 RE 会形成完整矩形。
+};
+
+% Explanation blocks
+\node[q, anchor=west] at ($(panel.north west)+(0.6,-12.55)$) {2. MIB / CFI / DCI 的位置与作用};
+
+\node[dotlabel, anchor=west] (mibdot) at ($(panel.north west)+(0.7,-14.75)$) {1};
+\node[sidebody, anchor=north west] at ($(panel.north west)+(1.55,-14.30)$)
+    {\textbf{MIB（来自 PBCH）}\\
+    \textbf{position:} 无线帧的子帧 0，中心 6 RB，跨 symbol 7--10。\\
+    \textbf{payload:} 下行带宽 $N^{DL}_{RB}$、PHICH 资源 Ng、PHICH duration、SFN 高位。\\
+    \textbf{used by PDCCH:} 决定资源网格带宽边界，并参与 PHICH 占用资源的推导。};
+
+\node[dotlabel, anchor=west] (cfidot) at ($(panel.north west)+(0.7,-18.55)$) {2};
+\node[sidebody, anchor=north west] at ($(panel.north west)+(1.55,-18.10)$)
+    {\textbf{CFI（来自 PCFICH）}\\
+    \textbf{position:} 每个子帧 symbol 0 中的 4 个 REG。\\
+    \textbf{payload:} 控制区长度，通常对应前 1--3 个 OFDM 符号。\\
+    \textbf{used by PDCCH:} 告诉接收机“盲检索只在前几列 symbol 内做”，不必在整个子帧搜索。};
+
+\node[dotlabel, anchor=west] (dcidot) at ($(panel.north west)+(0.7,-22.35)$) {3};
+\node[sidebody, anchor=north west] at ($(panel.north west)+(1.55,-21.90)$)
+    {\textbf{DCI（由 PDCCH 译出）}\\
+    \textbf{position:} 不预先固定在某个频点；它属于控制区中的某个候选 CCE 组合。\\
+    \textbf{payload:} RNTI、DCI format、RB 分配、MCS、HARQ、RV、NDI、TPC 等。\\
+    \textbf{result / action:} 决定 UE 后续如何接收 PDSCH，或者如何发起 PUSCH / PUCCH 相关动作。};
+
+\node[q, anchor=west] at ($(panel.north west)+(0.6,-27.35)$) {3. 模块对应关系（面向实现）};
+\node[sidebody, anchor=west] at ($(panel.north west)+(0.9,-28.75)$)
+    {\textbf{控制区资源整理模块}\\
+    输入 MIB + CFI + 小区上下文，完成控制区裁剪与非 PDCCH RE 排除。};
+\node[sidebody, anchor=west] at ($(panel.north west)+(0.9,-30.65)$)
+    {\textbf{CRS 信道估计 / MMSE 模块}\\
+    把有效控制区 RE 变成软符号与 SINR，供后续候选译码使用。};
+\node[sidebody, anchor=west] at ($(panel.north west)+(0.9,-32.55)$)
+    {\textbf{CCE 候选与译码模块}\\
+    完成 REG/C C E 组合、搜索空间遍历、卷积码译码与 CRC-RNTI 校验，最终输出 DCI。};
+
+\node[sidenote, anchor=west] at ($(panel.north west)+(0.6,-34.05)$)
+    {补充说明：本图把 PBCH / PCFICH / PHICH 只作为 PDCCH 接收链的“先验来源与资源约束”来画；真正的 PDCCH 有效负载输出是 DCI，而不是 MIB 或 CFI。};
+
+\end{tikzpicture}
+\end{document}

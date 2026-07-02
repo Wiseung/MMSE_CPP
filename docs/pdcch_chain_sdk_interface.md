@@ -1,92 +1,91 @@
-# PDCCH Chain SDK Documentation
+# PDCCH Chain SDK 文档
 
-This page is the PDCCH-specific subpage under the broader LTE equalized-channel SDK.
+本页是更大范围 LTE equalized-channel SDK 下的 PDCCH 专用子页面。
 
-Primary include:
+主要包含头文件：
 
 ```cpp
 #include "mmse/pdcch_chain_sdk.h"
 ```
 
-Current interface version:
+当前接口版本：
 
 - `PDCCH Chain SDK v1`
 
-Parent page:
+父页面：
 
-- [LTE Equalized Channel SDK Documentation](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
+- [LTE Equalized Channel SDK 文档](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
 
-Documentation set:
+文档集合：
 
-- [Quick Start](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
-- [API Reference](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
-- [Versioning Policy](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
-- [Integration Example](/G:/MMSE_CPP/docs/pdcch_module_api_example.md)
+- [快速开始](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
+- [API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
+- [版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
+- [集成示例](/G:/MMSE_CPP/docs/pdcch_module_api_example.md)
 
-## Recommended Reading Order
+## 推荐阅读顺序
 
-1. Read [Quick Start](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md) for first integration.
-2. Use [API Reference](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md) for field-level lookup.
-3. Use [Versioning Policy](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md) before making
-   interface changes or depending on compatibility guarantees.
+1. 首次集成时先阅读 [快速开始](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
+2. 做字段级查询时使用 [API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
+3. 在依赖兼容性保证或准备改接口前，先阅读 [版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
 
-## Scope
+## 作用范围
 
-The SDK covers:
+SDK 当前覆盖：
 
-- LTE PDCCH control-region RE extraction
-- CRS-based channel estimation
-- MMSE equalization
-- per-RE soft-symbol and SINR handoff
-- 2Tx transmit-diversity de-mapping through the additive `run_pdcch_td(...)` surface
+- LTE PDCCH 控制区 RE 提取
+- 基于 CRS 的信道估计
+- MMSE 均衡
+- 按 RE 输出软符号和 SINR
+- 通过新增的 `run_pdcch_td(...)` 接口支持 2Tx 发射分集去映射
 
-The SDK does not cover:
+SDK 当前不覆盖：
 
-- PCFICH decoding
-- PHICH decoding
-- REG/CCE regrouping
-- blind detection
-- channel decoding
+- PCFICH 译码
+- PHICH 译码
+- REG/CCE 重组
+- 盲检索
+- 信道译码
 
-## Page Summary
+## 页面摘要
 
-### Quick Start
+### 快速开始
 
-Use this page when you need:
+当你需要下面这些内容时，先看本页：
 
-- the minimum include path
-- the minimum DTO flow
-- a compact integration sequence
-- a validated demo build path
+- 最小 `include` 路径
+- 最小 DTO 流程
+- 紧凑集成步骤
+- 已验证的 demo 构建路径
 
-Link:
+链接：
 
-- [Quick Start](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
+- [快速开始](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
 
-### API Reference
+### API 参考
 
-Use this page when you need:
+当你需要下面这些内容时，先看本页：
 
-- field definitions
-- units
-- helper semantics
-- boundary conditions
-- error-code meanings
-- field index and status-code index
+- 字段定义
+- 单位
+- helper 语义
+- 边界条件
+- 错误码含义
+- 字段索引和状态码索引
 
-Link:
+链接：
 
-- [API Reference](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
+- [API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
 
-### Versioning Policy
+### 版本策略
 
-Use this page when you need:
+当你需要下面这些内容时，先看本页：
 
-- frozen v1 surface
-- allowed additive changes
-- disallowed incompatible changes
-- rules for introducing `v2`
+- 冻结的 v1 接口面
+- 允许的增量变更
+- 不允许的不兼容变更
+- 如何引入 `v2`
 
-Link:
+链接：
 
-- [Versioning Policy](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
+- [版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)

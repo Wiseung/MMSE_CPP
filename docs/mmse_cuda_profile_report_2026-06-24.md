@@ -1,145 +1,145 @@
-# MMSE CUDA Profiling Report (2026-06-24)
+﻿# MMSE CUDA Profiling 报告（2026-06-24）
 
-## Scope
+## 作用范围
 
-This report measures the current CUDA implementation in `G:\MMSE_CPP` on the local machine.
+本报告用于测量 `G:\MMSE_CPP` 当前 CUDA 实现在本机上的表现。
 
-Important boundary:
+重要边界说明：
 
-- The current public API processes one LTE subframe per call.
-- One call consumes `14 OFDM symbols x 1200 subcarriers`, which is one LTE 1 ms subframe under normal CP.
-- Therefore:
-  - `10 ms` results in this report are the aggregate cost of `10` consecutive 1 ms subframe calls.
-  - `100 ms` results are the aggregate cost of `100` consecutive 1 ms subframe calls.
-- This is a measurement of the current implementation as-is, not a redesigned batched 10 ms / 100 ms kernel interface.
+- 当前公开 API 仍然是“一次调用处理一个 LTE 子帧”
+- 一次调用消费 `14 OFDM symbols × 1200 subcarriers`，即 normal CP 下一个 LTE `1 ms` 子帧
+- 因此：
+  - 本报告中的 `10 ms` 结果，是连续 `10` 次 `1 ms` 子帧调用的聚合开销
+  - 本报告中的 `100 ms` 结果，是连续 `100` 次 `1 ms` 子帧调用的聚合开销
+- 本报告测量的是当前实现原样行为，而不是重新设计后的 batched `10 ms / 100 ms` kernel 接口
 
-## Test Environment
+## 测试环境
 
-| Item               | Value                              |
+| 项目               | 数值                               |
 | ------------------ | ---------------------------------- |
-| Date               | 2026-06-24                         |
+| 日期               | 2026-06-24                         |
 | OS                 | Windows                            |
-| Repo               | `G:\MMSE_CPP`                      |
-| Build              | `Release`                          |
+| 仓库               | `G:\MMSE_CPP`                      |
+| 构建               | `Release`                          |
 | GPU                | NVIDIA GeForce RTX 4060 Laptop GPU |
 | Driver / CUDA      | 560.94 / 12.6                      |
 | Compute capability | 8.9                                |
-| SM count           | 24                                 |
-| Global memory      | 8,585,216,000 bytes                |
+| SM 数              | 24                                 |
+| 全局显存           | 8,585,216,000 bytes                |
 | L2 cache           | 33,554,432 bytes                   |
 
-## Test Method
+## 测试方法
 
-### 1. Functional pre-check
+### 1. 功能预检查
 
-The following command was run first to ensure profiling was done on a passing build:
+在做 profiling 前，先通过下面的命令确认 profiling 基于的是一个通过测试的构建：
 
 ```powershell
 ctest --test-dir build -C Release --output-on-failure -R mmse_tests
 ```
 
-Result: `100% tests passed`.
+结果：`100% tests passed`
 
-### 2. Build
+### 2. 构建
 
 ```powershell
 cmake --build build --config Release --target mmse_cuda_profile mmse_tests
 ```
 
-### 3. Profiling executable
+### 3. Profiling 可执行文件
 
-A dedicated benchmark executable was added:
+本报告新增了一个专用 benchmark 可执行文件：
 
 - `G:\MMSE_CPP\bench\mmse_cuda_profile.cpp`
 
-It does the following:
+它的行为包括：
 
-- generates LTE-structured simulation data for `100` consecutive subframes
-- uses full-band 20 MHz LTE structure:
-  - `1200` subcarriers
-  - `100` PRB
-  - `14` OFDM symbols per subframe
+- 生成 `100` 个连续子帧的 LTE 结构化仿真数据
+- 使用 full-band 20 MHz LTE 结构：
+  - `1200` 个子载波
+  - `100` 个 PRB
+  - 每子帧 `14` 个 OFDM symbol
   - normal CP
   - `2x2` MIMO
-  - `2` layers
-  - `64QAM` (`mod_order = 6`)
-- builds CRS-bearing subframes and data RE samples consistent with the repo's current equalizer path
-- measures:
-  - cold `10 ms` latency
-  - warm `10 ms` latency
-  - repeated `10 ms` aggregate latency
-  - repeated `100 ms` aggregate latency
-- queries:
-  - static CUDA kernel resource attributes
-  - CUDA visible memory before/after init and after runs
-  - process memory
+  - `2` 层
+  - `64QAM`（`mod_order = 6`）
+- 构造与仓库当前 equalizer 路径一致的 CRS-bearing 子帧与 data RE 样本
+- 测量：
+  - cold `10 ms` 时延
+  - warm `10 ms` 时延
+  - 重复 `10 ms` 聚合时延
+  - 重复 `100 ms` 聚合时延
+- 查询：
+  - 静态 CUDA kernel 资源属性
+  - init 前后以及运行后的 CUDA 可见内存
+  - 进程内存
 
-### 4. Commands used
+### 4. 使用命令
 
-Baseline timing and memory:
+基线时延与内存：
 
 ```powershell
 .\build\Release\mmse_cuda_profile.exe
 ```
 
-Equalize kernel Nsight Compute:
+`equalize` kernel 的 Nsight Compute：
 
 ```powershell
 ncu --target-processes all --set basic --kernel-name-base demangled -k "regex:.*equalize_stub_kernel.*" -c 1 --profile-from-start on -f -o .\build\ncu_equalize_report .\build\Release\mmse_cuda_profile.exe --warmup-subframes 0 --iters-10ms 1 --iters-100ms 0
 ```
 
-Estimate kernel Nsight Compute:
+`estimate` kernel 的 Nsight Compute：
 
 ```powershell
 ncu --target-processes all --set basic --kernel-name-base demangled -k "regex:.*estimate_stub_kernel.*" -c 1 --profile-from-start on -f -o .\build\ncu_estimate_report .\build\Release\mmse_cuda_profile.exe --warmup-subframes 0 --iters-10ms 1 --iters-100ms 0
 ```
 
-Runtime `nvidia-smi` sampling was also performed every `200 ms` during the `100 ms` aggregate benchmark window.
+另外，在 `100 ms` 聚合 benchmark 期间，每 `200 ms` 做了一次运行时 `nvidia-smi` 采样。
 
-## Input and Output Definition
+## 输入与输出定义
 
-### Input structure per 1 ms subframe
+### 每个 `1 ms` 子帧的输入结构
 
-| Item                 | Value         |
-| -------------------- | ------------- |
-| RX antennas          | 2             |
-| TX ports             | 2             |
-| Layers               | 2             |
-| Symbols              | 14            |
-| Subcarriers          | 1200          |
-| PRB                  | 100           |
-| Data RE per subframe | 14,400        |
-| Modulation order     | 6 bits/symbol |
+| 项目           | 数值          |
+| -------------- | ------------- |
+| RX 天线数      | 2             |
+| TX 端口数      | 2             |
+| 层数           | 2             |
+| Symbols        | 14            |
+| Subcarriers    | 1200          |
+| PRB            | 100           |
+| 每子帧 Data RE | 14,400        |
+| 调制阶数       | 6 bits/symbol |
 
-### Logical data size
+### 逻辑数据尺寸
 
-Input grid is planar complex float for 2 RX antennas:
+输入网格是 2 个 RX 天线的 planar complex float：
 
-- per subframe input bytes:
-  - `2 RX x 2 (re/im) x 14 x 1200 x 4 bytes = 268,800 bytes`
+- 每子帧输入字节数：
+  - `2 RX × 2 (re/im) × 14 × 1200 × 4 bytes = 268,800 bytes`
 
-Output is `x_hat_re`, `x_hat_im`, `sinr` for 2 layers over 14,400 RE:
+输出是 2 层、14,400 RE 上的 `x_hat_re`、`x_hat_im`、`sinr`：
 
-- per subframe output bytes:
-  - `14,400 RE x 2 layers x 3 planes x 4 bytes = 345,600 bytes`
+- 每子帧输出字节数：
+  - `14,400 RE × 2 layers × 3 planes × 4 bytes = 345,600 bytes`
 
-Aggregate sizes:
+聚合尺寸：
 
-| Window | Input bytes | Output bytes |
-| ------ | ----------: | -----------: |
-| 1 ms   |     268,800 |      345,600 |
-| 10 ms  |   2,688,000 |    3,456,000 |
-| 100 ms |  26,880,000 |   34,560,000 |
+| 时间窗 | 输入字节数 | 输出字节数 |
+| ------ | ---------: | ---------: |
+| 1 ms   |    268,800 |    345,600 |
+| 10 ms  |  2,688,000 |  3,456,000 |
+| 100 ms | 26,880,000 | 34,560,000 |
 
-## Timing Results
+## 时延结果
 
-Source:
+数据来源：
 
 - `G:\MMSE_CPP\build\mmse_cuda_profile_output.txt`
 
-### Aggregate latency
+### 聚合时延
 
-| Metric                      |       Result |
+| 指标                        |         结果 |
 | --------------------------- | -----------: |
 | Cold 10 ms aggregate        |  198.0260 ms |
 | Cold per-subframe           |   19.8026 ms |
@@ -158,41 +158,41 @@ Source:
 | 100 ms max                  | 1218.3277 ms |
 | 100 ms average per-subframe |   12.0979 ms |
 
-### Interpretation
+### 结果解释
 
-- Current throughput is approximately `12.07 ms` per `1 ms` LTE subframe.
-- The `10 ms` aggregate workload currently takes about `120.71 ms`.
-- The `100 ms` aggregate workload currently takes about `1209.79 ms`.
-- The implementation is therefore not real-time for the stated LTE processing target.
+- 当前吞吐大约是每个 LTE `1 ms` 子帧 `12.07 ms`
+- 当前 `10 ms` 聚合工作负载大约需要 `120.71 ms`
+- 当前 `100 ms` 聚合工作负载大约需要 `1209.79 ms`
+- 因而该实现对既定 LTE 处理目标而言还不是实时的
 
-## GPU Runtime Occupancy and Utilization
+## GPU 运行时占用与利用率
 
-### `nvidia-smi` dynamic sampling during 100 ms aggregate benchmark
+### `nvidia-smi` 动态采样（100 ms 聚合 benchmark 期间）
 
-Source:
+数据来源：
 
 - `G:\MMSE_CPP\build\nvidia_smi_samples.csv`
 
-| Metric                  |      Result |
-| ----------------------- | ----------: |
-| Sample count            |          85 |
-| GPU util average        |      88.88% |
-| GPU util peak           |         94% |
-| GPU memory used average | 1432.64 MiB |
-| GPU memory used peak    |    1467 MiB |
+| 指标                   |        结果 |
+| ---------------------- | ----------: |
+| 采样数                 |          85 |
+| GPU util 平均值        |      88.88% |
+| GPU util 峰值          |         94% |
+| GPU memory used 平均值 | 1432.64 MiB |
+| GPU memory used 峰值   |    1467 MiB |
 
-Notes:
+说明：
 
-- This is runtime device-level utilization, not per-kernel occupancy.
-- Peak visible device memory during execution is far above the statically-accounted MMSE buffers, so it includes CUDA runtime/profiler/driver residency and other device allocations outside the MMSE working-set estimate.
+- 这是运行时设备级利用率，而不是单 kernel occupancy
+- 执行期间的峰值可见显存远高于静态统计的 MMSE buffer，因此它同时包含 CUDA runtime / profiler / driver 常驻部分，以及 MMSE 工作集之外的其它 device 分配
 
-### Nsight Compute: `equalize_stub_kernel`
+### Nsight Compute：`equalize_stub_kernel`
 
-Source:
+数据来源：
 
 - `G:\MMSE_CPP\build\ncu_equalize_report.ncu-rep`
 
-| Metric                         |         Result |
+| 指标                           |           结果 |
 | ------------------------------ | -------------: |
 | Kernel duration                |        6.78 us |
 | Grid size                      |      57 blocks |
@@ -210,19 +210,19 @@ Source:
 | L1/TEX throughput              | 17.43% of peak |
 | L2 throughput                  | 14.86% of peak |
 
-Nsight warnings:
+Nsight 警告：
 
-- grid too small to fill the device
-- occupancy limited by registers
-- workload imbalance across SM/SMSP/cache slices
+- grid 太小，无法充分填满设备
+- occupancy 受寄存器数限制
+- 各 SM / SMSP / cache slice 存在工作负载不均衡
 
-### Nsight Compute: `estimate_stub_kernel`
+### Nsight Compute：`estimate_stub_kernel`
 
-Source:
+数据来源：
 
 - `G:\MMSE_CPP\build\ncu_estimate_report.ncu-rep`
 
-| Metric                         |        Result |
+| 指标                           |          结果 |
 | ------------------------------ | ------------: |
 | Kernel duration                |      18.85 ms |
 | Grid size                      |       1 block |
@@ -240,125 +240,125 @@ Source:
 | L1/TEX throughput              | 4.10% of peak |
 | L2 throughput                  | 0.14% of peak |
 
-Nsight warnings:
+Nsight 警告：
 
-- only `1` thread per block
-- only `1` block in the entire grid
-- severe underutilization of the GPU
+- 每个 block 只有 `1` 个 thread
+- 整个 grid 只有 `1` 个 block
+- GPU 严重低利用率
 
-### Main conclusion from kernel profiling
+### Kernel profiling 主要结论
 
-`equalize_stub_kernel` is not the primary latency source.
+`equalize_stub_kernel` 不是主要时延来源。
 
-The dominant issue is `estimate_stub_kernel`, which currently runs as:
+主问题在于 `estimate_stub_kernel` 当前运行为：
 
 - `grid = 1`
 - `block = 1`
 
-That means the channel-estimation stage is effectively serialized onto one CUDA thread and is the main reason the end-to-end latency is around `12 ms` per subframe.
+这意味着信道估计阶段实际上被串行化到一个 CUDA thread 上，这正是端到端时延达到每子帧 `12 ms` 的主要原因。
 
-## Memory and Buffer Placement
+## 内存与缓冲区放置
 
-### Logical placement
+### 逻辑放置
 
-| Data                     | Placement                | Type             |
-| ------------------------ | ------------------------ | ---------------- |
-| Input simulation dataset | Host memory              | pageable `float` |
-| Staging grids            | Host memory              | pageable `float` |
-| Transport grids          | Host memory              | pinned `int16_t` |
-| Output host buffers      | Host memory              | pinned `float`   |
-| Device input grids       | GPU global memory        | `int16_t`        |
-| Device metadata          | GPU global memory        | `CudaGridMeta`   |
-| Device sigma2 state      | GPU global memory        | `float`          |
-| Device estimates         | GPU global memory        | `float`          |
-| Device outputs           | GPU global memory        | `float`          |
-| Kernel temporaries       | registers / local memory | per-kernel       |
+| 数据                | 放置位置                 | 类型             |
+| ------------------- | ------------------------ | ---------------- |
+| 输入仿真数据集      | Host memory              | pageable `float` |
+| Staging grids       | Host memory              | pageable `float` |
+| Transport grids     | Host memory              | pinned `int16_t` |
+| 输出 host buffers   | Host memory              | pinned `float`   |
+| Device input grids  | GPU global memory        | `int16_t`        |
+| Device metadata     | GPU global memory        | `CudaGridMeta`   |
+| Device sigma2 state | GPU global memory        | `float`          |
+| Device estimates    | GPU global memory        | `float`          |
+| Device outputs      | GPU global memory        | `float`          |
+| Kernel temporaries  | registers / local memory | per-kernel       |
 
-### Static working-set estimate from code
+### 代码给出的静态 working-set 估计
 
-Source:
+数据来源：
 
 - profiling executable output
 
-| Item                  |    Per slot | Total (3 slots) |
+| 项目                  |     每 slot | 总计（3 slots） |
 | --------------------- | ----------: | --------------: |
 | Host pageable buffers | 1,022,492 B |     3,067,476 B |
 | Host pinned buffers   |   537,600 B |     1,612,800 B |
 | Device buffers        | 1,256,160 B |     3,768,480 B |
 
-Derived totals:
+导出总量：
 
-| Item                             |       Size |
-| -------------------------------- | ---------: |
-| Dataset input footprint          | 25.635 MiB |
-| Total host pageable ring storage |  2.925 MiB |
-| Total host pinned ring storage   |  1.538 MiB |
-| Total device ring storage        |  3.594 MiB |
+| 项目                      |       尺寸 |
+| ------------------------- | ---------: |
+| Dataset 输入 footprint    | 25.635 MiB |
+| Host pageable ring 总存储 |  2.925 MiB |
+| Host pinned ring 总存储   |  1.538 MiB |
+| Device ring 总存储        |  3.594 MiB |
 
-### CUDA memory observations
+### CUDA 内存观察
 
-From the benchmark:
+来自 benchmark：
 
-| Metric                                             |          Result |
-| -------------------------------------------------- | --------------: |
-| GPU free before init                               | 7,443,841,024 B |
-| GPU free after init                                | 7,439,646,720 B |
-| GPU free after runs                                | 6,003,097,600 B |
-| Init-time visible GPU allocation delta             |     4,194,304 B |
-| Post-run visible GPU allocation delta vs post-init | 1,436,549,120 B |
+| 指标                                  |            结果 |
+| ------------------------------------- | --------------: |
+| init 前 GPU free                      | 7,443,841,024 B |
+| init 后 GPU free                      | 7,439,646,720 B |
+| 运行后 GPU free                       | 6,003,097,600 B |
+| init 时可见 GPU 分配增量              |     4,194,304 B |
+| 相对 init 后的运行后可见 GPU 分配增量 | 1,436,549,120 B |
 
-Important note:
+重要说明：
 
-- The static MMSE device buffers account for about `3.59 MiB`.
-- The much larger post-run visible delta from `cudaMemGetInfo` is not explained by MMSE buffers alone.
-- It likely includes CUDA runtime state, allocator retention, WDDM/driver residency behavior, and profiling side effects.
-- Therefore, the code-level buffer accounting is the reliable MMSE working-set estimate; `cudaMemGetInfo` should be treated as whole-context residency, not pure algorithm storage.
+- 静态 MMSE device buffers 约为 `3.59 MiB`
+- `cudaMemGetInfo` 给出的更大运行后增量，并不能只由 MMSE buffers 本身解释
+- 它很可能同时包含 CUDA runtime 状态、allocator 保留、WDDM / driver 常驻行为，以及 profiling 副作用
+- 因此，代码级 buffer accounting 才是可信的 MMSE 工作集估计；`cudaMemGetInfo` 更适合理解整个 context 常驻量，而不是纯算法存储
 
-## Register / Shared / Local Memory Summary
+## 寄存器 / Shared / Local Memory 摘要
 
-| Kernel                 | Registers/thread | Static shared | Local bytes/thread | Notes                                                              |
-| ---------------------- | ---------------: | ------------: | -----------------: | ------------------------------------------------------------------ |
-| `estimate_stub_kernel` |               54 |           0 B |           40,000 B | very large local memory footprint due to large thread-local arrays |
-| `equalize_stub_kernel` |               64 |           0 B |                0 B | occupancy limited by register count                                |
+| Kernel                 | Registers/thread | Static shared | Local bytes/thread | 说明                                                  |
+| ---------------------- | ---------------: | ------------: | -----------------: | ----------------------------------------------------- |
+| `estimate_stub_kernel` |               54 |           0 B |           40,000 B | 由于大规模 thread-local 数组，local memory 足迹非常大 |
+| `equalize_stub_kernel` |               64 |           0 B |                0 B | occupancy 主要受寄存器数限制                          |
 
-Interpretation:
+解释：
 
-- `estimate_stub_kernel` spills heavy temporary state into local memory because it declares large per-thread arrays while launching only one CUDA thread.
-- `equalize_stub_kernel` is comparatively compact, and its occupancy limit is register-driven rather than shared-memory-driven.
+- `estimate_stub_kernel` 因为只发射一个 CUDA thread，却声明了大规模逐线程临时数组，所以大量临时状态被 spill 到 local memory
+- `equalize_stub_kernel` 相对紧凑，occupancy 限制主要来自寄存器，而不是 shared memory
 
-## Output Artifacts
+## 输出产物
 
-Generated files:
+生成文件：
 
-- baseline profile text:
+- 基线 profile 文本：
   - `G:\MMSE_CPP\build\mmse_cuda_profile_output.txt`
-- runtime-sampled profile text:
+- 带运行时采样的 profile 文本：
   - `G:\MMSE_CPP\build\mmse_cuda_profile_runtime_output.txt`
-- runtime `nvidia-smi` samples:
+- 运行时 `nvidia-smi` 采样：
   - `G:\MMSE_CPP\build\nvidia_smi_samples.csv`
-- Nsight Compute reports:
+- Nsight Compute 报告：
   - `G:\MMSE_CPP\build\ncu_equalize_report.ncu-rep`
   - `G:\MMSE_CPP\build\ncu_estimate_report.ncu-rep`
 
-## Overall Conclusion
+## 总体结论
 
-The current algorithm implementation is functionally runnable on GPU, but performance is dominated by an extremely under-parallelized estimate stage.
+当前算法实现已经可以在 GPU 上功能性运行，但性能完全受一个严重欠并行化的 estimate 阶段支配。
 
-Current measured performance:
+当前测得性能：
 
-- `~12.07 ms` per `1 ms` LTE subframe
-- `~120.71 ms` per `10 ms` aggregate frame
-- `~1209.79 ms` per `100 ms` aggregate window
+- 每个 LTE `1 ms` 子帧约 `12.07 ms`
+- 每个 `10 ms` 聚合窗口约 `120.71 ms`
+- 每个 `100 ms` 聚合窗口约 `1209.79 ms`
 
-The main bottleneck is not the equalization kernel. It is the estimate kernel, which currently runs with:
+主要瓶颈不是 equalization kernel，而是 estimate kernel，它当前的运行形态是：
 
 - `1 block`
 - `1 thread`
 - `18.85 ms` kernel time
 - `2.08%` achieved occupancy
 
-If the goal is real-time or near-real-time LTE processing, the first engineering target should be:
+如果目标是实时或近实时 LTE 处理，第一优先级工程目标应该是：
 
-1. parallelize `estimate_stub_kernel`
-2. remove thread-local large arrays from the single-thread estimate path
-3. re-measure before changing the equalization kernel
+1. 并行化 `estimate_stub_kernel`
+2. 去掉单线程 estimate 路径中的大规模 thread-local 数组
+3. 在动 equalization kernel 之前先重新测量

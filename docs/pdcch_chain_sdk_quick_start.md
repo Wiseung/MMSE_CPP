@@ -1,50 +1,49 @@
-# PDCCH Chain SDK Quick Start
+# PDCCH Chain SDK 快速开始
 
-This page is the fastest path to integrate the LTE PDCCH channel-estimation and MMSE equalization
-SDK exported by:
+本页是集成 LTE PDCCH 信道估计与 MMSE 均衡 SDK 的最快入口。该 SDK 由以下头文件导出：
 
 ```cpp
 #include "mmse/pdcch_chain_sdk.h"
 ```
 
-Current interface version:
+当前接口版本：
 
 - `PDCCH Chain SDK v1`
 
-Related pages:
+相关页面：
 
-- [LTE Equalized Channel SDK Documentation](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
-- [Documentation Index](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)
-- [API Reference](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
-- [Versioning Policy](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
+- [LTE Equalized Channel SDK 文档](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
+- [文档首页](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)
+- [API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
+- [版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
 
-## Scope
+## 作用范围
 
-The SDK does:
+SDK 当前提供：
 
-- LTE PDCCH control-region RE extraction
-- CRS-based channel estimation
-- MMSE equalization
-- per-RE soft-symbol and SINR output
-- additive 2Tx transmit-diversity de-mapping through `run_pdcch_td(...)`
+- LTE PDCCH 控制区 RE 提取
+- 基于 CRS 的信道估计
+- MMSE 均衡
+- 按 RE 输出软符号和 SINR
+- 通过 `run_pdcch_td(...)` 新增支持 2Tx 发射分集去映射
 
-The SDK does not do:
+SDK 当前不提供：
 
-- PCFICH decoding
-- PHICH decoding
-- REG/CCE regrouping
-- blind detection
-- channel decoding
+- PCFICH 译码
+- PHICH 译码
+- REG/CCE 重组
+- 盲检索
+- 信道译码
 
-## Minimal Flow
+## 最小流程
 
-1. Upstream prepares one `mmse::pdcch::FrontendPdcchIndication`.
-2. Caller converts it into `mmse::PdcchMmseInput`.
-3. Caller allocates one `mmse::PdcchMmseOutputView` and one `mmse::PdcchMmseResult`.
-4. Caller runs `run_pdcch(...)`.
-5. Caller packs output into `mmse::pdcch::BackendPdcchEqualizedIndication`.
+1. 上游准备一个 `mmse::pdcch::FrontendPdcchIndication`
+2. 调用方把它转换成 `mmse::PdcchMmseInput`
+3. 调用方分配一个 `mmse::PdcchMmseOutputView` 和一个 `mmse::PdcchMmseResult`
+4. 调用 `run_pdcch(...)`
+5. 把输出打包成 `mmse::pdcch::BackendPdcchEqualizedIndication`
 
-## Minimal Example
+## 最小示例
 
 ```cpp
 #include "mmse/pdcch_chain_sdk.h"
@@ -99,17 +98,18 @@ mmse::pdcch::BackendPdcchEqualizedIndication backend =
     mmse::pdcch::make_backend_pdcch_equalized_indication(meta, out);
 ```
 
-## 2Tx TD Example
+## 2Tx TD 示例
 
-For `2 Tx port` LTE PDCCH transmit diversity, keep the same `FrontendPdcchIndication` and
-`PdcchMmseInput`, but allocate the additive TD output surface instead of the legacy single-RE one.
+对于 `2 Tx port` 的 LTE PDCCH 发射分集场景，可以继续使用同一个
+`FrontendPdcchIndication` 和 `PdcchMmseInput`，但输出面需要改为新增的 TD 接口，
+而不是传统的单 RE 接口。
 
-Capacity rule:
+容量规则：
 
 - `capacity_symbols >= expected_n_soft_symbols`
-- for the current control-region TD implementation, `expected_n_soft_symbols` equals the number of
-  valid control-region RE after CRS and reserved-RE exclusion
-- each adjacent RE pair produces two QPSK soft symbols, so `meta.n_symbols == meta.n_source_re`
+- 在当前控制区 TD 实现下，`expected_n_soft_symbols` 等于扣除 CRS 和 reserved-RE 后的
+  有效控制区 RE 数
+- 每一对相邻 RE 会生成两个 QPSK 软符号，因此 `meta.n_symbols == meta.n_source_re`
 
 ```cpp
 #include "mmse/pdcch_chain_sdk.h"
@@ -168,12 +168,13 @@ mmse::pdcch::BackendPdcchTdEqualizedIndication backend =
     mmse::pdcch::make_backend_pdcch_td_equalized_indication(meta, out);
 ```
 
-Each `backend.x_hat_re[i] / x_hat_im[i] / sinr[i]` is one decoded QPSK soft symbol. The two source
-REs used to produce that symbol are `backend.re_grid_indices0[i]` and `backend.re_grid_indices1[i]`.
+其中 `backend.x_hat_re[i] / x_hat_im[i] / sinr[i]` 表示一个译码后的 QPSK 软符号，
+而生成该符号用到的两个源 RE 则分别位于 `backend.re_grid_indices0[i]` 和
+`backend.re_grid_indices1[i]`。
 
-## Upstream Requirements
+## 上游要求
 
-Upstream must provide:
+上游必须提供：
 
 - `sfn_subframe`
 - `cell_id`
@@ -184,29 +185,30 @@ Upstream must provide:
 - `prb_bitmap`
 - `control_subframe`
 - `reserved_control_res`
-- optional chain metadata through `PdcchChainMetadata`
+- 通过 `PdcchChainMetadata` 传入的可选链路元数据
 
-Important rule:
+重要规则：
 
-- `reserved_control_res` should contain non-PDCCH control REs such as `PCFICH` and `PHICH`
-- CRS REs should not be listed there because the SDK excludes CRS internally
-- if upstream already knows the occupied REs, it can still fill `reserved_control_res` directly
-- for the current 20 MHz FDD normal-CP boundary, callers can also use
-  explicit shared `LteControlSubframeContext` plus `PhichReservationConfig`
-- in TDD mode, `mi` must match the selected `subframe_ctx.ul_dl_config + subframe_ctx.subframe`
-- for extended PHICH duration, `TDD subframe 1/6` special-case is selected automatically
-- true `MBSFN` subframes should be marked through `subframe_ctx.kind = kMbsfn`
-- for the current 20 MHz FDD/TDD normal-CP helper boundary, callers can also use
-  `append_pcfich_reserved_control_re_list(...)` and
-  `append_phich_reserved_control_re_list(...)` before `make_pdcch_mmse_input(...)`
+- `reserved_control_res` 应该只包含非 PDCCH 控制 RE，例如 `PCFICH` 和 `PHICH`
+- CRS RE 不应显式写入，因为 SDK 会在内部自动排除 CRS
+- 如果上游已经知道被占用的 RE，也可以直接手工填充 `reserved_control_res`
+- 对于当前 20 MHz FDD normal-CP 边界，调用方也可以使用显式共享的
+  `LteControlSubframeContext` 和 `PhichReservationConfig`
+- 在 TDD 模式下，`mi` 必须和所选 `subframe_ctx.ul_dl_config + subframe_ctx.subframe` 匹配
+- 对 extended PHICH duration，`TDD subframe 1/6` 特例会自动选中
+- 真实 `MBSFN` 子帧应通过 `subframe_ctx.kind = kMbsfn` 显式标记
+- 对当前 20 MHz FDD/TDD normal-CP helper 边界，调用方也可以在
+  `make_pdcch_mmse_input(...)` 之前先调用
+  `append_pcfich_reserved_control_re_list(...)` 和
+  `append_phich_reserved_control_re_list(...)`
 
-## Downstream Handoff
+## 下游透传
 
-Recommended downstream handoff object:
+推荐的下游透传对象：
 
 - `mmse::pdcch::BackendPdcchEqualizedIndication`
 
-Important fields:
+重点字段：
 
 - `x_hat_re`
 - `x_hat_im`
@@ -214,7 +216,7 @@ Important fields:
 - `re_grid_indices`
 - `chain`
 
-For `2 Tx port` transmit-diversity PDCCH, use the additive TD surface instead:
+对于 `2 Tx port` 发射分集 PDCCH，请改用新增 TD 接口面：
 
 - `mmse::PdcchTdMmseOutputView`
 - `mmse::PdcchTdMmseResult`
@@ -222,22 +224,22 @@ For `2 Tx port` transmit-diversity PDCCH, use the additive TD surface instead:
 - `mmse::MmseEqualizerGpuContext::run_pdcch_td(...)`
 - `mmse::pdcch::BackendPdcchTdEqualizedIndication`
 
-That surface returns one soft symbol per decoded QPSK symbol, plus source RE-pair mapping through
-`re_grid_indices0[i]` and `re_grid_indices1[i]`.
+该接口面会对每个译码后的软符号返回一组源 RE 对映射，
+对应字段是 `re_grid_indices0[i]` 和 `re_grid_indices1[i]`。
 
-Downstream can recover LTE coordinates with:
+下游如果需要恢复 LTE 坐标，可以这样做：
 
 ```cpp
 const auto coord = mmse::pdcch::decode_re_grid_index(backend.re_grid_indices[i]);
 ```
 
-## Support Boundary
+## 支持边界
 
-Current validated support:
+当前已验证的支持范围：
 
-- LTE only
-- 20 MHz only
-- normal CP only
+- 仅 LTE
+- 仅 20 MHz
+- 仅 normal CP
 - `n_rx_ant == 2`
 - `n_symbols == 14`
 - `n_subcarriers == 1200`
@@ -245,28 +247,28 @@ Current validated support:
 - `n_layers == 1`
 - `mod_order == 2`
 - `tx_mode == 1 or 2`
-- `run_pdcch(...)` with `n_tx_ports == 1`
-- `run_pdcch_td(...)` with `n_tx_ports == 2`
+- `run_pdcch(...)` 对应 `n_tx_ports == 1`
+- `run_pdcch_td(...)` 对应 `n_tx_ports == 2`
 
-Important non-support:
+当前明确不支持：
 
-- helper-based automatic PHICH reservation does not imply PHICH decoding support
+- helper 层自动 `PHICH` 保留不等于支持 `PHICH` 译码
 
-## Build and Demo
+## 构建与 Demo
 
-Compilable demo source:
+可编译 demo 源文件：
 
 - [pdcch_module_demo.cpp](/G:/MMSE_CPP/bench/pdcch_module_demo.cpp)
 
-Build and run:
+构建并运行：
 
 ```powershell
 cmake --build build --config Debug --target pdcch_module_demo
 .\build\Debug\pdcch_module_demo.exe
 ```
 
-## Next Reading
+## 下一步阅读
 
-- [API Reference](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
-- [Versioning Policy](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
-- [Integration Example](/G:/MMSE_CPP/docs/pdcch_module_api_example.md)
+- [API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
+- [版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
+- [集成示例](/G:/MMSE_CPP/docs/pdcch_module_api_example.md)

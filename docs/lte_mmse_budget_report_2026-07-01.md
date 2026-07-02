@@ -1,143 +1,139 @@
-# LTE MMSE Budget Report (2026-07-01)
+﻿# LTE MMSE 预算报告（2026-07-01）
 
-## Scope
+## 作用范围
 
-This report answers one specific question for the current `G:\MMSE_CPP` checkout:
+本报告回答当前 `G:\MMSE_CPP` checkout 下的一个明确问题：
 
-- if one `10 ms` LTE processing window needs to complete decoding for the full physical-channel
-  set (`PBCH`, `PDSCH`, `PDCCH`, `PCFICH`),
-- and the current CE/MMSE module may be called `5-6` times inside that window,
-- how much latency budget should this module consume,
-- and does the next optimization step still belong inside the CE/MMSE kernel path, or in the
-  higher-level call topology.
+- 如果一个 `10 ms` LTE 处理窗口需要完成完整物理信道集合
+  （`PBCH`、`PDSCH`、`PDCCH`、`PCFICH`）的译码，
+- 并且当前 CE/MMSE 模块可能会在该窗口内被调用 `5~6` 次，
+- 那么这个模块本身应消耗多少时延预算，
+- 以及下一步优化应该继续放在 CE/MMSE kernel 路径内，还是应转向更高层调用拓扑。
 
-## Interpretation Boundary
+## 解释边界
 
-Important boundary for this report:
+本报告的重要边界如下：
 
-- the current public MMSE API still processes one LTE `1 ms` subframe per call
-- therefore any `10 ms` judgment must be reasoned as repeated `1 ms` subframe calls unless the
-  interface changes
-- this report uses the current wrapper surfaces:
+- 当前公开 MMSE API 仍然是“一次调用处理一个 LTE `1 ms` 子帧”
+- 因而任何 `10 ms` 判断都必须按“重复调用 `1 ms` 子帧接口”的方式推导，除非接口本身发生变化
+- 本报告使用当前 wrapper 接口面：
   - `run_pbch(...)`
   - `run_pcfich(...)`
   - `run_pdcch(...)`
-  - generic `run(...)` for `PDSCH`
+  - `PDSCH` 对应的通用 `run(...)`
 
-## Current Chain Understanding
+## 当前链路认识
 
-At the current repository boundary, the MMSE module covers:
+在当前仓库边界下，MMSE 模块覆盖：
 
-- RE extraction
-- CRS-based channel estimation
-- MMSE equalization
-- equalized soft-symbol and `SINR` handoff
+- RE 提取
+- 基于 CRS 的信道估计
+- MMSE 均衡
+- 均衡后软符号与 `SINR` 透传
 
-It does not cover the downstream heavy decode stages such as:
+它不覆盖以下这些下游重译码阶段：
 
-- `PBCH` descrambling / rate recovery / convolutional decode / `MIB`
-- `PDCCH` blind search / channel decode / `DCI`
-- `PDSCH` descrambling / rate recovery / turbo decode / `MAC PDU`
-- `PCFICH` final `CFI` decode
+- `PBCH` 解扰 / 速率恢复 / 卷积译码 / `MIB`
+- `PDCCH` 盲检索 / 信道译码 / `DCI`
+- `PDSCH` 解扰 / 速率恢复 / Turbo 译码 / `MAC PDU`
+- `PCFICH` 最终 `CFI` 译码
 
-So the CE/MMSE block must leave enough time budget for those later stages.
+因此，CE/MMSE 这一块必须给后续译码阶段留出足够的时延预算。
 
-## Measured Current Baseline
+## 当前测量基线
 
 ### 1. Full-band GPU profile
 
-Command used:
+使用命令：
 
 ```powershell
 .\build\Release\mmse_cuda_profile.exe --warmup-subframes 5 --iters-10ms 5 --iters-100ms 0
 ```
 
-Measured current full-band `1 ms` subframe cost on this machine:
+在本机上测得的 full-band `1 ms` 子帧成本：
 
 - `timing.avg_10ms_per_subframe_ms = 0.346782 ms`
 
-Measured host/GPU split:
+测得的 host/GPU 拆分：
 
 - `host.phase.total_host_us = 308.93 us`
 - `host.phase.estimate_gpu_us = 73.86 us`
 - `host.phase.equalize_gpu_us = 6.66 us`
 - `host.phase.stream_gpu_us = 157.44 us`
 
-Current implication:
+当前含义：
 
-- `equalize` is already a very small fraction of the total
-- `estimate` is no longer the old `10+ ms` serialized bottleneck from the earlier stub
-- the current cost is dominated more by per-call framework / staging / synchronization overhead than
-  by the equalization math itself
+- `equalize` 已经只占总开销中的很小一部分
+- `estimate` 不再是早期 stub 版本中 `10+ ms` 的串行大瓶颈
+- 当前开销更多由每次调用的框架性开销、staging 和同步主导，而不是均衡数学本身
 
-### 2. Per-channel wrapper benchmark
+### 2. 分信道 wrapper benchmark
 
-Benchmark target added for this report:
+本报告新增的 benchmark 目标：
 
 - [mmse_channel_budget.cpp](G:\MMSE_CPP\bench\mmse_channel_budget.cpp)
 
-Command used:
+使用命令：
 
 ```powershell
 cmd /c "G:\MMSE_CPP\build\Release\mmse_channel_budget.exe"
 ```
 
-#### CPU path: independent-call baseline
+#### CPU 路径：独立调用基线
 
-| Metric                |      Average |         P95 |
-| --------------------- | -----------: | ----------: |
-| `PBCH`                |  `272.96 us` |  `288.7 us` |
-| `PCFICH`              |  `268.95 us` |  `287.6 us` |
-| `PDCCH`               |  `292.56 us` |  `310.2 us` |
-| `PDSCH`               |  `387.29 us` |  `437.9 us` |
-| six independent calls | `1916.21 us` | `2088.4 us` |
+| 指标             |       平均值 |         P95 |
+| ---------------- | -----------: | ----------: |
+| `PBCH`           |  `272.96 us` |  `288.7 us` |
+| `PCFICH`         |  `268.95 us` |  `287.6 us` |
+| `PDCCH`          |  `292.56 us` |  `310.2 us` |
+| `PDSCH`          |  `387.29 us` |  `437.9 us` |
+| 六次独立调用总计 | `1916.21 us` | `2088.4 us` |
 
-#### GPU path: independent-call baseline
+#### GPU 路径：独立调用基线
 
-| Metric                |      Average |         P95 |
-| --------------------- | -----------: | ----------: |
-| `PBCH`                |  `357.27 us` |  `407.2 us` |
-| `PCFICH`              |  `354.43 us` |  `435.2 us` |
-| `PDCCH`               |  `358.46 us` |  `404.7 us` |
-| `PDSCH`               |  `418.31 us` |  `484.1 us` |
-| six independent calls | `2262.90 us` | `2473.5 us` |
+| 指标             |       平均值 |         P95 |
+| ---------------- | -----------: | ----------: |
+| `PBCH`           |  `357.27 us` |  `407.2 us` |
+| `PCFICH`         |  `354.43 us` |  `435.2 us` |
+| `PDCCH`          |  `358.46 us` |  `404.7 us` |
+| `PDSCH`          |  `418.31 us` |  `484.1 us` |
+| 六次独立调用总计 | `2262.90 us` | `2473.5 us` |
 
-Observed current extracted RE counts:
+当前观测到的提取 RE 数：
 
 - `PBCH`: `240 RE`
 - `PCFICH`: `16 RE`
 - `PDCCH`: `3228 RE`
 - `PDSCH`: `14400 RE / layer`
 
-## What These Numbers Mean
+## 这些数字意味着什么
 
-### 1. The CE/MMSE kernel path is already in a usable range
+### 1. CE/MMSE kernel 路径已经进入可用区间
 
-The old question was whether the CE/MMSE math itself still needed major kernel-level work.
+之前的问题是：CE/MMSE 数学路径本身是否还需要大规模 kernel 级优化。
 
-For the current code and this machine, the answer is:
+对于当前代码和本机而言，答案是：
 
-- not as the first priority
+- 不是第一优先级
 
-Why:
+原因：
 
-- one full-band `1 ms` GPU call is already around `0.35 ms`
-- even a large `PDSCH` wrapper call is only around `0.42 ms`
-- `equalize` itself is only single-digit microseconds in the profiler
+- 一个 full-band `1 ms` GPU 调用现在大约只有 `0.35 ms`
+- 即使是较大的 `PDSCH` wrapper 调用也只有 `0.42 ms` 左右
+- profiler 里 `equalize` 本体已经只有个位数微秒
 
-This means further inner-kernel micro-optimization is not the highest-leverage next step.
+这意味着继续做 kernel 内部微雕，不是当前收益最高的下一步。
 
-### 2. The current problem is the number of independent calls
+### 2. 当前真正的问题是独立调用次数过多
 
-The current six-call aggregate is:
+当前六次调用聚合为：
 
-- average `2.263 ms`
-- p95 `2.474 ms`
+- 平均 `2.263 ms`
+- P95 `2.474 ms`
 
-That is already much smaller than the old `12 ms / subframe` baseline, but it is still too large
-for a clean full-chain `10 ms` decode budget.
+这已经远好于早期 `12 ms / subframe` 的基线，但对于一个干净的全链路 `10 ms` 译码预算来说仍然偏大。
 
-The main issue is repeated:
+主要问题在于多次重复了：
 
 - layout build
 - grid/meta packing
@@ -145,147 +141,143 @@ The main issue is repeated:
 - channel estimation launch/state handling
 - output staging / synchronization
 
-across multiple physical-channel wrapper calls that live on the same LTE subframe context.
+而这些工作都发生在同一个 LTE 子帧上下文上的多个物理信道 wrapper 调用之间。
 
-## Recommended LTE 10 ms Budget
+## 推荐的 LTE 10 ms 预算
 
-### Recommended CE/MMSE budget for the full 10 ms decode window
+### 针对完整 10 ms 译码窗口的推荐 CE/MMSE 预算
 
-For a `10 ms` end-to-end LTE physical-channel decode target, I recommend:
+对于 `10 ms` 端到端 LTE 物理信道译码目标，我建议：
 
-- ideal CE/MMSE budget: `<= 1.0 ms`
-- acceptable CE/MMSE upper bound: `<= 1.5 ms`
-- do not accept long-term design above: `1.5 ms`
+- 理想 CE/MMSE 预算：`<= 1.0 ms`
+- 可接受的 CE/MMSE 上限：`<= 1.5 ms`
+- 长期设计不应接受高于：`1.5 ms`
 
-Reasoning:
+推导依据：
 
-- the current measured six-call path at `~2.26 ms` would consume about `22.6%` of the total
-  `10 ms` wall-clock budget
-- that is too much for a block that still leaves all heavy channel-decoding work downstream
-- a `<= 1.0 ms` target keeps the MMSE block near `10%` of the total frame budget
-- a `<= 1.5 ms` upper bound still leaves reasonable space for control and data-channel decoding
+- 当前测得的六次调用路径 `~2.26 ms`，会占用整个 `10 ms` 墙钟预算的大约 `22.6%`
+- 对一个后面还要承担大量信道译码的模块来说，这个占比太高
+- `<= 1.0 ms` 可以把 MMSE 块压到总帧预算的大约 `10%`
+- `<= 1.5 ms` 仍然能给控制信道和数据信道译码留下相对合理的空间
 
-### Required improvement from current measured state
+### 相对当前状态需要的改进量
 
-Using the measured GPU six-call aggregate:
+使用当前测得的 GPU 六次调用聚合值：
 
-- current average: `2.263 ms`
-- target average: `<= 1.0 ms`
-  - required reduction: about `55.8%`
-  - required speedup: about `2.26x`
-- upper-bound average: `<= 1.5 ms`
-  - required reduction: about `33.7%`
-  - required speedup: about `1.51x`
+- 当前平均：`2.263 ms`
+- 目标平均：`<= 1.0 ms`
+  - 需要下降约 `55.8%`
+  - 需要约 `2.26x` 提速
+- 上限平均：`<= 1.5 ms`
+  - 需要下降约 `33.7%`
+  - 需要约 `1.51x` 提速
 
-## Recommended Next Optimization Direction
+## 推荐的下一步优化方向
 
-### Primary recommendation
+### 主推荐
 
-Do **not** return first to kernel micro-surgery.
+第一步**不要**回到 kernel 内部微雕。
 
-Do this first instead:
+优先做的是：
 
-- estimate once per LTE subframe
-- reuse that estimate across all channel-specific extraction/equalization paths
+- 每个 LTE 子帧只做一次 channel estimate
+- 在所有信道特定的提取 / 均衡路径之间复用这一份 estimate
 
-### Why this is the right next step
+### 为什么这是正确方向
 
-Inside one LTE subframe, `PBCH`, `PCFICH`, `PDCCH`, and `PDSCH` are not independent radio scenes.
-They share:
+在同一个 LTE 子帧里，`PBCH`、`PCFICH`、`PDCCH` 和 `PDSCH` 并不是彼此独立的无线场景。它们共享：
 
-- the same FFT grid
-- the same CRS context
-- the same cell id
-- the same receive antennas
-- the same subframe timing
+- 同一份 FFT 网格
+- 同一套 CRS 上下文
+- 同一个 cell id
+- 同一组接收天线
+- 同一个子帧时序
 
-So the highest-leverage design is not `5-6` fully independent MMSE wrapper calls, but something
-closer to:
+所以收益最高的设计，不应该是 `5~6` 次完全独立的 MMSE wrapper 调用，而应该更接近：
 
-1. stage the subframe once
-2. estimate the channel once
-3. reuse the estimate for:
+1. 子帧只 stage 一次
+2. channel estimate 只做一次
+3. 这份 estimate 复用于：
    - `PBCH`
    - `PCFICH`
    - `PDCCH`
    - `PDSCH`
-4. only do per-channel RE layout / equalized output extraction afterward
+4. 后面只保留每个信道自身的 RE layout / equalized output extraction
 
-### Practical target for the next design cut
+### 下一版设计的实际目标
 
-The next implementation cut should aim to reduce:
+下一轮实现应优先减少：
 
-- repeated channel-estimation work
-- repeated host/device setup and synchronization
+- 重复的 channel-estimation 工作
+- 重复的 host/device setup 和同步
 
-and validate that the aggregate path moves from:
+并验证聚合路径是否能从：
 
 - `~2.26 ms`
 
-down to:
+降到：
 
-- `<= 1.5 ms` first
-- then `<= 1.0 ms` if downstream decode budget remains tight
+- 先到 `<= 1.5 ms`
+- 再视下游译码预算是否仍紧张，继续冲到 `<= 1.0 ms`
 
-## Suggested Engineering Milestones
+## 建议的工程里程碑
 
 ### Milestone 1
 
-Introduce an internal subframe-scoped CE artifact:
+引入一个“子帧作用域”的 CE 工件：
 
-- one staged grid
-- one channel-estimate result
-- one reusable per-subframe runtime state
+- 一份 staged grid
+- 一份 channel-estimate 结果
+- 一份可复用的 per-subframe 运行时状态
 
 ### Milestone 2
 
-Expose internal multi-channel reuse flow:
+暴露内部的多信道复用流程：
 
-- `PBCH` extract from cached estimate
-- `PCFICH` extract from cached estimate
-- `PDCCH` extract from cached estimate
-- `PDSCH` extract from cached estimate
+- `PBCH` 从缓存 estimate 提取
+- `PCFICH` 从缓存 estimate 提取
+- `PDCCH` 从缓存 estimate 提取
+- `PDSCH` 从缓存 estimate 提取
 
 ### Milestone 3
 
-Re-benchmark two shapes:
+重新 benchmark 两种形态：
 
-- current independent-call path
-- shared-estimate multi-channel path
+- 当前独立调用路径
+- shared-estimate 多信道路径
 
-and compare:
+并比较：
 
-- total average
-- p95
-- host-side staging cost
-- estimate reuse win
+- 总平均值
+- P95
+- host 侧 staging 成本
+- estimate 复用收益
 
 ### Milestone 4
 
-Only if the shared-estimate path still stays above `1.5 ms`, return to:
+只有当 shared-estimate 路径仍高于 `1.5 ms` 时，才回头做：
 
-- estimate-stage kernel optimization
-- synchronization trimming
-- output staging reduction
+- estimate-stage kernel 优化
+- 同步裁剪
+- 输出 staging 缩减
 
-## Final Judgment
+## 最终判断
 
-For the current machine and current code:
+对于当前机器和当前代码：
 
-- the CE/MMSE module is already good enough at the **single-call kernel/math** level
-- it is **not yet good enough** at the **multi-call chain-level budget** level
+- CE/MMSE 模块在**单次调用的 kernel / 数学层面**已经足够好
+- 但在**多次调用的链路级预算层面**还不够好
 
-So the next target is:
+因此下一步目标应该是：
 
-- **not** “make one call faster at any cost”
-- **yes** “bring the full `5-6` call aggregate below `1.5 ms`, and preferably near `1.0 ms`”
+- **不是** “不惜一切代价把单次调用再压快”
+- **而是** “把完整 `5~6` 次调用聚合压到 `1.5 ms` 以下，最好接近 `1.0 ms`”
 
-That is the right optimization target for a `10 ms` full physical-channel decode goal.
+这才是面向 `10 ms` 物理信道全链路译码目标时正确的优化方向。
 
-## Refactor Outcome Update
+## Refactor 结果更新
 
-The subframe-scoped shared-estimate refactor was then implemented and remeasured on the same
-machine using one same-subframe representative six-call shape:
+随后，子帧作用域的 shared-estimate refactor 被实现，并在同一台机器上针对一个“同子帧六次调用”的代表性形态重新测量：
 
 - `PBCH`
 - `PCFICH`
@@ -294,72 +286,71 @@ machine using one same-subframe representative six-call shape:
 - `PDCCH`
 - `PDSCH`
 
-### Shared-estimate benchmark result
+### Shared-estimate benchmark 结果
 
-Source:
+数据来源：
 
 - [mmse_channel_budget.cpp](G:\MMSE_CPP\bench\mmse_channel_budget.cpp)
 
-Measured result after the refactor:
+Refactor 后测得：
 
-#### CPU path: shared-estimate same-subframe shape
+#### CPU 路径：同子帧 shared-estimate 形态
 
-| Metric             |     Average |        P95 |
-| ------------------ | ----------: | ---------: |
-| `PBCH`             |  `74.54 us` |  `89.8 us` |
-| `PCFICH`           |  `74.15 us` |  `93.1 us` |
-| `PDCCH`            | `101.28 us` | `125.0 us` |
-| `PDSCH`            | `175.76 us` | `202.8 us` |
-| six-call aggregate | `719.70 us` | `803.1 us` |
+| 指标     |      平均值 |        P95 |
+| -------- | ----------: | ---------: |
+| `PBCH`   |  `74.54 us` |  `89.8 us` |
+| `PCFICH` |  `74.15 us` |  `93.1 us` |
+| `PDCCH`  | `101.28 us` | `125.0 us` |
+| `PDSCH`  | `175.76 us` | `202.8 us` |
+| 六次聚合 | `719.70 us` | `803.1 us` |
 
-#### GPU path: shared-estimate same-subframe shape
+#### GPU 路径：同子帧 shared-estimate 形态
 
-| Metric             |      Average |         P95 |
-| ------------------ | -----------: | ----------: |
-| `PBCH`             |  `155.01 us` |  `199.8 us` |
-| `PCFICH`           |  `146.77 us` |  `197.7 us` |
-| `PDCCH`            |  `157.41 us` |  `200.8 us` |
-| `PDSCH`            |  `215.49 us` |  `270.3 us` |
-| six-call aggregate | `1020.30 us` | `1162.7 us` |
+| 指标     |       平均值 |         P95 |
+| -------- | -----------: | ----------: |
+| `PBCH`   |  `155.01 us` |  `199.8 us` |
+| `PCFICH` |  `146.77 us` |  `197.7 us` |
+| `PDCCH`  |  `157.41 us` |  `200.8 us` |
+| `PDSCH`  |  `215.49 us` |  `270.3 us` |
+| 六次聚合 | `1020.30 us` | `1162.7 us` |
 
-### Before vs after
+### 前后对比
 
-GPU six-call aggregate moved from:
+GPU 六次调用聚合从：
 
-- before: `2262.90 us`
-- after: `1020.30 us`
+- 改前：`2262.90 us`
+- 改后：`1020.30 us`
 
-Improvement:
+改进幅度：
 
-- absolute reduction: `1242.60 us`
-- relative reduction: about `54.9%`
-- speedup: about `2.22x`
+- 绝对下降：`1242.60 us`
+- 相对下降：约 `54.9%`
+- 加速比：约 `2.22x`
 
-### What caused the win
+### 收益来源
 
-The win came from eliminating repeated same-subframe work:
+这次收益主要来自消除同子帧内重复工作：
 
-- repeated grid staging / cache preparation
-- repeated channel-estimate generation
-- repeated `sigma2` update path
+- 重复的 grid staging / cache preparation
+- 重复的 channel-estimate 生成
+- 重复的 `sigma2` 更新路径
 
-The win did **not** come from further equalizer kernel micro-optimization.
+收益**并不是**来自进一步的 equalizer kernel 微优化。
 
-### Final budget judgment after implementation
+### 实现后的最终预算判断
 
-The refactor now satisfies the phase-1 hard target:
+这次 refactor 已经满足 phase-1 的硬目标：
 
-- target: `gpu.six_calls.avg_us <= 1500`
-- result: `gpu.six_calls.avg_us = 1020.30`
+- 目标：`gpu.six_calls.avg_us <= 1500`
+- 实际：`gpu.six_calls.avg_us = 1020.30`
 
-It does not fully meet the stretch goal yet:
+但还没有完全达到 stretch goal：
 
-- stretch goal: `<= 1000 us`
-- current gap: about `20.3 us`
+- stretch goal：`<= 1000 us`
+- 当前差距：约 `20.3 us`
 
-Final judgment:
+最终判断：
 
-- the CE/MMSE module is now inside the acceptable `10 ms` full-chain budget range
-- the next optimization step no longer needs to be mandatory for schedule viability
-- if further work is desired, it should focus on the remaining host/device framework overhead rather
-  than on the equalization math itself
+- CE/MMSE 模块现在已经进入可接受的 `10 ms` 全链路预算范围
+- 下一步优化不再是 schedule 可行性的硬性要求
+- 如果还要继续做，应把重点放在剩余的 host/device 框架性开销，而不是 equalization 数学本体

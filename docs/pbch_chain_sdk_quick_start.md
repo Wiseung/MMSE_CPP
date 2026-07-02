@@ -1,47 +1,47 @@
-# PBCH Quick Start
+# PBCH 快速开始
 
-This page is the fastest path to integrate the LTE PBCH equalized-RE surface exported by:
+本页是集成 LTE PBCH equalized-RE 接口面的最快入口。该接口面由以下头文件导出：
 
 ```cpp
 #include "mmse/lte_chain_sdk.h"
 ```
 
-Current interface version:
+当前接口版本：
 
 - `LTE Equalized Channel SDK v1`
 
-Related pages:
+相关页面：
 
-- [LTE Equalized Channel SDK Documentation](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
-- [LTE Downlink Channel Decode Overview](/G:/MMSE_CPP/docs/lte_pdcch_pdsch_channel_decode_overview.md)
+- [LTE Equalized Channel SDK 文档](/G:/MMSE_CPP/docs/lte_equalized_channel_sdk_interface.md)
+- [LTE 下行信道译码总览](/G:/MMSE_CPP/docs/lte_pdcch_pdsch_channel_decode_overview.md)
 
-## Scope
+## 作用范围
 
-The current PBCH surface does:
+当前 PBCH 接口面提供：
 
-- LTE PBCH RE extraction over the center `72` subcarriers
-- CRS-based channel estimation
-- MMSE equalization
-- caller-owned output view filling
-- backend DTO packing for downstream handoff
+- 面向中心 `72` 个子载波的 LTE PBCH RE 提取
+- 基于 CRS 的信道估计
+- MMSE 均衡
+- 由调用方持有的输出 view 填充
+- 面向下游透传的后端 DTO 打包
 
-The current PBCH surface does not do:
+当前 PBCH 接口面不提供：
 
-- PBCH descrambling
-- rate recovery
-- tail-biting convolutional decoding
-- CRC checking
-- MIB reconstruction
+- PBCH 解扰
+- 速率恢复
+- 尾咬卷积译码
+- CRC 检查
+- MIB 重建
 
-## Minimal Flow
+## 最小流程
 
-1. Upstream prepares one `mmse::pbch::FrontendPbchIndication`.
-2. Caller converts it into `mmse::PbchMmseInput`.
-3. Caller allocates one `mmse::PbchMmseOutputView` and one `mmse::PbchMmseResult`.
-4. Caller runs `run_pbch(...)`.
-5. Caller packs output into `mmse::pbch::BackendPbchEqualizedIndication`.
+1. 上游准备一个 `mmse::pbch::FrontendPbchIndication`
+2. 调用方把它转换成 `mmse::PbchMmseInput`
+3. 调用方分配一个 `mmse::PbchMmseOutputView` 和一个 `mmse::PbchMmseResult`
+4. 调用 `run_pbch(...)`
+5. 把结果打包为 `mmse::pbch::BackendPbchEqualizedIndication`
 
-## Minimal Example
+## 最小示例
 
 ```cpp
 #include "mmse/lte_chain_sdk.h"
@@ -85,30 +85,30 @@ mmse::pbch::BackendPbchEqualizedIndication backend =
     mmse::pbch::make_backend_pbch_equalized_indication(meta, out);
 ```
 
-## Upstream Requirements
+## 上游要求
 
-Upstream must provide:
+上游必须提供：
 
 - `sfn_subframe`
 - `cell_id`
 - `n_tx_ports`
 - `tx_mode`
-- one LTE downlink FFT grid through `PlanarGridViewF32`
+- 一份通过 `PlanarGridViewF32` 表示的 LTE 下行 FFT 网格
 
-The current wrapper internally fixes the PBCH extraction boundary to:
+当前 wrapper 内部把 PBCH 提取边界固定为：
 
-- center `6 PRB`
-- `4` OFDM symbols starting at symbol `7`
-- QPSK (`mod_order == 2`)
-- single equalized layer
+- 中心 `6 PRB`
+- 从 symbol `7` 开始的 `4` 个 OFDM symbol
+- QPSK（`mod_order == 2`）
+- 单层 equalized 输出
 
-## Downstream Handoff
+## 下游透传
 
-Recommended downstream handoff object:
+推荐下游透传对象：
 
 - `mmse::pbch::BackendPbchEqualizedIndication`
 
-Important fields:
+重点字段：
 
 - `x_hat_re`
 - `x_hat_im`
@@ -118,26 +118,26 @@ Important fields:
 - `n_prb`
 - `start_symbol`
 
-The output currently represents equalized PBCH RE only. Downstream PBCH decoding remains external.
+当前输出只表示 PBCH 的 equalized RE。后续 PBCH 译码仍然由下游外部完成。
 
-## Capacity Rule
+## 容量规则
 
-Caller must provide:
+调用方必须保证：
 
 - `capacity_re_per_layer >= expected_pbch_re`
 - `capacity_re_metadata >= expected_pbch_re`
 
-For the current LTE support boundary:
+在当前 LTE 支持边界下：
 
 - `expected_pbch_re == 240`
 
-## Support Boundary
+## 支持边界
 
-Current validated support:
+当前已验证的支持范围：
 
-- LTE only
-- 20 MHz only
-- normal CP only
+- 仅 LTE
+- 仅 20 MHz
+- 仅 normal CP
 - `n_rx_ant == 2`
 - `n_symbols == 14`
 - `n_subcarriers == 1200`
@@ -146,17 +146,17 @@ Current validated support:
 - `tx_mode == 1 or 2`
 - `n_tx_ports == 1 or 2`
 
-## Status Codes
+## 状态码
 
 - `MmseStatus::kOk`
-  - PBCH equalization completed successfully
+  - PBCH 均衡成功完成
 - `MmseStatus::kNotInitialized`
-  - context `init(...)` was not called first
+  - 尚未先调用 context `init(...)`
 - `MmseStatus::kInvalidArgument`
-  - grid shape, pointers, or PBCH wrapper inputs are invalid
+  - 网格形状、指针或 PBCH wrapper 输入非法
 - `MmseStatus::kUnsupportedConfig`
-  - request falls outside the current LTE PBCH support boundary
+  - 请求超出当前 LTE PBCH 支持边界
 - `MmseStatus::kBufferTooSmall`
-  - caller output capacity is smaller than the extracted PBCH RE count
+  - 调用方输出容量小于提取得到的 PBCH RE 数
 - `MmseStatus::kInternalError`
-  - runtime/internal transport failure
+  - 运行时 / 内部传输失败

@@ -1,91 +1,97 @@
-# LTE Equalized Channel SDK Documentation
+# LTE Equalized Channel SDK 文档
 
-This page is the stable documentation entrypoint for the LTE equalized-channel SDK exported by:
+本页是由以下头文件导出的 LTE equalized-channel SDK 的稳定文档入口：
 
 ```cpp
 #include "mmse/lte_chain_sdk.h"
 ```
 
-Current interface version:
+当前接口版本：
 
 - `LTE Equalized Channel SDK v1`
 
-Documentation set:
+文档集合：
 
-- [PBCH Quick Start](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md)
-- [PCFICH Quick Start and API Reference](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)
-- [PDCCH Subpage](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)
-- [PDCCH Quick Start](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
-- [PDCCH API Reference](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
-- [PDCCH Versioning Policy](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
-- [PDCCH Integration Example](/G:/MMSE_CPP/docs/pdcch_module_api_example.md)
+- [PBCH 快速开始](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md)
+- [PCFICH 快速开始与 API 参考](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)
+- [PDCCH 子页面](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)
+- [PDCCH 快速开始](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
+- [PDCCH API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
+- [PDCCH 版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
+- [PDCCH 集成示例](/G:/MMSE_CPP/docs/pdcch_module_api_example.md)
 
-## Scope
+## 作用范围
 
-The LTE equalized-channel SDK covers:
+当前 LTE equalized-channel SDK 覆盖：
 
-- LTE PBCH equalized RE extraction surface
-- LTE PDCCH control-region equalized RE extraction surface
-- LTE PCFICH equalized RE extraction surface
-- CRS-based channel estimation
-- MMSE equalization
-- caller-owned output views plus backend DTO packing
+- LTE PBCH 的 equalized RE 提取接口面
+- LTE PDCCH 控制区的 equalized RE 提取接口面
+- LTE PCFICH 的 equalized RE 提取接口面
+- 基于 CRS 的信道估计
+- MMSE 均衡
+- 由调用方持有输出 view，并支持后端 DTO 打包
 
-The current documentation set is still deepest on the `PDCCH` integration path. `PBCH` and
-`PCFICH` now share the same runtime and DTO style, but do not yet have standalone quick-start or
-field-reference pages.
+当前文档深度仍然主要集中在 `PDCCH` 集成路径上。`PBCH` 和 `PCFICH`
+现在已经共享同一套运行时与 DTO 风格，但尚未扩展出与 `PDCCH`
+同等深度的独立快速开始 / 字段级参考页面。
 
-## Recommended Reading Order
+## 推荐阅读顺序
 
-1. Read [LTE downlink overview](/G:/MMSE_CPP/docs/lte_pdcch_pdsch_channel_decode_overview.md) for
-   protocol context.
-2. Read [PBCH Quick Start](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md) when integrating the
-   PBCH equalized-RE surface.
-3. Read [PCFICH Quick Start and API Reference](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)
-   when integrating the PCFICH equalized-RE surface.
-4. Read [PDCCH Subpage](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md) for the most complete
-   channel-specific integration surface currently documented.
+1. 先阅读 [LTE 下行总览](/G:/MMSE_CPP/docs/lte_pdcch_pdsch_channel_decode_overview.md)，建立协议背景。
+2. 如果要集成 PBCH equalized-RE 接口，阅读 [PBCH 快速开始](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md)。
+3. 如果要集成 PCFICH equalized-RE 接口，阅读 [PCFICH 快速开始与 API 参考](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)。
+4. 如果要查看当前文档最完整的信道专页，阅读 [PDCCH 子页面](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)。
 
-## Public Header Layout
+## 公开头文件布局
 
-- unified LTE umbrella header:
+- 统一 LTE 总头文件：
   - `#include "mmse/lte_chain_sdk.h"`
-- PDCCH-only umbrella header:
+- 仅 PDCCH 总头文件：
   - `#include "mmse/pdcch_chain_sdk.h"`
 
-## Current Channel Surfaces
+## 当前信道接口面
 
 ### PBCH
 
-- frontend DTO namespace: `mmse::pbch`
-- low-level input/output: `PbchMmseInput`, `PbchMmseOutputView`, `PbchMmseResult`
-- runtime entrypoints:
+- 前端 DTO 命名空间：`mmse::pbch`
+- 低层输入 / 输出：
+  - `PbchMmseInput`
+  - `PbchMmseOutputView`
+  - `PbchMmseResult`
+- 运行时入口：
   - `MmseEqualizerCpuContext::run_pbch(...)`
   - `MmseEqualizerGpuContext::run_pbch(...)`
 
 ### PDCCH
 
-- frontend DTO namespace: `mmse::pdcch`
-- low-level input/output:
-  - `PdcchMmseInput`, `PdcchMmseOutputView`, `PdcchMmseResult`
-  - additive TD path: `PdcchTdMmseOutputView`, `PdcchTdMmseResult`
-- runtime entrypoints:
+- 前端 DTO 命名空间：`mmse::pdcch`
+- 低层输入 / 输出：
+  - `PdcchMmseInput`
+  - `PdcchMmseOutputView`
+  - `PdcchMmseResult`
+  - 新增 TD 路径：
+    - `PdcchTdMmseOutputView`
+    - `PdcchTdMmseResult`
+- 运行时入口：
   - `MmseEqualizerCpuContext::run_pdcch(...)`
   - `MmseEqualizerGpuContext::run_pdcch(...)`
-  - additive TD path:
+  - 新增 TD 路径：
     - `MmseEqualizerCpuContext::run_pdcch_td(...)`
     - `MmseEqualizerGpuContext::run_pdcch_td(...)`
 
 ### PCFICH
 
-- frontend DTO namespace: `mmse::pcfich`
-- low-level input/output: `PcfichMmseInput`, `PcfichMmseOutputView`, `PcfichMmseResult`
-- runtime entrypoints:
+- 前端 DTO 命名空间：`mmse::pcfich`
+- 低层输入 / 输出：
+  - `PcfichMmseInput`
+  - `PcfichMmseOutputView`
+  - `PcfichMmseResult`
+- 运行时入口：
   - `MmseEqualizerCpuContext::run_pcfich(...)`
   - `MmseEqualizerGpuContext::run_pcfich(...)`
 
-## Documentation Status
+## 文档状态
 
-- `PBCH` now has a dedicated quick-start page.
-- `PCFICH` now has a dedicated quick-start and compact API-reference page.
-- `PDCCH` remains the deepest documented subpage and still carries the most detailed field index.
+- `PBCH` 现在有独立的快速开始页面。
+- `PCFICH` 现在有独立的快速开始和紧凑型 API 参考页面。
+- `PDCCH` 仍然是当前文档最完整的子页面，并保留最详细的字段索引。
