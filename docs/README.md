@@ -22,6 +22,7 @@
 ## 其他设计说明
 
 - [MMSE Equalizer TDD 设计说明](G:\MMSE_CPP\docs\mmse_equalizer_tdd.md)
+- [MMSE_CPP 算法原理与优化方法详解](G:\MMSE_CPP\docs\mmse_algorithm_and_optimization_guide.md)
 
 ## 性能与预算报告
 
