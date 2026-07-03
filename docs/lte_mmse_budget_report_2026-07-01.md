@@ -106,6 +106,79 @@ cmd /c "G:\MMSE_CPP\build\Release\mmse_channel_budget.exe"
 - `PDCCH`: `3228 RE`
 - `PDSCH`: `14400 RE / layer`
 
+### 为什么独立调用基线里 CPU 反而比 GPU 更低
+
+这里最容易产生的误解是：
+
+- 既然 GPU 的 `equalize` kernel 已经很快，
+- 为什么六次独立调用聚合里，CPU 仍然比 GPU 低：
+  - CPU：`1916.21 us`
+  - GPU：`2262.90 us`
+
+原因并不是 GPU 的 MMSE 数学本体比 CPU 慢，而是这组“独立调用基线”测到的是**完整 wrapper 调用的端到端成本**，而不是单独的 kernel 时间。
+
+`mmse_channel_budget.cpp` 里的六次独立调用总计，实际测的是：
+
+1. `PBCH`
+2. `PCFICH`
+3. `PDCCH`
+4. `PDSCH`
+5. `PDCCH`
+6. `PDSCH`
+
+也就是说，GPU 路径在每次独立调用里都会重复承担一套固定框架开销，包括：
+
+- layout build
+- grid/meta packing
+- H2D 传输
+- estimate launch
+- `sigma2` 状态处理
+- outputs / scratch D2H
+- stream synchronize
+
+而这些固定成本，在 `PBCH` / `PCFICH` 这种小工作量场景下，占比会明显高于 kernel 数学本体本身。
+
+从当前 full-band profiling 也能看到这一点：
+
+- `host.phase.total_host_us = 308.93 us`
+- `host.phase.estimate_gpu_us = 73.86 us`
+- `host.phase.equalize_gpu_us = 6.66 us`
+- `host.phase.stream_gpu_us = 157.44 us`
+
+这说明当前 GPU 路径的主要成本，已经不是 `equalize` 数学内核，而是每次调用都要重复走一遍的 host/device 框架工作。
+
+相比之下，CPU 路径没有：
+
+- H2D / D2H
+- stream launch / event / sync
+- device 侧 `sigma2` 往返
+
+因此，在“单子帧、单次、小 RE 数、重复多次但彼此独立”的工作负载下，CPU 的固定成本反而更低。
+
+尤其是这里的几个信道规模很小：
+
+- `PBCH`: `240 RE`
+- `PCFICH`: `16 RE`
+- `PDCCH`: `3228 RE`
+
+对这类工作量，GPU 虽然单个 kernel 很快，但快到还不足以覆盖每次独立调用的运输、launch 和同步固定成本。
+
+所以这组数据的正确解释应当是：
+
+- GPU **不是**算得慢
+- GPU 是在“独立调用过多”时，被重复的框架成本拖慢了
+- 一旦进入同子帧 shared-estimate 复用形态，GPU 的聚合表现就会明显改善
+
+这也正是为什么后面的 shared-estimate refactor 能把 GPU 六次聚合从：
+
+- `2262.90 us`
+
+降到：
+
+- `1020.30 us`
+
+收益来源主要是消除重复调用外壳，而不是继续打磨 `equalize` 数学内核。
+
 ## 这些数字意味着什么
 
 ### 1. CE/MMSE kernel 路径已经进入可用区间
@@ -182,6 +255,22 @@ cmd /c "G:\MMSE_CPP\build\Release\mmse_channel_budget.exe"
 
 - 每个 LTE 子帧只做一次 channel estimate
 - 在所有信道特定的提取 / 均衡路径之间复用这一份 estimate
+
+### 对当前实现的具体建议
+
+结合上面的独立调用基线和 shared-estimate 结果，我建议下一步按下面顺序推进：
+
+1. 继续坚持“同子帧只做一次 estimate”的方向，不要回退到每个 wrapper 各自独立运行。
+2. 优先压缩每次调用都会重复发生的固定成本：
+   - metadata packing
+   - host/device 同步
+   - `scratch` / output staging
+   - `sigma2` 状态往返
+3. 对 `PBCH` / `PCFICH` / `PDCCH` 这类小 RE 数场景，不要再期待通过 equalize kernel 微优化拿到决定性收益，因为这里主成本已经不是 kernel 本体。
+4. 如果后续要继续扩展接口层，应优先扩展“子帧作用域的复用能力”，而不是增加新的独立 wrapper 调用次数。
+5. 只有当 shared-estimate 路径和 framework overhead 都已经压到接近极限时，才值得重新审视：
+   - estimate-stage kernel 细节
+   - equalize kernel occupancy / register 微调
 
 ### 为什么这是正确方向
 
