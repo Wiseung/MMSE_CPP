@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "mmse/constants.h"
+
 namespace mmse {
 
 namespace pdcch {

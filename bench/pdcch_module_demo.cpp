@@ -76,7 +76,7 @@ mmse::pdcch::FrontendPdcchIndication make_mock_frontend_indication() {
 
     // Mock upstream policy: use helper-generated non-PDCCH control RE reservations.
     ind.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
-                            .subframe = 0U,
+                            .subframe = static_cast<std::uint8_t>(ind.sfn_subframe % 10U),
                             .ul_dl_config = 0U,
                             .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
     mmse::pdcch::append_pcfich_reserved_control_re_list(ind);
@@ -97,6 +97,8 @@ void print_result_sample(const PdcchMmseResult& meta, const PdcchMmseOutputView&
                          std::uint32_t sample_count) {
     const mmse::pdcch::BackendPdcchEqualizedIndication backend =
         pdcch::make_backend_pdcch_equalized_indication(meta, out);
+    const mmse::pdcch::BackendPdcchDescrambledLlrIndication llr_backend =
+        pdcch::make_backend_pdcch_descrambled_llr_indication(backend);
     const std::uint32_t count =
         std::min(static_cast<std::uint32_t>(backend.re_grid_indices.size()), sample_count);
     std::cout << "meta.n_re=" << backend.re_grid_indices.size() << '\n';
@@ -119,6 +121,12 @@ void print_result_sample(const PdcchMmseResult& meta, const PdcchMmseOutputView&
                   << "xhat=(" << backend.x_hat_re[i] << "," << backend.x_hat_im[i] << ") "
                   << "sinr=" << backend.sinr[i] << '\n';
     }
+
+    const std::uint32_t llr_count =
+        std::min(static_cast<std::uint32_t>(llr_backend.llrs.size()), sample_count * 2U);
+    for (std::uint32_t i = 0; i < llr_count; ++i) {
+        std::cout << "llr[" << i << "]=" << llr_backend.llrs[i] << '\n';
+    }
 }
 
 } // namespace
@@ -131,6 +139,11 @@ int main() {
 
     PdcchMmseInput in{};
     fill_demo_input(in, grid, frontend);
+    const MmseStatus validate_status = mmse::pdcch::validate_pdcch_mmse_input(in);
+    if (validate_status != MmseStatus::kOk) {
+        std::cerr << "validate_pdcch_mmse_input failed: " << to_string(validate_status) << '\n';
+        return 1;
+    }
 
     constexpr std::uint32_t kCapacity = 4000U;
     std::vector<float> xhat_re(kCapacity);

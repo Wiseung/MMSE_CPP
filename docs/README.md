@@ -10,6 +10,7 @@
 - [LTE Equalized Channel SDK 文档首页](G:\MMSE_CPP\docs\lte_equalized_channel_sdk_interface.md)
 - [PBCH 快速开始](G:\MMSE_CPP\docs\pbch_chain_sdk_quick_start.md)
 - [PCFICH 快速开始与 API 参考](G:\MMSE_CPP\docs\pcfich_chain_sdk_quick_start_api_reference.md)
+- [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](G:\MMSE_CPP\docs\pdsch_llr_downstream_quick_start_api_reference.md)
 
 ## PDCCH SDK 子页面
 

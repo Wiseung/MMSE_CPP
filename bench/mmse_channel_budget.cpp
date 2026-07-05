@@ -21,6 +21,9 @@ constexpr std::uint32_t kPdcchCapacity = 4000U;
 constexpr std::uint32_t kPdschCapacityPerLayer = 20000U;
 constexpr std::uint32_t kWarmupIters = 8U;
 constexpr std::uint32_t kMeasureIters = 64U;
+constexpr std::uint16_t kPdschRnti = 0x1234U;
+
+volatile float g_llr_sink = 0.0F;
 
 struct GridBuffers {
     std::array<std::vector<float>, 2> re;
@@ -53,6 +56,33 @@ struct ChannelBuffers {
     std::vector<std::uint16_t> pdcch_idx;
     PdcchMmseOutputView pdcch_out{};
     PdcchMmseResult pdcch_meta{};
+};
+
+struct PdschEqualizedIndication {
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t n_prb = 0;
+    std::array<std::uint16_t, 7> prb_bitmap{};
+    std::uint32_t n_re_per_layer = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t start_symbol = 0;
+    std::uint8_t mod_order = 0;
+    std::int8_t pmi = -1;
+    std::vector<float> x_hat_re{};
+    std::vector<float> x_hat_im{};
+    std::vector<float> sinr{};
+};
+
+struct StageBuffers {
+    std::vector<float> pdsch_llrs;
+    std::vector<float> pbch_llrs;
+    std::vector<float> pcfich_llrs;
+    std::vector<float> pdcch_llrs;
+    pdsch::PdschDescrambledLlrResult pdsch_llr_result{};
+    pdsch::PdschDescramblingPlanCache pdsch_plan{};
 };
 
 GridBuffers make_random_grid(std::uint32_t seed) {
@@ -185,6 +215,323 @@ ChannelBuffers make_channel_buffers() {
     return b;
 }
 
+StageBuffers make_stage_buffers() {
+    return StageBuffers{};
+}
+
+template <typename BackendEqualizedIndication>
+void consume_equalized_result(const BackendEqualizedIndication& backend) {
+    if (!backend.x_hat_re.empty()) {
+        g_llr_sink += backend.x_hat_re.front();
+        g_llr_sink += static_cast<float>(backend.x_hat_re.size());
+    }
+    if (!backend.sinr.empty()) {
+        g_llr_sink += backend.sinr.front();
+    }
+}
+
+template <typename BackendLlrIndication>
+void consume_llr_result(const BackendLlrIndication& llr_backend) {
+    if (!llr_backend.llrs.empty()) {
+        g_llr_sink += llr_backend.llrs.front();
+        g_llr_sink += static_cast<float>(llr_backend.llrs.size());
+    }
+}
+
+void consume_llr_values(const std::vector<float>& llrs) {
+    if (!llrs.empty()) {
+        g_llr_sink += llrs.front();
+        g_llr_sink += static_cast<float>(llrs.size());
+    }
+}
+
+PdschEqualizedIndication make_pdsch_equalized_indication(const ExtractDescriptor& desc,
+                                                         const EqualizerOutputView& out) {
+    PdschEqualizedIndication backend{};
+    backend.sfn_subframe = desc.sfn_subframe;
+    backend.cell_id = desc.cell_id;
+    backend.n_prb = desc.n_prb;
+    backend.prb_bitmap = desc.prb_bitmap;
+    backend.n_re_per_layer = out.n_re_per_layer;
+    backend.n_tx_ports = desc.n_tx_ports;
+    backend.n_rx_ant = desc.n_rx_ant;
+    backend.n_layers = out.n_layers;
+    backend.tx_mode = desc.tx_mode;
+    backend.start_symbol = desc.start_symbol;
+    backend.mod_order = out.mod_order;
+    backend.pmi = desc.pmi;
+
+    const std::size_t total_re =
+        static_cast<std::size_t>(out.n_layers) * static_cast<std::size_t>(out.n_re_per_layer);
+    backend.x_hat_re.assign(out.x_hat_re, out.x_hat_re + total_re);
+    backend.x_hat_im.assign(out.x_hat_im, out.x_hat_im + total_re);
+    backend.sinr.assign(out.sinr, out.sinr + total_re);
+    return backend;
+}
+
+bool pack_pdsch_equalized_indication(const ExtractDescriptor& desc, const ChannelBuffers& buffers) {
+    const auto backend = make_pdsch_equalized_indication(desc, buffers.pdsch_out);
+    const std::size_t expected =
+        static_cast<std::size_t>(buffers.pdsch_out.n_layers) * buffers.pdsch_out.n_re_per_layer;
+    if (backend.x_hat_re.size() != expected || backend.x_hat_im.size() != expected ||
+        backend.sinr.size() != expected) {
+        return false;
+    }
+    consume_equalized_result(backend);
+    return true;
+}
+
+bool pack_pbch_equalized_indication(const ChannelBuffers& buffers) {
+    auto backend =
+        pbch::make_backend_pbch_equalized_indication(buffers.pbch_meta, buffers.pbch_out);
+    const std::size_t expected = static_cast<std::size_t>(buffers.pbch_meta.n_re);
+    if (backend.x_hat_re.size() != expected || backend.x_hat_im.size() != expected ||
+        backend.sinr.size() != expected) {
+        return false;
+    }
+    consume_equalized_result(backend);
+    return true;
+}
+
+bool pack_pcfich_equalized_indication(const ChannelBuffers& buffers) {
+    auto backend =
+        pcfich::make_backend_pcfich_equalized_indication(buffers.pcfich_meta, buffers.pcfich_out);
+    const std::size_t expected = static_cast<std::size_t>(buffers.pcfich_meta.n_re);
+    if (backend.x_hat_re.size() != expected || backend.x_hat_im.size() != expected ||
+        backend.sinr.size() != expected) {
+        return false;
+    }
+    consume_equalized_result(backend);
+    return true;
+}
+
+bool pack_pdcch_equalized_indication(const ChannelBuffers& buffers) {
+    auto backend =
+        pdcch::make_backend_pdcch_equalized_indication(buffers.pdcch_meta, buffers.pdcch_out);
+    const std::size_t expected = static_cast<std::size_t>(buffers.pdcch_meta.n_re);
+    if (backend.x_hat_re.size() != expected || backend.x_hat_im.size() != expected ||
+        backend.sinr.size() != expected) {
+        return false;
+    }
+    consume_equalized_result(backend);
+    return true;
+}
+
+bool build_pdsch_raw_llrs(const ChannelBuffers& buffers, StageBuffers& stage_buffers) {
+    if (lte::build_max_log_llrs(buffers.pdsch_out.x_hat_re, buffers.pdsch_out.x_hat_im,
+                                buffers.pdsch_out.sinr, buffers.pdsch_out.capacity_re_per_layer,
+                                buffers.pdsch_out.n_re_per_layer, buffers.pdsch_out.n_layers,
+                                buffers.pdsch_out.mod_order,
+                                stage_buffers.pdsch_llrs) != MmseStatus::kOk) {
+        return false;
+    }
+    const std::size_t expected =
+        static_cast<std::size_t>(buffers.pdsch_out.n_layers) *
+        lte::llr_count_per_layer(buffers.pdsch_out.n_re_per_layer, buffers.pdsch_out.mod_order);
+    if (stage_buffers.pdsch_llrs.size() != expected) {
+        return false;
+    }
+    consume_llr_values(stage_buffers.pdsch_llrs);
+    return true;
+}
+
+bool build_pdsch_fused_llr_indication(const ExtractDescriptor& desc,
+                                      const ChannelBuffers& buffers) {
+    auto backend =
+        pdsch::make_backend_pdsch_descrambled_llr_indication(desc, buffers.pdsch_out, kPdschRnti);
+    const std::size_t expected =
+        static_cast<std::size_t>(buffers.pdsch_out.n_layers) *
+        lte::llr_count_per_layer(buffers.pdsch_out.n_re_per_layer, buffers.pdsch_out.mod_order);
+    if (backend.llrs.size() != expected) {
+        return false;
+    }
+    consume_llr_result(backend);
+    return true;
+}
+
+bool build_pdsch_caller_owned_llr_output(const ExtractDescriptor& desc,
+                                         const ChannelBuffers& buffers,
+                                         StageBuffers& stage_buffers) {
+    const std::uint32_t expected = lte::total_llr_count(
+        buffers.pdsch_out.n_re_per_layer, buffers.pdsch_out.n_layers, buffers.pdsch_out.mod_order);
+    if (stage_buffers.pdsch_llrs.size() != expected) {
+        stage_buffers.pdsch_llrs.resize(expected);
+    }
+    pdsch::PdschDescrambledLlrOutputView llr_out{
+        stage_buffers.pdsch_llrs.data(),
+        static_cast<std::uint32_t>(stage_buffers.pdsch_llrs.size())};
+    if (pdsch::build_backend_pdsch_descrambled_llr_result(
+            desc, buffers.pdsch_out, kPdschRnti, llr_out, stage_buffers.pdsch_llr_result) !=
+        MmseStatus::kOk) {
+        return false;
+    }
+    if (stage_buffers.pdsch_llr_result.llr_count != expected) {
+        return false;
+    }
+    consume_llr_values(stage_buffers.pdsch_llrs);
+    return true;
+}
+
+bool build_pdsch_cached_fused_llr_indication(const ExtractDescriptor& desc,
+                                             const ChannelBuffers& buffers,
+                                             StageBuffers& stage_buffers) {
+    auto backend = pdsch::make_backend_pdsch_descrambled_llr_indication(
+        desc, buffers.pdsch_out, kPdschRnti, stage_buffers.pdsch_plan);
+    const std::size_t expected =
+        static_cast<std::size_t>(buffers.pdsch_out.n_layers) *
+        lte::llr_count_per_layer(buffers.pdsch_out.n_re_per_layer, buffers.pdsch_out.mod_order);
+    if (backend.llrs.size() != expected) {
+        return false;
+    }
+    consume_llr_result(backend);
+    return true;
+}
+
+bool build_pdsch_cached_caller_owned_llr_output(const ExtractDescriptor& desc,
+                                                const ChannelBuffers& buffers,
+                                                StageBuffers& stage_buffers) {
+    const std::uint32_t expected = lte::total_llr_count(
+        buffers.pdsch_out.n_re_per_layer, buffers.pdsch_out.n_layers, buffers.pdsch_out.mod_order);
+    if (stage_buffers.pdsch_llrs.size() != expected) {
+        stage_buffers.pdsch_llrs.resize(expected);
+    }
+    pdsch::PdschDescrambledLlrOutputView llr_out{
+        stage_buffers.pdsch_llrs.data(),
+        static_cast<std::uint32_t>(stage_buffers.pdsch_llrs.size())};
+    if (pdsch::build_backend_pdsch_descrambled_llr_result(
+            desc, buffers.pdsch_out, kPdschRnti, stage_buffers.pdsch_plan, llr_out,
+            stage_buffers.pdsch_llr_result) != MmseStatus::kOk) {
+        return false;
+    }
+    if (stage_buffers.pdsch_llr_result.llr_count != expected) {
+        return false;
+    }
+    consume_llr_values(stage_buffers.pdsch_llrs);
+    return true;
+}
+
+bool build_pbch_raw_llrs(const ChannelBuffers& buffers, StageBuffers& stage_buffers) {
+    if (lte::build_max_log_llrs(buffers.pbch_out.x_hat_re, buffers.pbch_out.x_hat_im,
+                                buffers.pbch_out.sinr, buffers.pbch_out.capacity_re_per_layer,
+                                buffers.pbch_meta.n_re, buffers.pbch_meta.n_layers,
+                                buffers.pbch_meta.mod_order,
+                                stage_buffers.pbch_llrs) != MmseStatus::kOk) {
+        return false;
+    }
+    const std::size_t expected = static_cast<std::size_t>(buffers.pbch_meta.n_re) *
+                                 static_cast<std::size_t>(buffers.pbch_meta.mod_order);
+    if (stage_buffers.pbch_llrs.size() != expected) {
+        return false;
+    }
+    consume_llr_values(stage_buffers.pbch_llrs);
+    return true;
+}
+
+bool build_pcfich_raw_llrs(const ChannelBuffers& buffers, StageBuffers& stage_buffers) {
+    if (lte::build_max_log_llrs(buffers.pcfich_out.x_hat_re, buffers.pcfich_out.x_hat_im,
+                                buffers.pcfich_out.sinr, buffers.pcfich_out.capacity_re_per_layer,
+                                buffers.pcfich_meta.n_re, buffers.pcfich_meta.n_layers,
+                                buffers.pcfich_meta.mod_order,
+                                stage_buffers.pcfich_llrs) != MmseStatus::kOk) {
+        return false;
+    }
+    const std::size_t expected = static_cast<std::size_t>(buffers.pcfich_meta.n_re) *
+                                 static_cast<std::size_t>(buffers.pcfich_meta.mod_order);
+    if (stage_buffers.pcfich_llrs.size() != expected) {
+        return false;
+    }
+    consume_llr_values(stage_buffers.pcfich_llrs);
+    return true;
+}
+
+bool build_pdcch_raw_llrs(const ChannelBuffers& buffers, StageBuffers& stage_buffers) {
+    if (lte::build_max_log_llrs(buffers.pdcch_out.x_hat_re, buffers.pdcch_out.x_hat_im,
+                                buffers.pdcch_out.sinr, buffers.pdcch_out.capacity_re_per_layer,
+                                buffers.pdcch_meta.n_re, buffers.pdcch_meta.n_layers,
+                                buffers.pdcch_meta.mod_order,
+                                stage_buffers.pdcch_llrs) != MmseStatus::kOk) {
+        return false;
+    }
+    const std::size_t expected = static_cast<std::size_t>(buffers.pdcch_meta.n_re) *
+                                 static_cast<std::size_t>(buffers.pdcch_meta.mod_order);
+    if (stage_buffers.pdcch_llrs.size() != expected) {
+        return false;
+    }
+    consume_llr_values(stage_buffers.pdcch_llrs);
+    return true;
+}
+
+bool descramble_pdsch_llrs(StageBuffers& stage_buffers, const ExtractDescriptor& desc) {
+    lte::descramble_llrs_inplace(stage_buffers.pdsch_llrs.data(),
+                                 static_cast<std::uint32_t>(stage_buffers.pdsch_llrs.size()),
+                                 lte::pdsch_c_init(desc.cell_id, kPdschRnti, desc.sfn_subframe));
+    consume_llr_values(stage_buffers.pdsch_llrs);
+    return true;
+}
+
+bool descramble_pbch_llrs(StageBuffers& stage_buffers, const ChannelBuffers& buffers) {
+    lte::descramble_llrs_inplace(stage_buffers.pbch_llrs.data(),
+                                 static_cast<std::uint32_t>(stage_buffers.pbch_llrs.size()),
+                                 lte::pbch_c_init(buffers.pbch_meta.cell_id));
+    consume_llr_values(stage_buffers.pbch_llrs);
+    return true;
+}
+
+bool descramble_pcfich_llrs(StageBuffers& stage_buffers, const ChannelBuffers& buffers) {
+    lte::descramble_llrs_inplace(
+        stage_buffers.pcfich_llrs.data(),
+        static_cast<std::uint32_t>(stage_buffers.pcfich_llrs.size()),
+        lte::pcfich_c_init(buffers.pcfich_meta.cell_id, buffers.pcfich_meta.sfn_subframe));
+    consume_llr_values(stage_buffers.pcfich_llrs);
+    return true;
+}
+
+bool descramble_pdcch_llrs(StageBuffers& stage_buffers, const ChannelBuffers& buffers) {
+    lte::descramble_llrs_inplace(
+        stage_buffers.pdcch_llrs.data(),
+        static_cast<std::uint32_t>(stage_buffers.pdcch_llrs.size()),
+        lte::pdcch_c_init(buffers.pdcch_meta.cell_id, buffers.pdcch_meta.sfn_subframe));
+    consume_llr_values(stage_buffers.pdcch_llrs);
+    return true;
+}
+
+bool prepare_raw_llrs(const ExtractDescriptor& pdsch_desc, const ChannelBuffers& buffers,
+                      StageBuffers& stage_buffers) {
+    (void)pdsch_desc;
+    return build_pdsch_raw_llrs(buffers, stage_buffers) &&
+           build_pbch_raw_llrs(buffers, stage_buffers) &&
+           build_pcfich_raw_llrs(buffers, stage_buffers) &&
+           build_pdcch_raw_llrs(buffers, stage_buffers);
+}
+
+template <typename T> void summarize(std::string_view label, const std::vector<T>& values);
+
+template <typename RunPdschFn, typename RunPbchFn, typename RunPcfichFn, typename RunPdcchFn>
+bool measure_stage_path(std::string_view prefix, RunPdschFn&& run_pdsch, RunPbchFn&& run_pbch,
+                        RunPcfichFn&& run_pcfich, RunPdcchFn&& run_pdcch,
+                        const ChannelBuffers& buffers) {
+    return measure_path(prefix, std::forward<RunPdschFn>(run_pdsch),
+                        std::forward<RunPbchFn>(run_pbch), std::forward<RunPcfichFn>(run_pcfich),
+                        std::forward<RunPdcchFn>(run_pdcch), buffers);
+}
+
+template <typename RunFn> bool measure_single_path(std::string_view prefix, RunFn&& run_fn) {
+    std::vector<double> timings_us;
+    timings_us.reserve(kMeasureIters);
+    for (std::uint32_t i = 0; i < kMeasureIters; ++i) {
+        const auto start = std::chrono::high_resolution_clock::now();
+        if (!run_fn()) {
+            return false;
+        }
+        const auto end = std::chrono::high_resolution_clock::now();
+        timings_us.push_back(
+            std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(end - start)
+                .count());
+    }
+    summarize(std::string(prefix), timings_us);
+    return true;
+}
+
 template <typename T> void summarize(std::string_view label, const std::vector<T>& values) {
     auto sorted = values;
     std::sort(sorted.begin(), sorted.end());
@@ -305,32 +652,41 @@ int main() {
 
     ChannelBuffers cpu_buffers = make_channel_buffers();
     ChannelBuffers gpu_buffers = make_channel_buffers();
+    StageBuffers cpu_stage_buffers = make_stage_buffers();
+    StageBuffers gpu_stage_buffers = make_stage_buffers();
+
+    const auto refresh_cpu_outputs = [&] {
+        return cpu_ctx.run(grid, pdsch_desc, cpu_buffers.pdsch_out) == MmseStatus::kOk &&
+               cpu_ctx.run_pbch(pbch_in, cpu_buffers.pbch_out, cpu_buffers.pbch_meta) ==
+                   MmseStatus::kOk &&
+               cpu_ctx.run_pcfich(pcfich_in, cpu_buffers.pcfich_out, cpu_buffers.pcfich_meta) ==
+                   MmseStatus::kOk &&
+               cpu_ctx.run_pdcch(pdcch_in, cpu_buffers.pdcch_out, cpu_buffers.pdcch_meta) ==
+                   MmseStatus::kOk;
+    };
+    const auto refresh_gpu_outputs = [&] {
+        return gpu_ctx.run(grid, pdsch_desc, gpu_buffers.pdsch_out) == MmseStatus::kOk &&
+               gpu_ctx.run_pbch(pbch_in, gpu_buffers.pbch_out, gpu_buffers.pbch_meta) ==
+                   MmseStatus::kOk &&
+               gpu_ctx.run_pcfich(pcfich_in, gpu_buffers.pcfich_out, gpu_buffers.pcfich_meta) ==
+                   MmseStatus::kOk &&
+               gpu_ctx.run_pdcch(pdcch_in, gpu_buffers.pdcch_out, gpu_buffers.pdcch_meta) ==
+                   MmseStatus::kOk;
+    };
 
     for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
-        if (cpu_ctx.run(grid, pdsch_desc, cpu_buffers.pdsch_out) != MmseStatus::kOk ||
-            cpu_ctx.run_pbch(pbch_in, cpu_buffers.pbch_out, cpu_buffers.pbch_meta) !=
-                MmseStatus::kOk ||
-            cpu_ctx.run_pcfich(pcfich_in, cpu_buffers.pcfich_out, cpu_buffers.pcfich_meta) !=
-                MmseStatus::kOk ||
-            cpu_ctx.run_pdcch(pdcch_in, cpu_buffers.pdcch_out, cpu_buffers.pdcch_meta) !=
-                MmseStatus::kOk) {
+        if (!refresh_cpu_outputs()) {
             std::cerr << "cpu warmup failed\n";
             return 1;
         }
-        if (gpu_ctx.run(grid, pdsch_desc, gpu_buffers.pdsch_out) != MmseStatus::kOk ||
-            gpu_ctx.run_pbch(pbch_in, gpu_buffers.pbch_out, gpu_buffers.pbch_meta) !=
-                MmseStatus::kOk ||
-            gpu_ctx.run_pcfich(pcfich_in, gpu_buffers.pcfich_out, gpu_buffers.pcfich_meta) !=
-                MmseStatus::kOk ||
-            gpu_ctx.run_pdcch(pdcch_in, gpu_buffers.pdcch_out, gpu_buffers.pdcch_meta) !=
-                MmseStatus::kOk) {
+        if (!refresh_gpu_outputs()) {
             std::cerr << "gpu warmup failed\n";
             return 1;
         }
     }
 
     if (!measure_path(
-            "cpu",
+            "cpu.eq_only",
             [&] { return cpu_ctx.run(grid, pdsch_desc, cpu_buffers.pdsch_out) == MmseStatus::kOk; },
             [&] {
                 return cpu_ctx.run_pbch(pbch_in, cpu_buffers.pbch_out, cpu_buffers.pbch_meta) ==
@@ -349,8 +705,155 @@ int main() {
         return 1;
     }
 
+    if (!refresh_cpu_outputs()) {
+        std::cerr << "cpu refresh before pack_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!pack_pdsch_equalized_indication(pdsch_desc, cpu_buffers) ||
+            !pack_pbch_equalized_indication(cpu_buffers) ||
+            !pack_pcfich_equalized_indication(cpu_buffers) ||
+            !pack_pdcch_equalized_indication(cpu_buffers)) {
+            std::cerr << "cpu pack_only warmup failed\n";
+            return 1;
+        }
+    }
+
+    if (!measure_stage_path(
+            "cpu.pack_only",
+            [&] { return pack_pdsch_equalized_indication(pdsch_desc, cpu_buffers); },
+            [&] { return pack_pbch_equalized_indication(cpu_buffers); },
+            [&] { return pack_pcfich_equalized_indication(cpu_buffers); },
+            [&] { return pack_pdcch_equalized_indication(cpu_buffers); }, cpu_buffers)) {
+        std::cerr << "cpu pack_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_cpu_outputs()) {
+        std::cerr << "cpu refresh before soft_demod_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_raw_llrs(cpu_buffers, cpu_stage_buffers) ||
+            !build_pbch_raw_llrs(cpu_buffers, cpu_stage_buffers) ||
+            !build_pcfich_raw_llrs(cpu_buffers, cpu_stage_buffers) ||
+            !build_pdcch_raw_llrs(cpu_buffers, cpu_stage_buffers)) {
+            std::cerr << "cpu soft_demod_only warmup failed\n";
+            return 1;
+        }
+    }
+
+    if (!measure_stage_path(
+            "cpu.soft_demod_only",
+            [&] { return build_pdsch_raw_llrs(cpu_buffers, cpu_stage_buffers); },
+            [&] { return build_pbch_raw_llrs(cpu_buffers, cpu_stage_buffers); },
+            [&] { return build_pcfich_raw_llrs(cpu_buffers, cpu_stage_buffers); },
+            [&] { return build_pdcch_raw_llrs(cpu_buffers, cpu_stage_buffers); }, cpu_buffers)) {
+        std::cerr << "cpu soft_demod_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_cpu_outputs() || !prepare_raw_llrs(pdsch_desc, cpu_buffers, cpu_stage_buffers)) {
+        std::cerr << "cpu prepare descramble_only inputs failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!descramble_pdsch_llrs(cpu_stage_buffers, pdsch_desc) ||
+            !descramble_pbch_llrs(cpu_stage_buffers, cpu_buffers) ||
+            !descramble_pcfich_llrs(cpu_stage_buffers, cpu_buffers) ||
+            !descramble_pdcch_llrs(cpu_stage_buffers, cpu_buffers)) {
+            std::cerr << "cpu descramble_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!prepare_raw_llrs(pdsch_desc, cpu_buffers, cpu_stage_buffers)) {
+        std::cerr << "cpu refresh descramble_only inputs failed\n";
+        return 1;
+    }
+
+    if (!measure_stage_path(
+            "cpu.descramble_only",
+            [&] { return descramble_pdsch_llrs(cpu_stage_buffers, pdsch_desc); },
+            [&] { return descramble_pbch_llrs(cpu_stage_buffers, cpu_buffers); },
+            [&] { return descramble_pcfich_llrs(cpu_stage_buffers, cpu_buffers); },
+            [&] { return descramble_pdcch_llrs(cpu_stage_buffers, cpu_buffers); }, cpu_buffers)) {
+        std::cerr << "cpu descramble_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_cpu_outputs()) {
+        std::cerr << "cpu refresh before pdsch_fused_llr_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_fused_llr_indication(pdsch_desc, cpu_buffers)) {
+            std::cerr << "cpu pdsch_fused_llr_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!measure_single_path("cpu.pdsch_fused_llr_only", [&] {
+            return build_pdsch_fused_llr_indication(pdsch_desc, cpu_buffers);
+        })) {
+        std::cerr << "cpu pdsch_fused_llr_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_cpu_outputs()) {
+        std::cerr << "cpu refresh before pdsch_caller_owned_llr_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_caller_owned_llr_output(pdsch_desc, cpu_buffers, cpu_stage_buffers)) {
+            std::cerr << "cpu pdsch_caller_owned_llr_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!measure_single_path("cpu.pdsch_caller_owned_llr_only", [&] {
+            return build_pdsch_caller_owned_llr_output(pdsch_desc, cpu_buffers, cpu_stage_buffers);
+        })) {
+        std::cerr << "cpu pdsch_caller_owned_llr_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_cpu_outputs()) {
+        std::cerr << "cpu refresh before pdsch_cached_fused_llr_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_cached_fused_llr_indication(pdsch_desc, cpu_buffers, cpu_stage_buffers)) {
+            std::cerr << "cpu pdsch_cached_fused_llr_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!measure_single_path("cpu.pdsch_cached_fused_llr_only", [&] {
+            return build_pdsch_cached_fused_llr_indication(pdsch_desc, cpu_buffers,
+                                                           cpu_stage_buffers);
+        })) {
+        std::cerr << "cpu pdsch_cached_fused_llr_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_cpu_outputs()) {
+        std::cerr << "cpu refresh before pdsch_cached_caller_owned_llr_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_cached_caller_owned_llr_output(pdsch_desc, cpu_buffers,
+                                                        cpu_stage_buffers)) {
+            std::cerr << "cpu pdsch_cached_caller_owned_llr_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!measure_single_path("cpu.pdsch_cached_caller_owned_llr_only", [&] {
+            return build_pdsch_cached_caller_owned_llr_output(pdsch_desc, cpu_buffers,
+                                                              cpu_stage_buffers);
+        })) {
+        std::cerr << "cpu pdsch_cached_caller_owned_llr_only measurement failed\n";
+        return 1;
+    }
+
     if (!measure_path(
-            "gpu",
+            "gpu.eq_only",
             [&] { return gpu_ctx.run(grid, pdsch_desc, gpu_buffers.pdsch_out) == MmseStatus::kOk; },
             [&] {
                 return gpu_ctx.run_pbch(pbch_in, gpu_buffers.pbch_out, gpu_buffers.pbch_meta) ==
@@ -366,6 +869,153 @@ int main() {
             },
             gpu_buffers)) {
         std::cerr << "gpu measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_gpu_outputs()) {
+        std::cerr << "gpu refresh before pack_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!pack_pdsch_equalized_indication(pdsch_desc, gpu_buffers) ||
+            !pack_pbch_equalized_indication(gpu_buffers) ||
+            !pack_pcfich_equalized_indication(gpu_buffers) ||
+            !pack_pdcch_equalized_indication(gpu_buffers)) {
+            std::cerr << "gpu pack_only warmup failed\n";
+            return 1;
+        }
+    }
+
+    if (!measure_stage_path(
+            "gpu.pack_only",
+            [&] { return pack_pdsch_equalized_indication(pdsch_desc, gpu_buffers); },
+            [&] { return pack_pbch_equalized_indication(gpu_buffers); },
+            [&] { return pack_pcfich_equalized_indication(gpu_buffers); },
+            [&] { return pack_pdcch_equalized_indication(gpu_buffers); }, gpu_buffers)) {
+        std::cerr << "gpu pack_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_gpu_outputs()) {
+        std::cerr << "gpu refresh before soft_demod_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_raw_llrs(gpu_buffers, gpu_stage_buffers) ||
+            !build_pbch_raw_llrs(gpu_buffers, gpu_stage_buffers) ||
+            !build_pcfich_raw_llrs(gpu_buffers, gpu_stage_buffers) ||
+            !build_pdcch_raw_llrs(gpu_buffers, gpu_stage_buffers)) {
+            std::cerr << "gpu soft_demod_only warmup failed\n";
+            return 1;
+        }
+    }
+
+    if (!measure_stage_path(
+            "gpu.soft_demod_only",
+            [&] { return build_pdsch_raw_llrs(gpu_buffers, gpu_stage_buffers); },
+            [&] { return build_pbch_raw_llrs(gpu_buffers, gpu_stage_buffers); },
+            [&] { return build_pcfich_raw_llrs(gpu_buffers, gpu_stage_buffers); },
+            [&] { return build_pdcch_raw_llrs(gpu_buffers, gpu_stage_buffers); }, gpu_buffers)) {
+        std::cerr << "gpu soft_demod_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_gpu_outputs() || !prepare_raw_llrs(pdsch_desc, gpu_buffers, gpu_stage_buffers)) {
+        std::cerr << "gpu prepare descramble_only inputs failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!descramble_pdsch_llrs(gpu_stage_buffers, pdsch_desc) ||
+            !descramble_pbch_llrs(gpu_stage_buffers, gpu_buffers) ||
+            !descramble_pcfich_llrs(gpu_stage_buffers, gpu_buffers) ||
+            !descramble_pdcch_llrs(gpu_stage_buffers, gpu_buffers)) {
+            std::cerr << "gpu descramble_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!prepare_raw_llrs(pdsch_desc, gpu_buffers, gpu_stage_buffers)) {
+        std::cerr << "gpu refresh descramble_only inputs failed\n";
+        return 1;
+    }
+
+    if (!measure_stage_path(
+            "gpu.descramble_only",
+            [&] { return descramble_pdsch_llrs(gpu_stage_buffers, pdsch_desc); },
+            [&] { return descramble_pbch_llrs(gpu_stage_buffers, gpu_buffers); },
+            [&] { return descramble_pcfich_llrs(gpu_stage_buffers, gpu_buffers); },
+            [&] { return descramble_pdcch_llrs(gpu_stage_buffers, gpu_buffers); }, gpu_buffers)) {
+        std::cerr << "gpu descramble_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_gpu_outputs()) {
+        std::cerr << "gpu refresh before pdsch_fused_llr_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_fused_llr_indication(pdsch_desc, gpu_buffers)) {
+            std::cerr << "gpu pdsch_fused_llr_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!measure_single_path("gpu.pdsch_fused_llr_only", [&] {
+            return build_pdsch_fused_llr_indication(pdsch_desc, gpu_buffers);
+        })) {
+        std::cerr << "gpu pdsch_fused_llr_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_gpu_outputs()) {
+        std::cerr << "gpu refresh before pdsch_caller_owned_llr_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_caller_owned_llr_output(pdsch_desc, gpu_buffers, gpu_stage_buffers)) {
+            std::cerr << "gpu pdsch_caller_owned_llr_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!measure_single_path("gpu.pdsch_caller_owned_llr_only", [&] {
+            return build_pdsch_caller_owned_llr_output(pdsch_desc, gpu_buffers, gpu_stage_buffers);
+        })) {
+        std::cerr << "gpu pdsch_caller_owned_llr_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_gpu_outputs()) {
+        std::cerr << "gpu refresh before pdsch_cached_fused_llr_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_cached_fused_llr_indication(pdsch_desc, gpu_buffers, gpu_stage_buffers)) {
+            std::cerr << "gpu pdsch_cached_fused_llr_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!measure_single_path("gpu.pdsch_cached_fused_llr_only", [&] {
+            return build_pdsch_cached_fused_llr_indication(pdsch_desc, gpu_buffers,
+                                                           gpu_stage_buffers);
+        })) {
+        std::cerr << "gpu pdsch_cached_fused_llr_only measurement failed\n";
+        return 1;
+    }
+
+    if (!refresh_gpu_outputs()) {
+        std::cerr << "gpu refresh before pdsch_cached_caller_owned_llr_only failed\n";
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < kWarmupIters; ++i) {
+        if (!build_pdsch_cached_caller_owned_llr_output(pdsch_desc, gpu_buffers,
+                                                        gpu_stage_buffers)) {
+            std::cerr << "gpu pdsch_cached_caller_owned_llr_only warmup failed\n";
+            return 1;
+        }
+    }
+    if (!measure_single_path("gpu.pdsch_cached_caller_owned_llr_only", [&] {
+            return build_pdsch_cached_caller_owned_llr_output(pdsch_desc, gpu_buffers,
+                                                              gpu_stage_buffers);
+        })) {
+        std::cerr << "gpu pdsch_cached_caller_owned_llr_only measurement failed\n";
         return 1;
     }
 
