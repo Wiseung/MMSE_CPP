@@ -4,12 +4,17 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
+#include "mmse/lte_descrambling.h"
+#include "mmse/lte_soft_demod.h"
 #include "mmse/mmse_equalizer.h"
 #include "mmse/pbch_chain_dto.h"
 #include "mmse/pbch_module_api.h"
+#include "mmse/pdsch_chain_dto.h"
+#include "mmse/pdsch_module_api.h"
 #include "mmse/pdcch_chain_dto.h"
 #include "mmse/pdcch_module_api.h"
 #include "mmse/pcfich_chain_dto.h"
@@ -212,6 +217,138 @@ TwoLayerCase make_two_layer_case() {
         .x0 = {0.75F, -0.25F},
         .x1 = {-0.35F, 0.60F},
     };
+}
+
+std::vector<std::uint8_t> reference_gold_sequence(std::uint32_t c_init, std::uint32_t count) {
+    std::array<std::uint8_t, 31> x1{};
+    std::array<std::uint8_t, 31> x2{};
+    x1[0] = 1U;
+    for (std::uint32_t i = 0; i < x2.size(); ++i) {
+        x2[i] = static_cast<std::uint8_t>((c_init >> i) & 1U);
+    }
+
+    std::vector<std::uint8_t> seq(count, 0U);
+    for (std::uint32_t n = 0; n < mmse::lte::kDescramblingNc + count; ++n) {
+        if (n >= mmse::lte::kDescramblingNc) {
+            seq[n - mmse::lte::kDescramblingNc] = static_cast<std::uint8_t>(x1[0] ^ x2[0]);
+        }
+
+        const std::uint8_t x1_feedback = static_cast<std::uint8_t>(x1[3] ^ x1[0]);
+        const std::uint8_t x2_feedback = static_cast<std::uint8_t>(x2[3] ^ x2[2] ^ x2[1] ^ x2[0]);
+        for (std::uint32_t i = 0; i + 1U < x1.size(); ++i) {
+            x1[i] = x1[i + 1U];
+            x2[i] = x2[i + 1U];
+        }
+        x1.back() = x1_feedback;
+        x2.back() = x2_feedback;
+    }
+
+    return seq;
+}
+
+void expect_bits_match_binary_string(const std::vector<std::uint8_t>& bits, const char* expected,
+                                     const std::string& label) {
+    const std::size_t expected_size = std::char_traits<char>::length(expected);
+    expect_true(bits.size() == expected_size, label + " size");
+    for (std::size_t i = 0; i < expected_size; ++i) {
+        const std::uint8_t expected_bit = expected[i] == '1' ? 1U : 0U;
+        if (bits[i] != expected_bit) {
+            throw TestFailure{label + " mismatch at bit " + std::to_string(i)};
+        }
+    }
+}
+
+std::vector<float> reference_build_max_log_llrs(const float* x_hat_re, const float* x_hat_im,
+                                                const float* sinr,
+                                                std::uint32_t capacity_re_per_layer,
+                                                std::uint32_t n_re_per_layer, std::uint8_t n_layers,
+                                                std::uint8_t mod_order) {
+    const std::uint8_t axis_bits = static_cast<std::uint8_t>(mod_order / 2U);
+    const std::uint32_t axis_cardinality = 1U << axis_bits;
+    const std::uint32_t per_layer_llr_count = n_re_per_layer * mod_order;
+    const float symbol_norm = [&] {
+        switch (mod_order) {
+        case 2U:
+            return std::sqrt(2.0F);
+        case 4U:
+            return std::sqrt(10.0F);
+        case 6U:
+            return std::sqrt(42.0F);
+        case 8U:
+            return std::sqrt(170.0F);
+        default:
+            return 1.0F;
+        }
+    }();
+
+    auto gray_to_binary = [](std::uint32_t gray) {
+        std::uint32_t binary = gray;
+        while (gray > 0U) {
+            gray >>= 1U;
+            binary ^= gray;
+        }
+        return binary;
+    };
+
+    std::vector<float> llrs(static_cast<std::size_t>(n_layers) * per_layer_llr_count, 0.0F);
+    for (std::uint32_t layer = 0; layer < n_layers; ++layer) {
+        const std::size_t layer_re_base = static_cast<std::size_t>(layer) * capacity_re_per_layer;
+        const std::size_t layer_llr_base = static_cast<std::size_t>(layer) * per_layer_llr_count;
+        for (std::uint32_t re = 0; re < n_re_per_layer; ++re) {
+            const std::size_t re_index = layer_re_base + re;
+            const float x_re = x_hat_re[re_index];
+            const float x_im = x_hat_im[re_index];
+            const float gamma = std::max(sinr[re_index], 0.0F);
+
+            std::array<float, 4> min_i0{};
+            std::array<float, 4> min_i1{};
+            std::array<float, 4> min_q0{};
+            std::array<float, 4> min_q1{};
+            min_i0.fill(std::numeric_limits<float>::infinity());
+            min_i1.fill(std::numeric_limits<float>::infinity());
+            min_q0.fill(std::numeric_limits<float>::infinity());
+            min_q1.fill(std::numeric_limits<float>::infinity());
+
+            for (std::uint32_t gray = 0; gray < axis_cardinality; ++gray) {
+                const std::uint32_t binary = gray_to_binary(gray);
+                const std::uint32_t max_level = axis_cardinality - 1U;
+                const std::int32_t signed_level =
+                    static_cast<std::int32_t>(max_level) - 2 * static_cast<std::int32_t>(binary);
+                const float axis_level = static_cast<float>(signed_level) / symbol_norm;
+                const float dist_i = gamma * (x_re - axis_level) * (x_re - axis_level);
+                const float dist_q = gamma * (x_im - axis_level) * (x_im - axis_level);
+                for (std::uint8_t axis_bit = 0; axis_bit < axis_bits; ++axis_bit) {
+                    const std::uint8_t shift = static_cast<std::uint8_t>(axis_bits - 1U - axis_bit);
+                    if (((gray >> shift) & 1U) == 0U) {
+                        min_i0[axis_bit] = std::min(min_i0[axis_bit], dist_i);
+                        min_q0[axis_bit] = std::min(min_q0[axis_bit], dist_q);
+                    } else {
+                        min_i1[axis_bit] = std::min(min_i1[axis_bit], dist_i);
+                        min_q1[axis_bit] = std::min(min_q1[axis_bit], dist_q);
+                    }
+                }
+            }
+
+            const std::size_t llr_base = layer_llr_base + static_cast<std::size_t>(re) * mod_order;
+            for (std::uint8_t axis_bit = 0; axis_bit < axis_bits; ++axis_bit) {
+                llrs[llr_base + 2U * axis_bit] = min_i0[axis_bit] - min_i1[axis_bit];
+                llrs[llr_base + 2U * axis_bit + 1U] = min_q0[axis_bit] - min_q1[axis_bit];
+            }
+        }
+    }
+    return llrs;
+}
+
+void expect_sign(float value, int expected_sign, const std::string& message) {
+    if (expected_sign < 0) {
+        expect_true(value < 0.0F, message);
+        return;
+    }
+    if (expected_sign > 0) {
+        expect_true(value > 0.0F, message);
+        return;
+    }
+    expect_near(value, 0.0F, 1.0e-6F, message);
 }
 
 void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor& desc, float data0,
@@ -2384,10 +2521,568 @@ void test_gpu_context_invalid_stream_count_is_rejected() {
                 "gpu init should reject zero stream count");
 }
 
+void test_lte_descrambling_cinit_helpers_match_expected_values() {
+    expect_true(mmse::lte::subframe_from_sfn_subframe(47U) == 7U, "subframe helper");
+    expect_true(mmse::lte::pbch_c_init(503U) == 503U, "pbch c_init");
+    expect_true(mmse::lte::pdcch_c_init(42U, 13U) == 1578U, "pdcch c_init");
+    expect_true(mmse::lte::pcfich_c_init(42U, 13U) == 174122U, "pcfich c_init");
+    expect_true(mmse::lte::pdsch_c_init(42U, 0x1234U, 13U, 1U) == 76359210U, "pdsch c_init");
+}
+
+void test_lte_descrambling_gold_sequence_matches_known_vectors() {
+    std::vector<std::uint8_t> seq0(32U, 0U);
+    std::vector<std::uint8_t> seq1(32U, 0U);
+    mmse::lte::generate_scrambling_bits(0U, seq0.data(), static_cast<std::uint32_t>(seq0.size()));
+    mmse::lte::generate_scrambling_bits(1578U, seq1.data(),
+                                        static_cast<std::uint32_t>(seq1.size()));
+    expect_bits_match_binary_string(seq0, "00000010000110100001001001111010", "gold c_init=0");
+    expect_bits_match_binary_string(seq1, "00111000010101010000100111100010", "gold c_init=1578");
+}
+
+void test_lte_descrambling_sequence_matches_reference_generator() {
+    const std::uint32_t c_init = mmse::lte::pdsch_c_init(11U, 0x3456U, 28U, 1U);
+    std::vector<std::uint8_t> actual(257U, 0U);
+    mmse::lte::generate_scrambling_bits(c_init, actual.data(),
+                                        static_cast<std::uint32_t>(actual.size()));
+    const std::vector<std::uint8_t> expected = reference_gold_sequence(c_init, 257U);
+    expect_true(actual == expected, "gold sequence should match reference generator");
+}
+
+void test_lte_descramble_bits_is_self_inverse() {
+    std::vector<std::uint8_t> bits = {1U, 0U, 1U, 1U, 0U, 0U, 1U, 0U, 1U, 0U, 1U, 1U, 1U, 0U};
+    const std::vector<std::uint8_t> original = bits;
+    const std::uint32_t c_init = mmse::lte::pdcch_c_init(321U, 47U);
+    mmse::lte::descramble_bits_inplace(bits.data(), static_cast<std::uint32_t>(bits.size()),
+                                       c_init);
+    mmse::lte::descramble_bits_inplace(bits.data(), static_cast<std::uint32_t>(bits.size()),
+                                       c_init);
+    expect_true(bits == original, "bit descrambling should be self-inverse");
+}
+
+void test_lte_descramble_llrs_flips_sign_on_scrambling_ones() {
+    const std::uint32_t c_init = mmse::lte::pcfich_c_init(42U, 13U);
+    std::vector<std::uint8_t> scramble(16U, 0U);
+    mmse::lte::generate_scrambling_bits(c_init, scramble.data(),
+                                        static_cast<std::uint32_t>(scramble.size()));
+
+    std::vector<float> llrs = {0.25F, -0.50F, 0.75F, -1.00F, 1.25F, -1.50F, 1.75F, -2.00F,
+                               2.25F, -2.50F, 2.75F, -3.00F, 3.25F, -3.50F, 3.75F, -4.00F};
+    const std::vector<float> original = llrs;
+    mmse::lte::descramble_llrs_inplace(llrs.data(), static_cast<std::uint32_t>(llrs.size()),
+                                       c_init);
+
+    for (std::size_t i = 0; i < llrs.size(); ++i) {
+        const float expected = scramble[i] != 0U ? -original[i] : original[i];
+        expect_near(llrs[i], expected, 0.0F, "llr sign flip");
+    }
+}
+
+void test_lte_soft_demod_qpsk_matches_known_llrs() {
+    const float inv_sqrt2 = 1.0F / std::sqrt(2.0F);
+    std::array<float, 2> xre = {inv_sqrt2, -inv_sqrt2};
+    std::array<float, 2> xim = {inv_sqrt2, inv_sqrt2};
+    std::array<float, 2> sinr = {5.0F, 5.0F};
+    std::vector<float> llrs{};
+
+    expect_true(mmse::lte::build_max_log_llrs(xre.data(), xim.data(), sinr.data(), 2U, 2U, 1U, 2U,
+                                              llrs) == MmseStatus::kOk,
+                "qpsk demod should succeed");
+    expect_true(llrs.size() == 4U, "qpsk llr count");
+    expect_near(llrs[0], -10.0F, 1.0e-4F, "qpsk symbol0 i-bit");
+    expect_near(llrs[1], -10.0F, 1.0e-4F, "qpsk symbol0 q-bit");
+    expect_near(llrs[2], 10.0F, 1.0e-4F, "qpsk symbol1 i-bit");
+    expect_near(llrs[3], -10.0F, 1.0e-4F, "qpsk symbol1 q-bit");
+}
+
+void test_lte_soft_demod_64qam_sign_pattern_matches_gray_mapping() {
+    const float inv_sqrt42 = 1.0F / std::sqrt(42.0F);
+    std::array<float, 1> xre = {7.0F * inv_sqrt42};
+    std::array<float, 1> xim = {-1.0F * inv_sqrt42};
+    std::array<float, 1> sinr = {2.0F};
+    std::vector<float> llrs{};
+    const std::vector<float> expected =
+        reference_build_max_log_llrs(xre.data(), xim.data(), sinr.data(), 1U, 1U, 1U, 6U);
+
+    expect_true(mmse::lte::build_max_log_llrs(xre.data(), xim.data(), sinr.data(), 1U, 1U, 1U, 6U,
+                                              llrs) == MmseStatus::kOk,
+                "64qam demod should succeed");
+    expect_true(llrs.size() == 6U, "64qam llr count");
+
+    for (std::size_t i = 0; i < llrs.size(); ++i) {
+        const int expected_sign = expected[i] > 0.0F ? 1 : (expected[i] < 0.0F ? -1 : 0);
+        expect_sign(llrs[i], expected_sign, "64qam sign matches reference");
+    }
+}
+
+void test_lte_soft_demod_specialized_paths_match_reference() {
+    std::array<float, 4> xre = {0.3F, -0.7F, 3.0F / std::sqrt(10.0F), 7.0F / std::sqrt(42.0F)};
+    std::array<float, 4> xim = {-0.4F, 0.2F, -1.0F / std::sqrt(10.0F), -3.0F / std::sqrt(42.0F)};
+    std::array<float, 4> sinr = {0.5F, 1.0F, 2.0F, 3.0F};
+
+    for (const std::uint8_t mod_order : {2U, 4U, 6U}) {
+        std::vector<float> actual{};
+        expect_true(mmse::lte::build_max_log_llrs(xre.data(), xim.data(), sinr.data(), 4U, 4U, 1U,
+                                                  mod_order, actual) == MmseStatus::kOk,
+                    "specialized demod should succeed");
+        const std::vector<float> expected = reference_build_max_log_llrs(
+            xre.data(), xim.data(), sinr.data(), 4U, 4U, 1U, mod_order);
+        expect_true(actual.size() == expected.size(), "specialized demod llr size");
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            expect_relative_near(actual[i], expected[i], 1.0e-5F, 1.0e-5F,
+                                 "specialized demod matches reference");
+        }
+    }
+}
+
+void test_lte_soft_demod_descrambled_fused_matches_split_reference() {
+    std::array<float, 3> xre = {0.3F, -3.0F / std::sqrt(10.0F), 7.0F / std::sqrt(42.0F)};
+    std::array<float, 3> xim = {-0.4F, 1.0F / std::sqrt(10.0F), -3.0F / std::sqrt(42.0F)};
+    std::array<float, 3> sinr = {0.5F, 2.0F, 3.0F};
+    const std::uint32_t c_init = mmse::lte::pdsch_c_init(17U, 0x1234U, 8U, 0U);
+
+    for (const std::uint8_t mod_order : {2U, 4U, 6U}) {
+        std::vector<float> split = reference_build_max_log_llrs(xre.data(), xim.data(), sinr.data(),
+                                                                3U, 3U, 1U, mod_order);
+        mmse::lte::descramble_llrs_inplace(split.data(), static_cast<std::uint32_t>(split.size()),
+                                           c_init);
+
+        std::vector<float> fused{};
+        expect_true(mmse::lte::build_max_log_descrambled_llrs(xre.data(), xim.data(), sinr.data(),
+                                                              3U, 3U, 1U, mod_order, c_init,
+                                                              fused) == MmseStatus::kOk,
+                    "fused descrambled demod should succeed");
+        expect_true(fused.size() == split.size(), "fused descrambled demod size");
+        for (std::size_t i = 0; i < split.size(); ++i) {
+            expect_relative_near(fused[i], split[i], 1.0e-5F, 1.0e-5F,
+                                 "fused descrambled demod matches split reference");
+        }
+    }
+}
+
+void test_pbch_backend_descrambled_llr_indication() {
+    const float inv_sqrt2 = 1.0F / std::sqrt(2.0F);
+    mmse::pbch::BackendPbchEqualizedIndication backend{};
+    backend.sfn_subframe = 0U;
+    backend.cell_id = 37U;
+    backend.start_prb = kLtePbchStartPrb;
+    backend.n_prb = kLtePbchNumPrb;
+    backend.start_symbol = kLtePbchStartSymbolNormalCp;
+    backend.n_tx_ports = 1U;
+    backend.n_rx_ant = 2U;
+    backend.n_layers = 1U;
+    backend.tx_mode = 1U;
+    backend.mod_order = 2U;
+    backend.sigma2 = 0.1F;
+    backend.chain.request_id = 901U;
+    backend.x_hat_re = {inv_sqrt2, -inv_sqrt2};
+    backend.x_hat_im = {inv_sqrt2, -inv_sqrt2};
+    backend.sinr = {4.0F, 4.0F};
+    backend.re_grid_indices = {100U, 101U};
+
+    const auto llr_backend = mmse::pbch::make_backend_pbch_descrambled_llr_indication(backend);
+    std::vector<float> expected{};
+    expect_true(mmse::lte::build_max_log_llrs(backend.x_hat_re.data(), backend.x_hat_im.data(),
+                                              backend.sinr.data(), 2U, 2U, 1U, 2U,
+                                              expected) == MmseStatus::kOk,
+                "pbch raw llr demod");
+    std::vector<std::uint8_t> scramble(expected.size(), 0U);
+    mmse::lte::generate_scrambling_bits(mmse::lte::pbch_c_init(backend.cell_id), scramble.data(),
+                                        static_cast<std::uint32_t>(scramble.size()));
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (scramble[i] != 0U) {
+            expected[i] = -expected[i];
+        }
+    }
+
+    expect_true(llr_backend.llrs.size() == expected.size(), "pbch descrambled llr size");
+    expect_true(llr_backend.chain.request_id == backend.chain.request_id, "pbch llr chain");
+    expect_true(llr_backend.re_grid_indices == backend.re_grid_indices, "pbch llr indices");
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        expect_near(llr_backend.llrs[i], expected[i], 1.0e-4F, "pbch llr sample");
+    }
+}
+
+void test_pcfich_backend_descrambled_llr_indication() {
+    const float inv_sqrt2 = 1.0F / std::sqrt(2.0F);
+    mmse::pcfich::BackendPcfichEqualizedIndication backend{};
+    backend.sfn_subframe = 13U;
+    backend.cell_id = 42U;
+    backend.n_prb = kLteNumPrb20MHz;
+    backend.start_symbol = 0U;
+    backend.reg_count = static_cast<std::uint8_t>(kLtePcfichNumRegs);
+    backend.n_tx_ports = 1U;
+    backend.n_rx_ant = 2U;
+    backend.n_layers = 1U;
+    backend.tx_mode = 1U;
+    backend.mod_order = 2U;
+    backend.sigma2 = 0.2F;
+    backend.chain.request_id = 902U;
+    backend.x_hat_re = {inv_sqrt2};
+    backend.x_hat_im = {-inv_sqrt2};
+    backend.sinr = {3.0F};
+    backend.re_grid_indices = {55U};
+
+    const auto llr_backend = mmse::pcfich::make_backend_pcfich_descrambled_llr_indication(backend);
+    std::vector<float> expected{};
+    expect_true(mmse::lte::build_max_log_llrs(backend.x_hat_re.data(), backend.x_hat_im.data(),
+                                              backend.sinr.data(), 1U, 1U, 1U, 2U,
+                                              expected) == MmseStatus::kOk,
+                "pcfich raw llr demod");
+    std::vector<std::uint8_t> scramble(expected.size(), 0U);
+    mmse::lte::generate_scrambling_bits(
+        mmse::lte::pcfich_c_init(backend.cell_id, backend.sfn_subframe), scramble.data(),
+        static_cast<std::uint32_t>(scramble.size()));
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (scramble[i] != 0U) {
+            expected[i] = -expected[i];
+        }
+    }
+
+    expect_true(llr_backend.llrs.size() == expected.size(), "pcfich descrambled llr size");
+    expect_true(llr_backend.reg_count == backend.reg_count, "pcfich reg count passthrough");
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        expect_near(llr_backend.llrs[i], expected[i], 1.0e-4F, "pcfich llr sample");
+    }
+}
+
+void test_pdcch_backend_descrambled_llr_indication() {
+    const float inv_sqrt2 = 1.0F / std::sqrt(2.0F);
+    mmse::pdcch::BackendPdcchEqualizedIndication backend{};
+    backend.sfn_subframe = 9U;
+    backend.cell_id = 21U;
+    backend.n_prb = kLteNumPrb20MHz;
+    backend.n_tx_ports = 1U;
+    backend.n_rx_ant = 2U;
+    backend.n_layers = 1U;
+    backend.tx_mode = 1U;
+    backend.control_symbol_count = 3U;
+    backend.mod_order = 2U;
+    backend.sigma2 = 0.125F;
+    backend.chain.request_id = 903U;
+    backend.chain.candidate_id = 7U;
+    backend.x_hat_re = {-inv_sqrt2};
+    backend.x_hat_im = {inv_sqrt2};
+    backend.sinr = {6.0F};
+    backend.re_grid_indices = {66U};
+
+    const auto llr_backend = mmse::pdcch::make_backend_pdcch_descrambled_llr_indication(backend);
+    std::vector<float> expected{};
+    expect_true(mmse::lte::build_max_log_llrs(backend.x_hat_re.data(), backend.x_hat_im.data(),
+                                              backend.sinr.data(), 1U, 1U, 1U, 2U,
+                                              expected) == MmseStatus::kOk,
+                "pdcch raw llr demod");
+    std::vector<std::uint8_t> scramble(expected.size(), 0U);
+    mmse::lte::generate_scrambling_bits(
+        mmse::lte::pdcch_c_init(backend.cell_id, backend.sfn_subframe), scramble.data(),
+        static_cast<std::uint32_t>(scramble.size()));
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (scramble[i] != 0U) {
+            expected[i] = -expected[i];
+        }
+    }
+
+    expect_true(llr_backend.llrs.size() == expected.size(), "pdcch descrambled llr size");
+    expect_true(llr_backend.chain.candidate_id == backend.chain.candidate_id, "pdcch llr chain");
+    expect_true(llr_backend.re_grid_indices == backend.re_grid_indices, "pdcch llr indices");
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        expect_near(llr_backend.llrs[i], expected[i], 1.0e-4F, "pdcch llr sample");
+    }
+}
+
+void test_pdcch_td_backend_descrambled_llr_indication() {
+    const float inv_sqrt2 = 1.0F / std::sqrt(2.0F);
+    mmse::pdcch::BackendPdcchTdEqualizedIndication backend{};
+    backend.sfn_subframe = 19U;
+    backend.cell_id = 31U;
+    backend.n_prb = kLteNumPrb20MHz;
+    backend.n_tx_ports = 2U;
+    backend.n_rx_ant = 2U;
+    backend.n_layers = 1U;
+    backend.tx_mode = 2U;
+    backend.control_symbol_count = 3U;
+    backend.mod_order = 2U;
+    backend.sigma2 = 0.25F;
+    backend.chain.request_id = 904U;
+    backend.x_hat_re = {inv_sqrt2, -inv_sqrt2};
+    backend.x_hat_im = {inv_sqrt2, inv_sqrt2};
+    backend.sinr = {2.5F, 2.5F};
+    backend.re_grid_indices0 = {70U, 72U};
+    backend.re_grid_indices1 = {71U, 73U};
+
+    const auto llr_backend = mmse::pdcch::make_backend_pdcch_td_descrambled_llr_indication(backend);
+    std::vector<float> expected{};
+    expect_true(mmse::lte::build_max_log_llrs(backend.x_hat_re.data(), backend.x_hat_im.data(),
+                                              backend.sinr.data(), 2U, 2U, 1U, 2U,
+                                              expected) == MmseStatus::kOk,
+                "pdcch td raw llr demod");
+    std::vector<std::uint8_t> scramble(expected.size(), 0U);
+    mmse::lte::generate_scrambling_bits(
+        mmse::lte::pdcch_c_init(backend.cell_id, backend.sfn_subframe), scramble.data(),
+        static_cast<std::uint32_t>(scramble.size()));
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (scramble[i] != 0U) {
+            expected[i] = -expected[i];
+        }
+    }
+
+    expect_true(llr_backend.llrs.size() == expected.size(), "pdcch td descrambled llr size");
+    expect_true(llr_backend.re_grid_indices0 == backend.re_grid_indices0,
+                "pdcch td re0 passthrough");
+    expect_true(llr_backend.re_grid_indices1 == backend.re_grid_indices1,
+                "pdcch td re1 passthrough");
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        expect_near(llr_backend.llrs[i], expected[i], 1.0e-4F, "pdcch td llr sample");
+    }
+}
+
+void test_pdsch_backend_descrambled_llr_indication_16qam() {
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = 12U;
+    desc.cell_id = 17U;
+    desc.n_tx_ports = 2U;
+    desc.n_rx_ant = 2U;
+    desc.n_layers = 1U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPdsch;
+    desc.start_symbol = 3U;
+    desc.mod_order = 4U;
+    desc.n_prb = 50U;
+    desc.prb_bitmap.fill(0U);
+    desc.prb_bitmap[0] = 0x00FFU;
+    desc.pmi = -1;
+
+    const float inv_sqrt10 = 1.0F / std::sqrt(10.0F);
+    std::array<float, 1> xre = {3.0F * inv_sqrt10};
+    std::array<float, 1> xim = {-1.0F * inv_sqrt10};
+    std::array<float, 1> sinr = {2.0F};
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), 1U, 1U, 1U, 4U};
+
+    const std::uint16_t rnti = 0x1234U;
+    const auto backend =
+        mmse::pdsch::make_backend_pdsch_descrambled_llr_indication(desc, out, rnti, 0U);
+    expect_true(backend.llrs.size() == 4U, "pdsch llr size");
+    expect_true(backend.llr_count_per_layer == 4U, "pdsch llr per layer");
+    expect_true(backend.rnti == rnti, "pdsch rnti passthrough");
+
+    std::vector<float> expected =
+        reference_build_max_log_llrs(xre.data(), xim.data(), sinr.data(), 1U, 1U, 1U, 4U);
+    mmse::lte::descramble_llrs_inplace(
+        expected.data(), static_cast<std::uint32_t>(expected.size()),
+        mmse::lte::pdsch_c_init(desc.cell_id, rnti, desc.sfn_subframe, 0U));
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        expect_relative_near(backend.llrs[i], expected[i], 1.0e-5F, 1.0e-5F,
+                             "pdsch 16qam llr exact match");
+    }
+}
+
+void test_pdsch_caller_owned_llr_output_matches_backend_builder() {
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = 9U;
+    desc.cell_id = 21U;
+    desc.n_tx_ports = 2U;
+    desc.n_rx_ant = 2U;
+    desc.n_layers = 2U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPdsch;
+    desc.start_symbol = 1U;
+    desc.mod_order = 6U;
+    desc.n_prb = 20U;
+    desc.prb_bitmap.fill(0U);
+    desc.prb_bitmap[0] = 0x0FFFU;
+    desc.prb_bitmap[1] = 0x00FFU;
+    desc.pmi = -1;
+
+    std::array<float, 4> xre = {0.3F, -0.4F, 7.0F / std::sqrt(42.0F), -3.0F / std::sqrt(42.0F)};
+    std::array<float, 4> xim = {-0.2F, 0.5F, -1.0F / std::sqrt(42.0F), 5.0F / std::sqrt(42.0F)};
+    std::array<float, 4> sinr = {0.5F, 1.0F, 2.0F, 3.0F};
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), 2U, 2U, 2U, 6U};
+
+    const std::uint16_t rnti = 0x2468U;
+    const auto backend =
+        mmse::pdsch::make_backend_pdsch_descrambled_llr_indication(desc, out, rnti);
+
+    std::vector<float> llrs(backend.llrs.size(), 0.0F);
+    mmse::pdsch::PdschDescrambledLlrOutputView llr_out{llrs.data(),
+                                                       static_cast<std::uint32_t>(llrs.size())};
+    mmse::pdsch::PdschDescrambledLlrResult result{};
+    expect_true(mmse::pdsch::build_backend_pdsch_descrambled_llr_result(desc, out, rnti, llr_out,
+                                                                        result) == MmseStatus::kOk,
+                "pdsch caller-owned llr builder should succeed");
+    expect_true(result.llr_count == backend.llrs.size(), "pdsch caller-owned llr count");
+    expect_true(result.llr_count_per_layer == backend.llr_count_per_layer,
+                "pdsch caller-owned llr count per layer");
+    expect_true(result.n_layers == backend.n_layers, "pdsch caller-owned n_layers");
+    for (std::size_t i = 0; i < backend.llrs.size(); ++i) {
+        expect_relative_near(llrs[i], backend.llrs[i], 1.0e-5F, 1.0e-5F,
+                             "pdsch caller-owned matches backend llrs");
+    }
+}
+
+void test_pdsch_cached_builder_matches_uncached_builder() {
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = 9U;
+    desc.cell_id = 21U;
+    desc.n_tx_ports = 2U;
+    desc.n_rx_ant = 2U;
+    desc.n_layers = 2U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPdsch;
+    desc.start_symbol = 1U;
+    desc.mod_order = 6U;
+    desc.n_prb = 20U;
+    desc.prb_bitmap.fill(0U);
+    desc.prb_bitmap[0] = 0x0FFFU;
+    desc.prb_bitmap[1] = 0x00FFU;
+    desc.pmi = -1;
+
+    std::array<float, 4> xre = {0.3F, -0.4F, 7.0F / std::sqrt(42.0F), -3.0F / std::sqrt(42.0F)};
+    std::array<float, 4> xim = {-0.2F, 0.5F, -1.0F / std::sqrt(42.0F), 5.0F / std::sqrt(42.0F)};
+    std::array<float, 4> sinr = {0.5F, 1.0F, 2.0F, 3.0F};
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), 2U, 2U, 2U, 6U};
+
+    const std::uint16_t rnti = 0x2468U;
+    const auto uncached =
+        mmse::pdsch::make_backend_pdsch_descrambled_llr_indication(desc, out, rnti);
+    mmse::pdsch::PdschDescramblingPlanCache cache{};
+    const auto cached =
+        mmse::pdsch::make_backend_pdsch_descrambled_llr_indication(desc, out, rnti, cache);
+    expect_true(cache.valid, "pdsch scrambling cache should be populated");
+    expect_true(cache.llr_count == uncached.llrs.size(), "pdsch scrambling cache llr_count");
+    expect_true(cached.llrs.size() == uncached.llrs.size(), "pdsch cached llr size");
+    for (std::size_t i = 0; i < uncached.llrs.size(); ++i) {
+        expect_relative_near(cached.llrs[i], uncached.llrs[i], 1.0e-5F, 1.0e-5F,
+                             "pdsch cached builder matches uncached");
+    }
+}
+
+void test_pdsch_cached_caller_owned_output_matches_cached_builder() {
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = 9U;
+    desc.cell_id = 21U;
+    desc.n_tx_ports = 2U;
+    desc.n_rx_ant = 2U;
+    desc.n_layers = 2U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPdsch;
+    desc.start_symbol = 1U;
+    desc.mod_order = 6U;
+    desc.n_prb = 20U;
+    desc.prb_bitmap.fill(0U);
+    desc.prb_bitmap[0] = 0x0FFFU;
+    desc.prb_bitmap[1] = 0x00FFU;
+    desc.pmi = -1;
+
+    std::array<float, 4> xre = {0.3F, -0.4F, 7.0F / std::sqrt(42.0F), -3.0F / std::sqrt(42.0F)};
+    std::array<float, 4> xim = {-0.2F, 0.5F, -1.0F / std::sqrt(42.0F), 5.0F / std::sqrt(42.0F)};
+    std::array<float, 4> sinr = {0.5F, 1.0F, 2.0F, 3.0F};
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), 2U, 2U, 2U, 6U};
+
+    const std::uint16_t rnti = 0x2468U;
+    mmse::pdsch::PdschDescramblingPlanCache cache{};
+    const auto cached =
+        mmse::pdsch::make_backend_pdsch_descrambled_llr_indication(desc, out, rnti, cache);
+
+    std::vector<float> llrs(cached.llrs.size(), 0.0F);
+    mmse::pdsch::PdschDescrambledLlrOutputView llr_out{llrs.data(),
+                                                       static_cast<std::uint32_t>(llrs.size())};
+    mmse::pdsch::PdschDescrambledLlrResult result{};
+    expect_true(mmse::pdsch::build_backend_pdsch_descrambled_llr_result(
+                    desc, out, rnti, cache, llr_out, result) == MmseStatus::kOk,
+                "pdsch cached caller-owned llr builder should succeed");
+    expect_true(result.llr_count == cached.llrs.size(), "pdsch cached caller-owned llr count");
+    for (std::size_t i = 0; i < cached.llrs.size(); ++i) {
+        expect_relative_near(llrs[i], cached.llrs[i], 1.0e-5F, 1.0e-5F,
+                             "pdsch cached caller-owned matches cached builder");
+    }
+}
+
+void test_pdsch_scrambling_plan_reuses_bits_for_same_key() {
+    mmse::pdsch::PdschDescramblingPlanCache cache{};
+    const std::uint32_t llr_count = 24U;
+    expect_true(mmse::pdsch::prepare_pdsch_descrambling_plan(11U, 0x1234U, 8U, 0U, llr_count,
+                                                             cache) == MmseStatus::kOk,
+                "pdsch prepare scrambling plan");
+    expect_true(cache.valid, "pdsch scrambling cache valid");
+    expect_true(cache.bits.size() == llr_count, "pdsch scrambling cache size");
+    auto* first_bits_ptr = cache.bits.data();
+    std::vector<std::uint8_t> first_bits = cache.bits;
+    expect_true(mmse::pdsch::prepare_pdsch_descrambling_plan(11U, 0x1234U, 8U, 0U, llr_count,
+                                                             cache) == MmseStatus::kOk,
+                "pdsch prepare scrambling plan reuse");
+    expect_true(cache.bits.data() == first_bits_ptr, "pdsch scrambling cache should reuse storage");
+    expect_true(cache.bits == first_bits, "pdsch scrambling cache bits should stay unchanged");
+}
+
+void test_pdsch_caller_owned_llr_output_rejects_small_buffer() {
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = 0U;
+    desc.cell_id = 1U;
+    desc.n_tx_ports = 2U;
+    desc.n_rx_ant = 2U;
+    desc.n_layers = 1U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPdsch;
+    desc.start_symbol = 1U;
+    desc.mod_order = 6U;
+    desc.n_prb = 4U;
+    desc.prb_bitmap.fill(0U);
+    desc.prb_bitmap[0] = 0x000FU;
+    desc.pmi = -1;
+
+    std::array<float, 1> xre = {0.3F};
+    std::array<float, 1> xim = {-0.2F};
+    std::array<float, 1> sinr = {1.0F};
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), 1U, 1U, 1U, 6U};
+
+    std::array<float, 5> small_buffer{};
+    mmse::pdsch::PdschDescrambledLlrOutputView llr_out{small_buffer.data(), 5U};
+    mmse::pdsch::PdschDescrambledLlrResult result{};
+    expect_true(mmse::pdsch::build_backend_pdsch_descrambled_llr_result(
+                    desc, out, 0x1111U, llr_out, result) == MmseStatus::kBufferTooSmall,
+                "pdsch caller-owned llr builder should reject small buffer");
+}
+
 } // namespace
 
 int main() {
     const std::array tests = {
+        std::pair{"lte_descrambling_cinit_helpers_match_expected_values",
+                  &test_lte_descrambling_cinit_helpers_match_expected_values},
+        std::pair{"lte_descrambling_gold_sequence_matches_known_vectors",
+                  &test_lte_descrambling_gold_sequence_matches_known_vectors},
+        std::pair{"lte_descrambling_sequence_matches_reference_generator",
+                  &test_lte_descrambling_sequence_matches_reference_generator},
+        std::pair{"lte_descramble_bits_is_self_inverse", &test_lte_descramble_bits_is_self_inverse},
+        std::pair{"lte_descramble_llrs_flips_sign_on_scrambling_ones",
+                  &test_lte_descramble_llrs_flips_sign_on_scrambling_ones},
+        std::pair{"lte_soft_demod_qpsk_matches_known_llrs",
+                  &test_lte_soft_demod_qpsk_matches_known_llrs},
+        std::pair{"lte_soft_demod_64qam_sign_pattern_matches_gray_mapping",
+                  &test_lte_soft_demod_64qam_sign_pattern_matches_gray_mapping},
+        std::pair{"lte_soft_demod_specialized_paths_match_reference",
+                  &test_lte_soft_demod_specialized_paths_match_reference},
+        std::pair{"lte_soft_demod_descrambled_fused_matches_split_reference",
+                  &test_lte_soft_demod_descrambled_fused_matches_split_reference},
+        std::pair{"pbch_backend_descrambled_llr_indication",
+                  &test_pbch_backend_descrambled_llr_indication},
+        std::pair{"pcfich_backend_descrambled_llr_indication",
+                  &test_pcfich_backend_descrambled_llr_indication},
+        std::pair{"pdcch_backend_descrambled_llr_indication",
+                  &test_pdcch_backend_descrambled_llr_indication},
+        std::pair{"pdcch_td_backend_descrambled_llr_indication",
+                  &test_pdcch_td_backend_descrambled_llr_indication},
+        std::pair{"pdsch_backend_descrambled_llr_indication_16qam",
+                  &test_pdsch_backend_descrambled_llr_indication_16qam},
+        std::pair{"pdsch_caller_owned_llr_output_matches_backend_builder",
+                  &test_pdsch_caller_owned_llr_output_matches_backend_builder},
+        std::pair{"pdsch_cached_builder_matches_uncached_builder",
+                  &test_pdsch_cached_builder_matches_uncached_builder},
+        std::pair{"pdsch_cached_caller_owned_output_matches_cached_builder",
+                  &test_pdsch_cached_caller_owned_output_matches_cached_builder},
+        std::pair{"pdsch_scrambling_plan_reuses_bits_for_same_key",
+                  &test_pdsch_scrambling_plan_reuses_bits_for_same_key},
+        std::pair{"pdsch_caller_owned_llr_output_rejects_small_buffer",
+                  &test_pdsch_caller_owned_llr_output_rejects_small_buffer},
         std::pair{"reject_invalid_descriptor", &test_reject_invalid_descriptor},
         std::pair{"buffer_too_small", &test_buffer_too_small},
         std::pair{"single_layer_identity_channel_equalization",

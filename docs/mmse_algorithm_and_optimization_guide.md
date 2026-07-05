@@ -36,8 +36,18 @@
 
 - PBCH 卷积译码 / MIB 恢复
 - PDCCH 盲检索 / DCI 译码
-- PDSCH 解扰 / 速率恢复 / Turbo 译码
+- PDSCH 速率恢复 / HARQ 软合并 / Turbo 译码
 - PCFICH 的最终 CFI 判决
+
+不过，当前仓库已经额外提供了一层面向 `PDSCH` 的下游 helper：
+
+- 基于 equalized `x_hat + sinr` 生成 max-log `LLR`
+- 基于 LTE Gold 序列做 `PDSCH` 解扰
+- 显式 caller-owned `LLR` 输出面
+- 显式 `PdschDescramblingPlanCache`
+
+这层 helper 仍然不等于真实存在的 `PDSCH` downstream context，也没有把仓库边界扩展到
+完整 `PDSCH` 译码链。
 
 因此，本项目既要保证信道估计和均衡结果正确，也要给后续软解调/译码保留足够时延预算。
 

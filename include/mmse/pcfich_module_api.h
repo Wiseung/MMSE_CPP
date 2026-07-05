@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mmse/lte_descrambling.h"
+#include "mmse/lte_soft_demod.h"
 #include "mmse/pcfich_chain_dto.h"
 
 namespace mmse::pcfich {
@@ -56,6 +58,35 @@ make_backend_pcfich_equalized_indication(const PcfichMmseResult& meta,
     backend.sinr.assign(out.sinr, out.sinr + meta.n_re);
     backend.re_grid_indices.assign(out.re_grid_indices, out.re_grid_indices + meta.n_re);
     return backend;
+}
+
+inline BackendPcfichDescrambledLlrIndication
+make_backend_pcfich_descrambled_llr_indication(const BackendPcfichEqualizedIndication& backend) {
+    BackendPcfichDescrambledLlrIndication llr_backend{};
+    llr_backend.sfn_subframe = backend.sfn_subframe;
+    llr_backend.cell_id = backend.cell_id;
+    llr_backend.n_prb = backend.n_prb;
+    llr_backend.start_symbol = backend.start_symbol;
+    llr_backend.reg_count = backend.reg_count;
+    llr_backend.n_tx_ports = backend.n_tx_ports;
+    llr_backend.n_rx_ant = backend.n_rx_ant;
+    llr_backend.n_layers = backend.n_layers;
+    llr_backend.tx_mode = backend.tx_mode;
+    llr_backend.mod_order = backend.mod_order;
+    llr_backend.sigma2 = backend.sigma2;
+    llr_backend.chain = backend.chain;
+    llr_backend.re_grid_indices = backend.re_grid_indices;
+
+    const std::uint8_t n_layers = backend.n_layers == 0U ? 1U : backend.n_layers;
+    const std::uint32_t n_re_per_layer =
+        static_cast<std::uint32_t>(backend.x_hat_re.size() / n_layers);
+    (void)mmse::lte::build_max_log_llrs(backend.x_hat_re.data(), backend.x_hat_im.data(),
+                                        backend.sinr.data(), n_re_per_layer, n_re_per_layer,
+                                        n_layers, backend.mod_order, llr_backend.llrs);
+    mmse::lte::descramble_llrs_inplace(
+        llr_backend.llrs.data(), static_cast<std::uint32_t>(llr_backend.llrs.size()),
+        mmse::lte::pcfich_c_init(backend.cell_id, backend.sfn_subframe));
+    return llr_backend;
 }
 
 } // namespace mmse::pcfich

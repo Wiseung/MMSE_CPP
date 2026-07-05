@@ -14,6 +14,7 @@
 
 - [PBCH 快速开始](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md)
 - [PCFICH 快速开始与 API 参考](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)
+- [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](/G:/MMSE_CPP/docs/pdsch_llr_downstream_quick_start_api_reference.md)
 - [PDCCH 子页面](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)
 - [PDCCH 快速开始](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
 - [PDCCH API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
@@ -25,22 +26,25 @@
 当前 LTE equalized-channel SDK 覆盖：
 
 - LTE PBCH 的 equalized RE 提取接口面
+- LTE PDSCH 的下游 `LLR / descrambling` helper
 - LTE PDCCH 控制区的 equalized RE 提取接口面
 - LTE PCFICH 的 equalized RE 提取接口面
 - 基于 CRS 的信道估计
 - MMSE 均衡
 - 由调用方持有输出 view，并支持后端 DTO 打包
+- 显式 caller-owned `LLR` 输出面与显式 `PDSCH` scrambling plan cache
 
-当前文档深度仍然主要集中在 `PDCCH` 集成路径上。`PBCH` 和 `PCFICH`
-现在已经共享同一套运行时与 DTO 风格，但尚未扩展出与 `PDCCH`
-同等深度的独立快速开始 / 字段级参考页面。
+当前文档深度仍然主要集中在 `PDCCH` 集成路径上。`PBCH`、`PCFICH`
+和 `PDSCH` 现在已经共享同一套 `LTE` 运行时 / DTO 风格；其中 `PDSCH`
+当前提供的是下游 `LLR / descrambling` helper 页面，而不是完整译码链页面。
 
 ## 推荐阅读顺序
 
 1. 先阅读 [LTE 下行总览](/G:/MMSE_CPP/docs/lte_pdcch_pdsch_channel_decode_overview.md)，建立协议背景。
 2. 如果要集成 PBCH equalized-RE 接口，阅读 [PBCH 快速开始](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md)。
 3. 如果要集成 PCFICH equalized-RE 接口，阅读 [PCFICH 快速开始与 API 参考](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)。
-4. 如果要查看当前文档最完整的信道专页，阅读 [PDCCH 子页面](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)。
+4. 如果要在 equalized `PDSCH` 输出之后生成解扰后的 `LLR`，阅读 [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](/G:/MMSE_CPP/docs/pdsch_llr_downstream_quick_start_api_reference.md)。
+5. 如果要查看当前文档最完整的信道专页，阅读 [PDCCH 子页面](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)。
 
 ## 公开头文件布局
 
@@ -61,6 +65,23 @@
 - 运行时入口：
   - `MmseEqualizerCpuContext::run_pbch(...)`
   - `MmseEqualizerGpuContext::run_pbch(...)`
+
+### PDSCH
+
+- 下游 helper 命名空间：`mmse::pdsch`
+- 低层输入 / 输出：
+  - 输入仍然是通用 `ExtractDescriptor + EqualizerOutputView`
+  - `PdschDescrambledLlrOutputView`
+  - `PdschDescrambledLlrResult`
+  - `PdschDescramblingPlanCache`
+  - `BackendPdschDescrambledLlrIndication`
+- 运行时入口：
+  - `MmseEqualizerCpuContext::run(...)`
+  - `MmseEqualizerGpuContext::run(...)`
+- 下游 helper：
+  - `prepare_pdsch_descrambling_plan(...)`
+  - `build_backend_pdsch_descrambled_llr_result(...)`
+  - `make_backend_pdsch_descrambled_llr_indication(...)`
 
 ### PDCCH
 
@@ -94,4 +115,5 @@
 
 - `PBCH` 现在有独立的快速开始页面。
 - `PCFICH` 现在有独立的快速开始和紧凑型 API 参考页面。
+- `PDSCH` 现在有独立的下游 `LLR / descrambling` helper 页面，但仓库仍没有更高层 `PDSCH` downstream context。
 - `PDCCH` 仍然是当前文档最完整的子页面，并保留最详细的字段索引。

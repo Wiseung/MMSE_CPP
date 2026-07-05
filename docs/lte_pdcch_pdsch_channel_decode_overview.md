@@ -134,6 +134,11 @@
 - 基于 `CRS` 的信道估计
 - `MMSE` 均衡
 - 输出均衡后的 `x_hat` 与 `sinr`
+- 在 `PDSCH` equalized 输出之后提供可选的下游 helper：
+  - max-log `LLR` 生成
+  - `PDSCH` 解扰
+  - 显式 `PdschDescramblingPlanCache`
+  - caller-owned `LLR` 输出面
 - `PDCCH` 场景下对 `PCFICH / PHICH` 占用资源的排除
 - `PDCCH 2Tx` 发射分集去映射
 
@@ -147,7 +152,8 @@
 - `PHICH` 译码
 - `PDCCH` 盲检索
 - `DCI` 解码 / CRC-RNTI 验证
-- `PDSCH` 解扰 / 速率恢复 / `Turbo` 译码
+- 仓库内真实存在的 `PDSCH` 下游 context / grant context / decode context
+- `PDSCH` 速率恢复 / `HARQ` 软合并 / `Turbo` 译码
 - `MAC PDU` 解码
 - `RRC / ASN.1` 解码
 
@@ -177,6 +183,31 @@
 - `n_re_per_layer`
 - `n_layers`
 - `mod_order`
+
+### 1.1 PDSCH 下游 LLR / 解扰 helper 输出
+
+输入：
+
+- `ExtractDescriptor`
+- `EqualizerOutputView`
+- `RNTI`
+
+输出：
+
+- `PdschDescrambledLlrOutputView`
+- `PdschDescrambledLlrResult`
+- 或者直接返回 `BackendPdschDescrambledLlrIndication`
+
+可选辅助对象：
+
+- `PdschDescramblingPlanCache`
+
+这一层的作用是把 equalized `PDSCH` 输出转换成：
+
+- 解扰后的 `LLR`
+
+但它仍然不等于完整 `PDSCH` 译码链，也不代表仓库内已经存在更高层的 `PDSCH`
+downstream context。
 
 ### 2. 旧版 PDCCH 单 RE 输出面
 
@@ -221,6 +252,8 @@
 
 - [include/mmse/types.h](G:\MMSE_CPP\include\mmse\types.h)
 - [include/mmse/mmse_equalizer.h](G:\MMSE_CPP\include\mmse\mmse_equalizer.h)
+- [include/mmse/pdsch_chain_dto.h](G:\MMSE_CPP\include\mmse\pdsch_chain_dto.h)
+- [include/mmse/pdsch_module_api.h](G:\MMSE_CPP\include\mmse\pdsch_module_api.h)
 - [include/mmse/pdcch_chain_dto.h](G:\MMSE_CPP\include\mmse\pdcch_chain_dto.h)
 - [include/mmse/pdcch_module_api.h](G:\MMSE_CPP\include\mmse\pdcch_module_api.h)
 
