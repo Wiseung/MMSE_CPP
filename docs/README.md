@@ -4,10 +4,13 @@
 
 - [LTE 下行信道译码总览](G:\MMSE_CPP\docs\lte_pdcch_pdsch_channel_decode_overview.md)
   说明协议层面的 `PBCH / PDCCH / PDSCH` 下行流程，以及当前 `MMSE_CPP` 的实现边界。
+- [LTE DCI 输出语义与 CE/MMSE 接口说明](G:\MMSE_CPP\docs\lte_dci_and_ce_mmse_reference.md)
+  说明下游 `DCI` 翻译输出的字段语义，以及当前 CE/MMSE 阶段的输入输出、数据长度和 `10 ms` 调用口径。
 
 ## LTE Equalized Channel SDK
 
 - [LTE Equalized Channel SDK 文档首页](G:\MMSE_CPP\docs\lte_equalized_channel_sdk_interface.md)
+- [LTE DCI 输出语义与 CE/MMSE 接口说明](G:\MMSE_CPP\docs\lte_dci_and_ce_mmse_reference.md)
 - [PBCH 快速开始](G:\MMSE_CPP\docs\pbch_chain_sdk_quick_start.md)
 - [PCFICH 快速开始与 API 参考](G:\MMSE_CPP\docs\pcfich_chain_sdk_quick_start_api_reference.md)
 - [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](G:\MMSE_CPP\docs\pdsch_llr_downstream_quick_start_api_reference.md)

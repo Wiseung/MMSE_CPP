@@ -12,6 +12,7 @@
 
 文档集合：
 
+- [LTE DCI 输出语义与 CE/MMSE 接口说明](/G:/MMSE_CPP/docs/lte_dci_and_ce_mmse_reference.md)
 - [PBCH 快速开始](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md)
 - [PCFICH 快速开始与 API 参考](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)
 - [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](/G:/MMSE_CPP/docs/pdsch_llr_downstream_quick_start_api_reference.md)
@@ -41,10 +42,11 @@
 ## 推荐阅读顺序
 
 1. 先阅读 [LTE 下行总览](/G:/MMSE_CPP/docs/lte_pdcch_pdsch_channel_decode_overview.md)，建立协议背景。
-2. 如果要集成 PBCH equalized-RE 接口，阅读 [PBCH 快速开始](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md)。
-3. 如果要集成 PCFICH equalized-RE 接口，阅读 [PCFICH 快速开始与 API 参考](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)。
-4. 如果要在 equalized `PDSCH` 输出之后生成解扰后的 `LLR`，阅读 [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](/G:/MMSE_CPP/docs/pdsch_llr_downstream_quick_start_api_reference.md)。
-5. 如果要查看当前文档最完整的信道专页，阅读 [PDCCH 子页面](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)。
+2. 如果要先把 `DCI` 语义、CE/MMSE 输入输出和 `10 ms` 调用口径讲清楚，阅读 [LTE DCI 输出语义与 CE/MMSE 接口说明](/G:/MMSE_CPP/docs/lte_dci_and_ce_mmse_reference.md)。
+3. 如果要集成 PBCH equalized-RE 接口，阅读 [PBCH 快速开始](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md)。
+4. 如果要集成 PCFICH equalized-RE 接口，阅读 [PCFICH 快速开始与 API 参考](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)。
+5. 如果要在 equalized `PDSCH` 输出之后生成解扰后的 `LLR`，阅读 [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](/G:/MMSE_CPP/docs/pdsch_llr_downstream_quick_start_api_reference.md)。
+6. 如果要查看当前文档最完整的信道专页，阅读 [PDCCH 子页面](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)。
 
 ## 公开头文件布局
 
