@@ -1,188 +1,368 @@
 # MMSE_CPP
 
-## 本地提交门禁
+[![CI](https://github.com/Wiseung/MMSE_CPP/actions/workflows/ci.yml/badge.svg)](https://github.com/Wiseung/MMSE_CPP/actions/workflows/ci.yml)
+[![CD](https://github.com/Wiseung/MMSE_CPP/actions/workflows/cd.yml/badge.svg)](https://github.com/Wiseung/MMSE_CPP/actions/workflows/cd.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+[![Security Policy](https://img.shields.io/badge/Security-Policy-blue)](./SECURITY.md)
 
-仓库克隆完成后先执行一次 `npm install`。本仓库使用 `husky + lint-staged` 在本地提交时做门禁：
-如果暂存文件格式不符合要求，或者原生代码改动导致轻量级 `mmse_tests` 构建/测试冒烟检查失败，则阻止提交。
+高性能 LTE PHY 基带处理仓库，聚焦以下能力：
 
-原生门禁规则如下：
+- 从 LTE FFT 后频域资源网格中提取目标 `RE`
+- 基于 `CRS` 做信道估计与 `MMSE` 均衡
+- 为 `PBCH / PCFICH / PDCCH / PDSCH` 提供统一或专用的 SDK 调用面
+- 为部分下游链路提供 `LLR / descrambling` helper
+- 提供 `AVX2` 与 `CUDA` 加速路径，以及对应测试、基准和质量门禁
 
-- 已暂存的 `*.cpp/*.h` 文件会在本地通过 `clang-format` 格式化
-- 已暂存的 `*.md/*.json/*.yml/*.yaml` 文件会通过 `prettier` 格式化
-- 如果暂存改动触及 `src/`、`include/`、`tests/`、`bench/` 或 `CMakeLists.txt` 等原生构建/测试面，`pre-commit`
-  钩子会执行本地 `cmake -> build mmse_tests -> ctest` 冒烟检查；若失败则拒绝提交
+这个仓库的核心输出是 **equalized symbols + SINR + 必要的资源网格元数据**。  
+它**不是**完整 LTE 接收机；当前并不负责最终的 `MIB / CFI / DCI / TB / MAC PDU` 解码输出。
 
-## CI / CD
+## 目录
 
-当前仓库使用两条工作流：
+- [项目定位](#项目定位)
+- [当前能力与边界](#当前能力与边界)
+- [仓库结构](#仓库结构)
+- [环境与依赖](#环境与依赖)
+- [快速开始](#快速开始)
+- [如何快速调用](#如何快速调用)
+- [文档导航](#文档导航)
+- [GitHub 协作入口](#github-协作入口)
+- [License](#license)
+- [Security and Quality](#security-and-quality)
 
-- `ci`：针对 `main`、`codex/**` 分支以及 Pull Request 在 Windows 上构建并运行测试
-- `cd`：当 `main` 分支 CI 成功后，自动生成发布包并部署到 `staging`；`production` 仍保留为
-  `workflow_dispatch` 手工触发
+## 项目定位
 
-在启用真实部署前，需要先在 GitHub 环境 / 仓库变量中配置：
+如果你第一次接触这个仓库，可以先把它理解为：
 
-- `production` 环境下的 `MMSE_PRODUCTION_DEPLOY_DIR`
+> 一个面向 LTE 下行物理层的 **equalized-channel runtime / SDK**，输入是 FFT 后的 LTE 频域资源网格，输出是可供下游继续处理的均衡软符号、`SINR` 和资源网格位置信息。
 
-推荐但非必须的 `staging` 配置：
+它适合做的事：
 
-- `staging` 环境下的 `MMSE_STAGING_DEPLOY_DIR`
+- 为 `PDSCH` 或控制信道构造高性能 `RE` 提取与均衡链路
+- 为 `PBCH / PCFICH / PDCCH` 提供可集成的 LTE SDK 入口
+- 为下游解码器提供 `PDCCH / PDSCH` 的 `LLR` 或 descrambled `LLR`
+- 做 CPU/GPU 一致性验证、性能分析和预算评估
 
-当前部署行为是基于文件拷贝：CD 工作流会生成 `dist/mmse_cpp-release.zip`，然后把它拷贝到目标目录，
-同时保留带时间戳的文件名和一个 `latest` 副本。如果 `MMSE_STAGING_DEPLOY_DIR` 还没有配置，
-`staging` 会退回到 runner 本地目录，以保证 CD 流程仍然能完整跑通。
+它当前不做的事：
 
-## CUDA 运行时策略
+- `PBCH -> MIB` 最终译码
+- `PCFICH -> CFI` 最终判决
+- `PDCCH` 的 `REG / CCE` 重组、盲检索、卷积译码、`CRC + RNTI` 校验和最终 `DCI` 输出
+- `PDSCH` 的速率恢复、`HARQ` 软合并、`Turbo` 译码和 `MAC PDU` 解析
 
-GPU 传输路径现在通过 `MmseEqualizerGpuConfig` 暴露了两类明确的运行时策略开关：
+## 当前能力与边界
 
-- `sigma2_ownership`
-  - `kHostOwnedIir`：由 host 持有 IIR 平滑后的 `sigma2` 状态，并在 `equalize` 前把标量写回 device
-  - `kDeviceOwnedState`：由 device 持有平滑后的 `sigma2` 状态，host 只读取一个摘要值用于 sanity / 观测
-- `validation_policy`
-  - `kReleaseSanity`：发布路径只保留轻量级的有限值 / 正值 sanity 检查
-  - `kTestDeepTrace`：保留 CPU-vs-GPU trace 对齐能力，仅用于 debug / test 场景
+| 能力                                      | 当前状态   | 主要入口                                                                  |
+| ----------------------------------------- | ---------- | ------------------------------------------------------------------------- |
+| 通用 LTE `RE` 提取 + `MMSE` 均衡          | 已支持     | `MmseEqualizerCpuContext::run(...)` / `MmseEqualizerGpuContext::run(...)` |
+| `PBCH` equalized `RE` 输出                | 已支持     | `run_pbch(...)`                                                           |
+| `PCFICH` equalized `RE` 输出              | 已支持     | `run_pcfich(...)`                                                         |
+| `PDCCH 1Tx` equalized `RE` 输出           | 已支持     | `run_pdcch(...)`                                                          |
+| `PDCCH 2Tx` transmit-diversity 去映射输出 | 已支持     | `run_pdcch_td(...)`                                                       |
+| `PDSCH` descrambled `LLR` helper          | 已支持     | `mmse::pdsch::*`                                                          |
+| `PDCCH` `QPSK LLR + descrambling` helper  | 已支持     | `mmse::pdcch::make_backend_pdcch_descrambled_llr_indication(...)`         |
+| `PBCH -> MIB` 最终译码                    | 不在仓库内 | 下游外部模块                                                              |
+| `PCFICH -> CFI` 最终译码                  | 不在仓库内 | 下游外部模块                                                              |
+| `PDCCH` 盲检索与最终 `DCI` 译码           | 不在仓库内 | 下游外部模块                                                              |
+| `PDSCH` `Turbo/HARQ/MAC` 解码             | 不在仓库内 | 下游外部模块                                                              |
 
-这样既能让生产路径保持精简，也能在测试场景下保留更严格的验证模式。
+对 `PDCCH` 来说，当前最容易误解的边界是：
 
-在 `kReleaseSanity` 下，CUDA scratch 被压缩为一个 4-float 头部，用于轻量级状态检查：
-`output_slot`、`symbol`、`subcarrier` 和运行时 `sigma2`。
-逐采样的 equalizer trace 负载只会在 `kTestDeepTrace` 下分配和回传。
+- 仓库已经支持控制区大小约束、`PCFICH / PHICH` 保留资源排除、`CRS` 信道估计、`MMSE` 均衡、`2Tx` 去映射
+- 仓库还**没有**支持 `REG / CCE` 重组、盲检索、卷积译码和最终 `DCI` 输出
 
-当前采样验证被拆成两层：
+如果你需要完整背景，先读：
 
-- 发布态 `spot_check_sample_count`：只用于轻量级输出检查，例如
-  `xhat` 有限、`sinr` 有限且为正、以及头部级别的 `sigma2` sanity
-- 调试态 `trace_sample_count`：在采样 RE 上额外输出逐采样的 equalizer trace 负载，
-  供 CPU-vs-GPU 对齐分析
+- [LTE 下行信道译码总览](./docs/lte_pdcch_pdsch_channel_decode_overview.md)
+- [LTE PDCCH 完整流程说明](./docs/lte_pdcch_complete_flow.md)
 
-## LTE PDCCH 适配
+## 仓库结构
 
-均衡路径现在通过 `ExtractDescriptor::channel_type` 支持第二种 LTE 下行提取模式：
+```text
+MMSE_CPP/
+├─ include/mmse/          # 公共头文件与 SDK 入口
+├─ src/                   # CPU / GPU / CUDA 实现
+├─ tests/                 # 单元测试
+├─ bench/                 # demo、基准与 profiling 工具
+├─ docs/                  # 中文技术文档、API 参考与性能报告
+├─ .github/workflows/     # CI / CD 工作流
+├─ LICENSE                # Apache-2.0 许可
+├─ SECURITY.md            # 安全策略
+└─ CMakeLists.txt         # 构建入口
+```
 
-- `MmseChannelType::kPdsch`：现有数据区流程
-- `MmseChannelType::kPdcch`：LTE PDCCH 控制区 RE 提取流程
+建议优先关注：
 
-对于 `kPdcch`，调用方必须提供：
+- `include/mmse/mmse_equalizer.h`：通用运行时入口
+- `include/mmse/lte_chain_sdk.h`：统一 LTE SDK 头文件
+- `include/mmse/pdcch_module_api.h`：`PDCCH` DTO/helper 接口
+- `bench/pdcch_module_demo.cpp`：最直接的可运行链路示例
 
-- `control_symbol_count`：由 `PCFICH/CFI` 推导出的 LTE 控制区大小，在 normal-CP 下取值 `1..3`
-- `control_re_exclusion_masks`：按控制符号、按 PRB 的 12-bit RE mask，用于在均衡前排除控制区里
-  不属于 PDCCH 的 RE，例如被 `PCFICH/PHICH` 占用的 RE
+## 环境与依赖
 
-对于希望停留在 DTO 层做链路集成的场景，PDCCH helper 层还提供了当前 LTE 支持边界下的可加式保留 RE 生成器：
+### 必需依赖
 
-- `mmse::pdcch::append_pcfich_reserved_control_re_list(...)`
-- `mmse::pdcch::append_phich_reserved_control_re_list(...)`
-- `mmse::pdcch::append_fdd_phich_reserved_control_re_list(...)`
+- `CMake >= 3.31`
+- 支持 `C++20` 的编译器
 
-这些 helper 会在 `make_pdcch_mmse_input(...)` 把列表转换成 `control_re_exclusion_masks` 之前，
-自动填充当前 20 MHz normal-CP LTE 边界下 `FrontendPdcchIndication::reserved_control_res`。
+### 已验证环境
 
-当前 helper 契约围绕一个共享的 LTE 控制子帧上下文展开：
+- Windows 2022
+- MSVC
+- Ninja
 
-- `FrontendPdcchIndication::control_subframe`
-- `PdcchMmseInput::control_subframe`
-- `mmse::pdcch::LteControlSubframeContext`
+### 可选依赖
 
-当前 DTO 层的集成路径是：
+- CUDA Toolkit  
+  用于启用 GPU/CUDA 后端；如果不可用，仓库仍可编译 CPU 路径。
+- Node.js / npm  
+  仅在你希望启用本地 `husky + lint-staged` 提交门禁时需要。
+- Python  
+  仅用于发布包和部署脚本，例如 `scripts/create_release_bundle.py`。
 
-1. 填充 `FrontendPdcchIndication::control_subframe`
-2. 调用 `append_pcfich_reserved_control_re_list(frontend)`
-3. 调用 `append_phich_reserved_control_re_list(frontend, ...)`
-4. 调用 `make_pdcch_mmse_input(...)`
+## 快速开始
 
-`run_pdcch(...)` 现在会先通过一条集中式校验路径验证低层 `PdcchMmseInput`，
-然后再构建内部 descriptor。
+### 1. 克隆仓库
 
-当前支持边界：
+```powershell
+git clone https://github.com/Wiseung/MMSE_CPP.git
+cd MMSE_CPP
+```
 
-- 仅支持 LTE，与仓库现有基于 CRS 的 20 MHz normal-CP 设计保持一致
-- 传统 `run_pdcch(...)` 的 per-RE 契约支持 `1 Tx port`
-- 新增 `run_pdcch_td(...)` 契约支持 `2 Tx port` LTE PDCCH 发射分集去映射，
-  并为每个 RE 对输出两个软符号
-- 基于 helper 的自动 `PHICH` 保留仍限制在相同的 LTE 20 MHz normal-CP helper 契约内，
-  不会扩展 equalizer 运行时契约
+### 2. 可选：安装本地 Git 提交门禁
 
-### 模块集成接口面
+如果你只想构建和运行仓库，本步骤不是必需的。  
+如果你希望本地提交时自动执行格式化和轻量测试，请执行：
 
-对于链路集成，优先使用专门的 PDCCH module API，而不是手工构造一个通用 `ExtractDescriptor`。
+```powershell
+npm install
+```
 
-推荐的单头文件 SDK 入口如下：
+### 3. 配置构建
 
-- 仅 PDCCH 接口面：`#include "mmse/pdcch_chain_sdk.h"`
-- 面向 `PBCH/PDCCH/PCFICH` 以及 `PDSCH` 下游 helper 的统一 LTE 接口面：
-  `#include "mmse/lte_chain_sdk.h"`
-- LTE 总体信道流程概览：`docs/lte_pdcch_pdsch_channel_decode_overview.md`
-- 文档索引：`docs/README.md`
-- LTE SDK 首页：`docs/lte_equalized_channel_sdk_interface.md`（`LTE Equalized Channel SDK v1`）
-- PBCH 快速开始：`docs/pbch_chain_sdk_quick_start.md`
-- PCFICH 快速开始 / API 参考：`docs/pcfich_chain_sdk_quick_start_api_reference.md`
-- PDSCH 下游 LLR / 解扰接口：`docs/pdsch_llr_downstream_quick_start_api_reference.md`
-- LTE MMSE 预算报告：`docs/lte_mmse_budget_report_2026-07-01.md`
-- PDCCH 文档首页：`docs/pdcch_chain_sdk_interface.md`（`PDCCH Chain SDK v1`）
-- 快速开始：`docs/pdcch_chain_sdk_quick_start.md`
-- API 参考：`docs/pdcch_chain_sdk_api_reference.md`
-- 版本策略：`docs/pdcch_chain_sdk_versioning_policy.md`
+推荐使用当前 CI 同类的单配置 Ninja 路径：
 
-面向上游的输入：
+```powershell
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+```
 
-- `PdcchMmseInput`
-  - FFT 网格：`grid`
-  - 小区 / 时序上下文：`sfn_subframe`、`cell_id`
-  - PDCCH 区域描述：`control_symbol_count`、`n_prb`、`prb_bitmap`
-  - 非 PDCCH 控制 RE 保留：`control_re_exclusion_masks`
-  - 用于后续级联的元数据透传：`PdcchChainMetadata`
+如果你明确只想构建 CPU 路径：
 
-面向下游的输出：
+```powershell
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMMSE_ENABLE_CUDA=OFF
+```
 
-- 传统 per-RE 接口面：
-  - 均衡后的软符号输入：`x_hat_re`、`x_hat_im`、`sinr`
-  - 每个输出 RE 的来源映射：`re_grid_indices`
-  - 运行元数据和透传字段：`PdcchMmseResult`
-- 新增 2Tx TD 接口面：
-  - 均衡后的软符号输入：`x_hat_re`、`x_hat_im`、`sinr`
-  - 每个软符号对应的 RE 对映射：`re_grid_indices0`、`re_grid_indices1`
-  - 运行元数据和透传字段：`PdcchTdMmseResult`
+### 4. 构建
 
-这样能让当前模块继续聚焦在信道估计和均衡，同时又保留 PDCCH 下游阶段需要的资源位置与候选元数据。
+```powershell
+cmake --build build --parallel
+```
 
-### LTE 统一 DTO 接口面
+### 5. 运行测试
 
-如果集成方希望只包含一个 LTE 总入口头文件，而不是一个 PDCCH 专用头文件，则使用：
+```powershell
+ctest --test-dir build --output-on-failure
+```
 
-- `#include "mmse/lte_chain_sdk.h"`
+如果你使用的是 Visual Studio 这类多配置生成器，而不是上面的 Ninja 单配置路径，请带上配置名：
 
-这个统一头文件会导出：
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+```
 
-- `mmse::pbch::*`
-  - `FrontendPbchIndication`
-  - `make_pbch_mmse_input(...)`
-  - `MmseEqualizerCpuContext::run_pbch(...)`
-  - `MmseEqualizerGpuContext::run_pbch(...)`
-  - `make_backend_pbch_equalized_indication(...)`
-- `mmse::pdcch::*`
-  - 现有 DTO 与 helper 接口面
-- `mmse::pdsch::*`
-  - `PdschDescramblingPlanCache`
-  - `PdschDescrambledLlrOutputView`
-  - `PdschDescrambledLlrResult`
-  - `BackendPdschDescrambledLlrIndication`
-  - `prepare_pdsch_descrambling_plan(...)`
-  - `build_backend_pdsch_descrambled_llr_result(...)`
-  - `make_backend_pdsch_descrambled_llr_indication(...)`
-- `mmse::pcfich::*`
-  - `FrontendPcfichIndication`
-  - `make_pcfich_mmse_input(...)`
-  - `MmseEqualizerCpuContext::run_pcfich(...)`
-  - `MmseEqualizerGpuContext::run_pcfich(...)`
-  - `make_backend_pcfich_equalized_indication(...)`
+### 6. 运行第一个示例
 
-### PDSCH 下游 helper 现状
+如果你想最快看到 SDK 调用路径，先运行 `PDCCH` demo：
 
-当前仓库已经提供 `PDSCH` 下游 `LLR / 解扰` helper，但仍然没有仓库内真实存在的
-`PDSCH` downstream context。推荐集成方式是：
+```powershell
+cmake --build build --target pdcch_module_demo --parallel
+.\build\pdcch_module_demo.exe
+```
 
-1. 上游先调用 `MmseEqualizerCpuContext::run(...)` 或 `MmseEqualizerGpuContext::run(...)`
-2. 下游再通过 `mmse::pdsch::*` helper 生成解扰后的 `LLR`
-3. 若调用方存在真实的 grant / item / worker context，则由调用方持有
-   `PdschDescramblingPlanCache` 和 caller-owned `LLR` buffer
+## 如何快速调用
+
+### 先选对入口
+
+| 你的目标                            | 推荐头文件               | 主入口                                                                                        |
+| ----------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------- |
+| 通用 `PDSCH` / 自定义 `RE` 均衡     | `mmse/mmse_equalizer.h`  | `run(...)`                                                                                    |
+| 统一 LTE SDK 入口                   | `mmse/lte_chain_sdk.h`   | `run_pbch / run_pcfich / run_pdcch / run_pdcch_td`                                            |
+| `PDCCH 1Tx` 控制区链路              | `mmse/pdcch_chain_sdk.h` | `FrontendPdcchIndication -> make_pdcch_mmse_input(...) -> run_pdcch(...)`                     |
+| `PDCCH 2Tx` transmit-diversity 链路 | `mmse/pdcch_chain_sdk.h` | `run_pdcch_td(...)`                                                                           |
+| `PDSCH` descrambled `LLR` helper    | `mmse/lte_chain_sdk.h`   | `prepare_pdsch_descrambling_plan(...)` / `make_backend_pdsch_descrambled_llr_indication(...)` |
+
+### 最常见调用路径
+
+#### 1. 通用均衡路径
+
+适合你已经自己知道要提取哪些 `RE`，并且只需要统一的 equalizer runtime：
+
+1. 构造 `PlanarGridViewF32`
+2. 构造 `ExtractDescriptor`
+3. 初始化 `MmseEqualizerCpuContext` 或 `MmseEqualizerGpuContext`
+4. 调用 `run(...)`
+5. 读取 `EqualizerOutputView`
+
+#### 2. `PDCCH 1Tx` SDK 路径
+
+适合你已经知道控制区大小，并希望仓库帮你完成控制区 `RE` 提取、`CRS` 信道估计和 `MMSE`：
+
+```cpp
+#include "mmse/pdcch_chain_sdk.h"
+
+mmse::MmseEqualizerCpuContext ctx;
+ctx.init({});
+
+mmse::pdcch::FrontendPdcchIndication frontend = ...;
+mmse::pdcch::append_pcfich_reserved_control_re_list(frontend);
+mmse::pdcch::append_phich_reserved_control_re_list(frontend, ...);
+
+mmse::PdcchMmseInput in = mmse::pdcch::make_pdcch_mmse_input(grid, frontend);
+mmse::PdcchMmseOutputView out = ...;
+mmse::PdcchMmseResult meta{};
+
+ctx.run_pdcch(in, out, meta);
+auto backend = mmse::pdcch::make_backend_pdcch_equalized_indication(meta, out);
+```
+
+这条路径的工作终点是：
+
+- 得到 `equalized RE`
+- 得到 `sinr`
+- 得到 `re_grid_indices`
+
+它**不是**最终 `DCI` 解码结束点。
+
+完整可运行示例见：
+
+- [`bench/pdcch_module_demo.cpp`](./bench/pdcch_module_demo.cpp)
+
+#### 3. `PDCCH 2Tx` 路径
+
+如果控制信道是 `2 Tx port transmit diversity`，不要再走 `run_pdcch(...)`。  
+应直接切换到：
+
+- `run_pdcch_td(...)`
+
+它会输出：
+
+- 软符号
+- `sinr`
+- `re_grid_indices0 / re_grid_indices1`
+
+也就是“每个软符号对应哪一对来源 `RE`”。
+
+## 文档导航
+
+### 如果你是第一次看这个项目
+
+- [文档总索引](./docs/README.md)
+- [LTE Equalized Channel SDK 文档首页](./docs/lte_equalized_channel_sdk_interface.md)
+- [LTE 下行信道译码总览](./docs/lte_pdcch_pdsch_channel_decode_overview.md)
+
+### 如果你想看 `PDCCH`
+
+- [PDCCH 完整流程说明](./docs/lte_pdcch_complete_flow.md)
+- [PDCCH Chain SDK 文档首页](./docs/pdcch_chain_sdk_interface.md)
+- [PDCCH Chain SDK 快速开始](./docs/pdcch_chain_sdk_quick_start.md)
+- [PDCCH Chain SDK API 参考](./docs/pdcch_chain_sdk_api_reference.md)
+- [PDCCH Module API 集成示例](./docs/pdcch_module_api_example.md)
+- [LTE DCI 输出语义与 CE/MMSE 接口说明](./docs/lte_dci_and_ce_mmse_reference.md)
+
+### 如果你想看 `PBCH / PCFICH / PDSCH`
+
+- [PBCH 快速开始](./docs/pbch_chain_sdk_quick_start.md)
+- [PCFICH 快速开始与 API 参考](./docs/pcfich_chain_sdk_quick_start_api_reference.md)
+- [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](./docs/pdsch_llr_downstream_quick_start_api_reference.md)
+
+### 如果你想看算法、性能和预算
+
+- [MMSE_CPP 算法原理与优化方法详解](./docs/mmse_algorithm_and_optimization_guide.md)
+- [MMSE CUDA Profiling 报告（2026-07-03）](./docs/mmse_cuda_profile_report_2026-07-03.md)
+- [LTE MMSE 预算报告（2026-07-01）](./docs/lte_mmse_budget_report_2026-07-01.md)
+
+## GitHub 协作入口
+
+如果你在 GitHub 上使用这个项目，建议按目的选择入口，而不是全部都走 `Issues`。
+
+| 你的诉求                           | 应该去哪里  | 链接                                                                               |
+| ---------------------------------- | ----------- | ---------------------------------------------------------------------------------- |
+| 报告 bug、回归、构建失败、测试失败 | Issues      | [Issues](https://github.com/Wiseung/MMSE_CPP/issues)                               |
+| 提问、讨论设计取舍、确认集成方式   | Discussions | [Discussions](https://github.com/Wiseung/MMSE_CPP/discussions)                     |
+| 看路线图、依赖顺序、执行状态       | Projects    | [MMSE_CPP Project](https://github.com/users/Wiseung/projects/1)                    |
+| 查看长期说明、FAQ、操作知识沉淀    | Wiki        | [Wiki](https://github.com/Wiseung/MMSE_CPP/wiki)                                   |
+| 私下报告安全漏洞                   | Security    | [Security Advisories](https://github.com/Wiseung/MMSE_CPP/security/advisories/new) |
+
+使用建议：
+
+- `Issues`：只放可执行的问题、缺陷和明确需求
+- `Discussions`：适合“先讨论再落 issue/PR”的问题
+- `Projects`：适合看当前 roadmap，而不是追 PR 历史
+- `Wiki`：如果某个主题需要长期维护、比 `README` 更长、但又不属于 API 参考，放到 Wiki 更合适  
+  如果当前 Wiki 页面为空，请以 [`docs/`](./docs/) 为准
+
+## License
+
+本项目采用 [Apache License 2.0](./LICENSE)。
+
+这意味着你可以在遵守许可条款的前提下：
+
+- 使用、复制和分发本项目
+- 修改源码并分发修改版本
+- 在商业项目中集成本项目
+
+你仍需要遵守 `Apache-2.0` 的保留许可、变更说明和免责声明要求。若你计划对外发布
+基于本仓库的派生版本，请直接阅读 [LICENSE](./LICENSE) 正文。
+
+## Security and Quality
+
+### Security
+
+- 安全策略文件：[`SECURITY.md`](./SECURITY.md)
+- 私密漏洞报告入口：<https://github.com/Wiseung/MMSE_CPP/security/advisories/new>
+- 不要通过公开 `Issues` 报告安全漏洞
+
+### Quality
+
+本仓库的质量保障分为本地门禁、CI、CD、测试和 profiling 五层：
+
+#### 1. 本地提交门禁
+
+执行 `npm install` 后，会启用 `husky + lint-staged`：
+
+- `*.cpp / *.h` 走 `clang-format`
+- `*.md / *.json / *.yml / *.yaml` 走 `prettier`
+- 如果改动触及 `src/`、`include/`、`tests/`、`bench/` 或 `CMakeLists.txt`，会自动触发本地 `cmake -> build mmse_tests -> ctest` 冒烟检查
+
+#### 2. CI
+
+CI 工作流：
+
+- 入口：<https://github.com/Wiseung/MMSE_CPP/actions/workflows/ci.yml>
+- 触发：`main`、`codex/**`、Pull Request
+- 内容：Windows 2022 上执行 `configure -> build -> test`
+
+#### 3. CD
+
+CD 工作流：
+
+- 入口：<https://github.com/Wiseung/MMSE_CPP/actions/workflows/cd.yml>
+- `main` 分支 CI 成功后自动打包并部署到 `staging`
+- `production` 保持手工触发
+
+#### 4. 单元测试与示例
+
+- 主测试目标：`mmse_tests`
+- 关键示例目标：`pdcch_module_demo`
+- 其他常用目标：
+  - `mmse_bench`
+  - `mmse_cuda_profile`
+  - `mmse_channel_budget`
+
+#### 5. 性能与预算文档
+
+如果你需要判断一个改动是否只是“功能正确”还是“真正达到工程要求”，请同时参考：
+
+- [MMSE CUDA Profiling 报告（2026-07-03）](./docs/mmse_cuda_profile_report_2026-07-03.md)
+- [LTE MMSE 预算报告（2026-07-01）](./docs/lte_mmse_budget_report_2026-07-01.md)
+
+这两份文档比单次控制台输出更接近项目级质量判断标准。

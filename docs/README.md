@@ -4,6 +4,8 @@
 
 - [LTE 下行信道译码总览](G:\MMSE_CPP\docs\lte_pdcch_pdsch_channel_decode_overview.md)
   说明协议层面的 `PBCH / PDCCH / PDSCH` 下行流程，以及当前 `MMSE_CPP` 的实现边界。
+- [LTE PDCCH 完整流程说明](G:\MMSE_CPP\docs\lte_pdcch_complete_flow.md)
+  逐步说明 `PDCCH` 从控制区确定到最终 `DCI` 输出的完整链路，并标出当前仓库已覆盖与未覆盖的步骤。
 - [LTE DCI 输出语义与 CE/MMSE 接口说明](G:\MMSE_CPP\docs\lte_dci_and_ce_mmse_reference.md)
   说明下游 `DCI` 翻译输出的字段语义，以及当前 CE/MMSE 阶段的输入输出、数据长度和 `10 ms` 调用口径。
 
