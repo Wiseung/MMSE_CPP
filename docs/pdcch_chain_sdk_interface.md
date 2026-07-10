@@ -18,6 +18,7 @@
 
 文档集合：
 
+- [完整流程说明](/G:/MMSE_CPP/docs/lte_pdcch_complete_flow.md)
 - [快速开始](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
 - [API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
 - [版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
@@ -26,8 +27,9 @@
 ## 推荐阅读顺序
 
 1. 首次集成时先阅读 [快速开始](/G:/MMSE_CPP/docs/pdcch_chain_sdk_quick_start.md)
-2. 做字段级查询时使用 [API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
-3. 在依赖兼容性保证或准备改接口前，先阅读 [版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
+2. 如果要看“完整 `PDCCH` 接收链”和“当前仓库覆盖到哪一步”，先阅读 [完整流程说明](/G:/MMSE_CPP/docs/lte_pdcch_complete_flow.md)
+3. 做字段级查询时使用 [API 参考](/G:/MMSE_CPP/docs/pdcch_chain_sdk_api_reference.md)
+4. 在依赖兼容性保证或准备改接口前，先阅读 [版本策略](/G:/MMSE_CPP/docs/pdcch_chain_sdk_versioning_policy.md)
 
 ## 作用范围
 
