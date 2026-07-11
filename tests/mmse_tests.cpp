@@ -16,6 +16,7 @@
 #include "mmse/pdsch_chain_dto.h"
 #include "mmse/pdsch_module_api.h"
 #include "mmse/pdcch_chain_dto.h"
+#include "mmse/pdcch_chain_sdk.h"
 #include "mmse/pdcch_module_api.h"
 #include "mmse/pcfich_chain_dto.h"
 #include "mmse/pcfich_module_api.h"
@@ -349,6 +350,148 @@ void expect_sign(float value, int expected_sign, const std::string& message) {
         return;
     }
     expect_near(value, 0.0F, 1.0e-6F, message);
+}
+
+std::vector<float> reference_pdcch_convolutional_rate_match(const std::vector<float>& input,
+                                                            std::uint32_t encoded_bit_count) {
+    constexpr std::uint32_t kColumns = 32U;
+    constexpr std::array<std::uint8_t, kColumns> kPermutation = {
+        1U, 17U, 9U, 25U, 5U, 21U, 13U, 29U, 3U, 19U, 11U, 27U, 7U, 23U, 15U, 31U,
+        0U, 16U, 8U, 24U, 4U, 20U, 12U, 28U, 2U, 18U, 10U, 26U, 6U, 22U, 14U, 30U,
+    };
+    expect_true(input.size() % mmse::pdcch::kPdcchConvolutionalCodeRate == 0U,
+                "reference convolutional input must contain three streams");
+
+    const std::uint32_t codeword_bit_count =
+        static_cast<std::uint32_t>(input.size() / mmse::pdcch::kPdcchConvolutionalCodeRate);
+    const std::uint32_t row_count = (codeword_bit_count + kColumns - 1U) / kColumns;
+    const std::uint32_t interleaver_size = row_count * kColumns;
+    const std::uint32_t dummy_bit_count = interleaver_size - codeword_bit_count;
+    std::vector<float> collected(mmse::pdcch::kPdcchConvolutionalCodeRate * interleaver_size, 0.0F);
+    std::vector<std::uint8_t> present(collected.size(), 0U);
+
+    std::uint32_t collection_index = 0U;
+    for (std::uint32_t stream = 0U; stream < mmse::pdcch::kPdcchConvolutionalCodeRate; ++stream) {
+        for (std::uint32_t column = 0U; column < kColumns; ++column) {
+            for (std::uint32_t row = 0U; row < row_count; ++row) {
+                const std::uint32_t padded_bit = row * kColumns + kPermutation[column];
+                if (padded_bit >= dummy_bit_count) {
+                    collected[collection_index] =
+                        input[(padded_bit - dummy_bit_count) *
+                                  mmse::pdcch::kPdcchConvolutionalCodeRate +
+                              stream];
+                    present[collection_index] = 1U;
+                }
+                ++collection_index;
+            }
+        }
+    }
+
+    std::vector<float> output;
+    output.reserve(encoded_bit_count);
+    collection_index = 0U;
+    while (output.size() < encoded_bit_count) {
+        if (present[collection_index] != 0U) {
+            output.push_back(collected[collection_index]);
+        }
+        collection_index = (collection_index + 1U) % collected.size();
+    }
+    return output;
+}
+
+void append_bits(std::vector<std::uint8_t>& bits, std::uint32_t value, std::uint8_t width) {
+    for (std::uint8_t bit = 0U; bit < width; ++bit) {
+        const std::uint8_t shift = static_cast<std::uint8_t>(width - 1U - bit);
+        bits.push_back(static_cast<std::uint8_t>((value >> shift) & 1U));
+    }
+}
+
+std::vector<std::uint8_t> append_pdcch_crc_rnti_mask(const std::vector<std::uint8_t>& payload,
+                                                     std::uint16_t rnti) {
+    std::vector<std::uint8_t> result = payload;
+    const std::uint16_t masked_crc =
+        static_cast<std::uint16_t>(mmse::pdcch::calculate_pdcch_crc16(
+                                       payload.data(), static_cast<std::uint32_t>(payload.size())) ^
+                                   rnti);
+    append_bits(result, masked_crc, mmse::pdcch::kPdcchCrcBitCount);
+    return result;
+}
+
+std::uint16_t reference_type2_riv(std::uint16_t n_prb, std::uint16_t start_prb,
+                                  std::uint16_t allocated_prb_count) {
+    expect_true(n_prb != 0U && allocated_prb_count != 0U &&
+                    start_prb + allocated_prb_count <= n_prb,
+                "reference type2 RIV arguments");
+    if (allocated_prb_count - 1U <= n_prb / 2U) {
+        return static_cast<std::uint16_t>(n_prb * (allocated_prb_count - 1U) + start_prb);
+    }
+    return static_cast<std::uint16_t>(n_prb * (n_prb - allocated_prb_count + 1U) + n_prb - 1U -
+                                      start_prb);
+}
+
+struct TailBitingDecoderProbe {
+    std::vector<float> expected_llrs{};
+    std::vector<std::uint8_t> decoded_bits{};
+    MmseStatus return_status = MmseStatus::kOk;
+    std::uint32_t call_count = 0U;
+};
+
+MmseStatus
+probe_tail_biting_decoder(void* context,
+                          const mmse::pdcch::PdcchTailBitingConvolutionalDecodeRequest& request) {
+    auto* probe = static_cast<TailBitingDecoderProbe*>(context);
+    if (probe == nullptr || request.convolutional_llrs == nullptr ||
+        request.decoded_bits == nullptr ||
+        request.convolutional_llr_count != probe->expected_llrs.size() ||
+        request.decoded_bit_count * mmse::pdcch::kPdcchConvolutionalCodeRate !=
+            request.convolutional_llr_count ||
+        request.soft_bit_polarity != mmse::pdcch::PdcchSoftBitPolarity::kNegativeFavorsZero ||
+        request.llr_order != mmse::pdcch::PdcchConvolutionalLlrOrder::kLteRateRecoveredTriplets ||
+        !request.tail_biting) {
+        return MmseStatus::kInternalError;
+    }
+    for (std::uint32_t i = 0U; i < request.convolutional_llr_count; ++i) {
+        if (std::fabs(request.convolutional_llrs[i] - probe->expected_llrs[i]) > 1.0e-6F) {
+            return MmseStatus::kInternalError;
+        }
+    }
+
+    ++probe->call_count;
+    if (probe->return_status != MmseStatus::kOk) {
+        return probe->return_status;
+    }
+    if (!probe->decoded_bits.empty()) {
+        if (probe->decoded_bits.size() != request.decoded_bit_count) {
+            return MmseStatus::kInternalError;
+        }
+        std::copy(probe->decoded_bits.begin(), probe->decoded_bits.end(), request.decoded_bits);
+        return MmseStatus::kOk;
+    }
+    for (std::uint32_t bit = 0U; bit < request.decoded_bit_count; ++bit) {
+        request.decoded_bits[bit] = static_cast<std::uint8_t>(bit & 1U);
+    }
+    return MmseStatus::kOk;
+}
+
+struct FixedTailBitingDecoder {
+    std::vector<std::uint8_t> decoded_bits{};
+    std::uint32_t call_count = 0U;
+};
+
+MmseStatus
+fixed_tail_biting_decoder(void* context,
+                          const mmse::pdcch::PdcchTailBitingConvolutionalDecodeRequest& request) {
+    auto* decoder = static_cast<FixedTailBitingDecoder*>(context);
+    if (decoder == nullptr || request.convolutional_llrs == nullptr ||
+        request.decoded_bits == nullptr || !request.tail_biting ||
+        request.decoded_bit_count != decoder->decoded_bits.size() ||
+        request.convolutional_llr_count !=
+            request.decoded_bit_count * mmse::pdcch::kPdcchConvolutionalCodeRate) {
+        return MmseStatus::kInternalError;
+    }
+    std::copy(decoder->decoded_bits.begin(), decoder->decoded_bits.end(), request.decoded_bits);
+    ++decoder->call_count;
+    return MmseStatus::kOk;
 }
 
 void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor& desc, float data0,
@@ -877,7 +1020,7 @@ void test_pdcch_layout_excludes_crs_and_reserved_res() {
     const auto desc = make_pdcch_desc();
     mmse::detail::ReLayout layout{};
     const std::uint32_t n_re = mmse::detail::build_pdcch_re_layout(desc, layout);
-    expect_true(n_re == 3400U, "pdcch RE count without extra reserved REs");
+    expect_true(n_re == 3168U, "pdcch RE count without extra reserved REs");
     for (std::uint32_t i = 0; i < n_re; ++i) {
         const std::uint32_t grid_idx = layout.grid_indices[i];
         const std::uint32_t symbol = grid_idx / kLteNumSubcarriers20MHz;
@@ -890,7 +1033,13 @@ void test_pdcch_layout_excludes_crs_and_reserved_res() {
     auto reserved = desc;
     reserved.control_re_exclusion_masks[kLteNumPrb20MHz] = 0x000FU;
     const std::uint32_t n_re_reserved = mmse::detail::build_pdcch_re_layout(reserved, layout);
-    expect_true(n_re_reserved == n_re - 4U, "reserved control REs must be excluded");
+    expect_true(n_re_reserved == n_re,
+                "CCE alignment may retain the same PDCCH RE count after excluding one REG");
+    for (std::uint32_t i = 0; i < n_re_reserved; ++i) {
+        const std::uint32_t grid_idx = layout.grid_indices[i];
+        expect_true(grid_idx < kLteNumSubcarriers20MHz || grid_idx > kLteNumSubcarriers20MHz + 3U,
+                    "reserved control REs must be excluded");
+    }
 }
 
 void test_pbch_layout_matches_lte_center_72_subcarriers() {
@@ -943,7 +1092,7 @@ void test_pdcch_cpu_run_supports_single_port_and_generic_two_port_layout() {
     std::vector<float> sinr(cap);
     EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
     expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "single-port pdcch run");
-    expect_true(out.n_re_per_layer == 3400U, "single-port pdcch RE count");
+    expect_true(out.n_re_per_layer == 3168U, "single-port pdcch RE count");
     expect_true(out.mod_order == 2U, "pdcch mod order must stay qpsk");
 
     auto two_port = desc;
@@ -951,7 +1100,7 @@ void test_pdcch_cpu_run_supports_single_port_and_generic_two_port_layout() {
     two_port.tx_mode = 2U;
     expect_true(ctx.run(grid, two_port, out) == MmseStatus::kOk,
                 "generic run should allow two-port pdcch backend path");
-    expect_true(out.n_re_per_layer == 3200U, "two-port generic pdcch RE count");
+    expect_true(out.n_re_per_layer == 3168U, "two-port generic pdcch RE count");
 }
 
 void test_pbch_frontend_dto_builds_mmse_input() {
@@ -1277,7 +1426,7 @@ void test_pdcch_td_cpu_run_recovers_qpsk_symbols() {
 
     mmse::detail::ReLayout layout{};
     const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
-    if (n_source_re != 3200U) {
+    if (n_source_re != 3168U) {
         throw TestFailure{"two-port pdcch RE count actual=" + std::to_string(n_source_re)};
     }
     expect_true((n_source_re & 1U) == 0U, "two-port pdcch RE count must be even");
@@ -1447,7 +1596,7 @@ void test_pdcch_module_api_returns_chain_metadata_and_re_indices() {
     if (status != MmseStatus::kOk) {
         throw TestFailure{"pdcch module api run status=" + std::string(to_string(status))};
     }
-    expect_true(meta.n_re == 3400U, "pdcch module api RE count");
+    expect_true(meta.n_re == 3168U, "pdcch module api RE count");
     expect_true(meta.chain.request_id == in.chain.request_id, "request id passthrough");
     expect_true(meta.chain.candidate_id == in.chain.candidate_id, "candidate id passthrough");
     expect_true(meta.chain.first_cce == in.chain.first_cce, "first cce passthrough");
@@ -1568,6 +1717,435 @@ void test_pdcch_helper_apply_reserved_re_list() {
                 "second reserved RE should be applied");
     expect_true(!mmse::pdcch::is_control_re_excluded(in, 0U, 0U, 0U),
                 "non-reserved RE should remain clear");
+}
+
+void test_pdcch_control_region_builds_regs_and_cces() {
+    constexpr std::uint32_t kRegCount = 18U;
+    std::array<std::uint16_t, kRegCount * mmse::pdcch::kPdcchRePerReg> grid_indices{};
+    for (std::uint32_t re = 0U; re < grid_indices.size(); ++re) {
+        grid_indices[re] = static_cast<std::uint16_t>(re + 100U);
+    }
+
+    mmse::pdcch::PdcchControlRegion control_region{};
+    expect_true(mmse::pdcch::build_pdcch_control_region(
+                    17U, 1U, grid_indices.data(), static_cast<std::uint32_t>(grid_indices.size()),
+                    control_region) == MmseStatus::kOk,
+                "pdcch control-region builder should accept ordered REs");
+    expect_true(control_region.cell_id == 17U, "pdcch control-region cell id");
+    expect_true(control_region.control_symbol_count == 1U, "pdcch control-region CFI");
+    expect_true(control_region.n_source_re == grid_indices.size(),
+                "pdcch control-region source RE count");
+    expect_true(control_region.regs.size() == kRegCount, "pdcch control-region REG count");
+    expect_true(control_region.cces.size() == 2U, "pdcch control-region CCE count");
+    expect_true(control_region.n_unassigned_reg == 0U, "pdcch control-region complete CCEs");
+    expect_true(control_region.regs[1].source_re_indices[0] == 4U,
+                "pdcch control-region REG source offset");
+    expect_true(control_region.regs[1].grid_indices[3] == 107U,
+                "pdcch control-region REG grid index");
+    expect_true(control_region.cces[1].reg_indices[0] == 9U &&
+                    control_region.cces[1].reg_indices[8] == 17U,
+                "pdcch control-region CCE REG range");
+}
+
+void test_pdcch_control_region_rejects_invalid_re_indices() {
+    std::array<std::uint16_t, 8> unordered = {0U, 1U, 2U, 3U, 3U, 5U, 6U, 7U};
+    mmse::pdcch::PdcchControlRegion control_region{};
+    expect_true(mmse::pdcch::build_pdcch_control_region(
+                    0U, 1U, unordered.data(), static_cast<std::uint32_t>(unordered.size()),
+                    control_region) == MmseStatus::kInvalidArgument,
+                "pdcch control-region builder should reject duplicate RE indices");
+
+    std::array<std::uint16_t, 8> outside_control_region = {
+        0U, 1U, 2U, 3U, 4U, 5U, 6U, static_cast<std::uint16_t>(kLteNumSubcarriers20MHz)};
+    expect_true(mmse::pdcch::build_pdcch_control_region(
+                    0U, 1U, outside_control_region.data(),
+                    static_cast<std::uint32_t>(outside_control_region.size()),
+                    control_region) == MmseStatus::kInvalidArgument,
+                "pdcch control-region builder should reject REs outside the control region");
+}
+
+void test_pdcch_common_search_candidates_follow_lte_levels() {
+    constexpr std::uint32_t kRegCount = 810U;
+    std::array<std::uint16_t, kRegCount * mmse::pdcch::kPdcchRePerReg> grid_indices{};
+    for (std::uint32_t re = 0U; re < grid_indices.size(); ++re) {
+        grid_indices[re] = static_cast<std::uint16_t>(re);
+    }
+
+    mmse::pdcch::PdcchControlRegion control_region{};
+    expect_true(mmse::pdcch::build_pdcch_control_region(
+                    0U, 3U, grid_indices.data(), static_cast<std::uint32_t>(grid_indices.size()),
+                    control_region) == MmseStatus::kOk,
+                "pdcch common search test control-region build");
+    expect_true(control_region.cces.size() == 90U, "pdcch common search CCE count");
+
+    std::vector<mmse::pdcch::PdcchCommonSearchCandidate> candidates;
+    mmse::pdcch::build_pdcch_common_search_candidates(control_region, candidates);
+    expect_true(candidates.size() == 6U, "pdcch common search candidate count");
+    expect_true(candidates[0].candidate_id == 0U && candidates[0].first_cce == 0U &&
+                    candidates[0].aggregation_level == 4U &&
+                    candidates[0].encoded_bit_count == 288U,
+                "pdcch common search first aggregation-four candidate");
+    expect_true(candidates[3].candidate_id == 3U && candidates[3].first_cce == 12U &&
+                    candidates[3].aggregation_level == 4U &&
+                    candidates[3].encoded_bit_count == 288U,
+                "pdcch common search last aggregation-four candidate");
+    expect_true(candidates[4].candidate_id == 4U && candidates[4].first_cce == 0U &&
+                    candidates[4].aggregation_level == 8U &&
+                    candidates[4].encoded_bit_count == 576U,
+                "pdcch common search first aggregation-eight candidate");
+    expect_true(candidates[5].candidate_id == 5U && candidates[5].first_cce == 8U &&
+                    candidates[5].aggregation_level == 8U &&
+                    candidates[5].encoded_bit_count == 576U,
+                "pdcch common search last aggregation-eight candidate");
+}
+
+void test_pdcch_common_search_candidate_llrs_follow_cce_offsets() {
+    constexpr std::uint32_t kCceCount = 8U;
+    constexpr std::uint32_t kReCount =
+        kCceCount * mmse::pdcch::kPdcchRegsPerCce * mmse::pdcch::kPdcchRePerReg;
+    mmse::pdcch::BackendPdcchEqualizedIndication backend{};
+    backend.sfn_subframe = 7U;
+    backend.cell_id = 19U;
+    backend.n_layers = 1U;
+    backend.control_symbol_count = 1U;
+    backend.mod_order = 2U;
+    backend.chain.request_id = 880U;
+    backend.x_hat_re.resize(kReCount);
+    backend.x_hat_im.resize(kReCount);
+    backend.sinr.resize(kReCount, 1.0F);
+    backend.re_grid_indices.resize(kReCount);
+    for (std::uint32_t re = 0U; re < kReCount; ++re) {
+        backend.x_hat_re[re] = static_cast<float>(re + 1U) * 0.01F;
+        backend.x_hat_im[re] = -static_cast<float>(re + 1U) * 0.02F;
+        backend.re_grid_indices[re] = static_cast<std::uint16_t>(re);
+    }
+
+    std::vector<float> expected_full_llrs{};
+    expect_true(mmse::lte::build_max_log_descrambled_llrs(
+                    backend.x_hat_re.data(), backend.x_hat_im.data(), backend.sinr.data(), kReCount,
+                    kReCount, 1U, 2U,
+                    mmse::lte::pdcch_c_init(backend.cell_id, backend.sfn_subframe),
+                    expected_full_llrs) == MmseStatus::kOk,
+                "pdcch candidate test full LLR build");
+
+    std::vector<mmse::pdcch::PdcchCandidateLlr> candidate_llrs;
+    expect_true(mmse::pdcch::build_pdcch_common_search_candidate_llrs(backend, candidate_llrs) ==
+                    MmseStatus::kOk,
+                "pdcch candidate LLR builder should succeed");
+    expect_true(candidate_llrs.size() == 3U, "pdcch candidate LLR count");
+    expect_true(candidate_llrs[1].chain.request_id == backend.chain.request_id &&
+                    candidate_llrs[1].chain.candidate_id == 1U &&
+                    candidate_llrs[1].chain.first_cce == 4U &&
+                    candidate_llrs[1].chain.aggregation_level == 4U &&
+                    candidate_llrs[1].encoded_bit_count == 288U,
+                "pdcch aggregation-four candidate metadata");
+    expect_true(candidate_llrs[1].llrs.size() == 288U,
+                "pdcch aggregation-four candidate LLR count");
+    for (std::uint32_t llr = 0U; llr < candidate_llrs[1].llrs.size(); ++llr) {
+        expect_near(candidate_llrs[1].llrs[llr], expected_full_llrs[288U + llr], 1.0e-5F,
+                    "pdcch aggregation-four candidate LLR slice");
+    }
+    expect_true(candidate_llrs[2].chain.candidate_id == 2U &&
+                    candidate_llrs[2].chain.first_cce == 0U &&
+                    candidate_llrs[2].chain.aggregation_level == 8U &&
+                    candidate_llrs[2].encoded_bit_count == 576U,
+                "pdcch aggregation-eight candidate metadata");
+    expect_true(candidate_llrs[2].llrs == expected_full_llrs,
+                "pdcch aggregation-eight candidate must retain full control-region LLRs");
+}
+
+void test_pdcch_common_search_candidate_llrs_reject_invalid_backend() {
+    mmse::pdcch::BackendPdcchEqualizedIndication backend{};
+    backend.n_layers = 2U;
+    backend.mod_order = 2U;
+    backend.x_hat_re = {0.0F};
+    backend.x_hat_im = {0.0F};
+    backend.sinr = {1.0F};
+    backend.re_grid_indices = {0U};
+    std::vector<mmse::pdcch::PdcchCandidateLlr> candidate_llrs;
+    expect_true(mmse::pdcch::build_pdcch_common_search_candidate_llrs(backend, candidate_llrs) ==
+                    MmseStatus::kInvalidArgument,
+                "pdcch candidate LLR builder should reject unsupported PDCCH layers");
+}
+
+void test_pdcch_convolutional_rate_recovery_combines_repetitions() {
+    constexpr std::uint32_t kDciPayloadBits = 16U;
+    constexpr std::uint32_t kCodewordBits = kDciPayloadBits + mmse::pdcch::kPdcchCrcBitCount;
+    std::vector<float> expected_convolutional_llrs(
+        kCodewordBits * mmse::pdcch::kPdcchConvolutionalCodeRate, 0.0F);
+    for (std::uint32_t i = 0U; i < expected_convolutional_llrs.size(); ++i) {
+        expected_convolutional_llrs[i] = static_cast<float>(i + 1U) * 0.25F;
+    }
+
+    mmse::pdcch::PdcchCandidateLlr candidate{};
+    candidate.sfn_subframe = 7U;
+    candidate.cell_id = 19U;
+    candidate.chain = {
+        .request_id = 551U, .candidate_id = 2U, .first_cce = 8U, .aggregation_level = 4U};
+    candidate.encoded_bit_count = 288U;
+    candidate.llrs = reference_pdcch_convolutional_rate_match(expected_convolutional_llrs,
+                                                              candidate.encoded_bit_count);
+
+    mmse::pdcch::PdcchRateRecoveredLlr recovered{};
+    expect_true(mmse::pdcch::recover_pdcch_convolutional_rate_matched_llrs(
+                    candidate, kDciPayloadBits, recovered) == MmseStatus::kOk,
+                "pdcch convolutional rate recovery should succeed");
+    expect_true(recovered.sfn_subframe == candidate.sfn_subframe &&
+                    recovered.cell_id == candidate.cell_id &&
+                    recovered.chain.request_id == candidate.chain.request_id &&
+                    recovered.chain.candidate_id == candidate.chain.candidate_id &&
+                    recovered.codeword_bit_count == kCodewordBits,
+                "pdcch rate recovery metadata passthrough");
+    expect_true(recovered.convolutional_llrs.size() == expected_convolutional_llrs.size(),
+                "pdcch rate recovery output length");
+    for (std::uint32_t i = 0U; i < recovered.convolutional_llrs.size(); ++i) {
+        expect_near(recovered.convolutional_llrs[i], 3.0F * expected_convolutional_llrs[i], 1.0e-5F,
+                    "pdcch rate recovery soft combine");
+    }
+}
+
+void test_pdcch_convolutional_rate_recovery_handles_dummy_bits() {
+    constexpr std::uint32_t kDciPayloadBits = 17U;
+    constexpr std::uint32_t kCodewordBits = kDciPayloadBits + mmse::pdcch::kPdcchCrcBitCount;
+    std::vector<float> convolutional_llrs(kCodewordBits * mmse::pdcch::kPdcchConvolutionalCodeRate,
+                                          1.0F);
+
+    mmse::pdcch::PdcchCandidateLlr candidate{};
+    candidate.chain.aggregation_level = 4U;
+    candidate.encoded_bit_count = 288U;
+    candidate.llrs =
+        reference_pdcch_convolutional_rate_match(convolutional_llrs, candidate.encoded_bit_count);
+
+    mmse::pdcch::PdcchRateRecoveredLlr recovered{};
+    expect_true(mmse::pdcch::recover_pdcch_convolutional_rate_matched_llrs(
+                    candidate, kDciPayloadBits, recovered) == MmseStatus::kOk,
+                "pdcch rate recovery with dummy bits should succeed");
+    for (const float llr : recovered.convolutional_llrs) {
+        expect_true(llr == 2.0F || llr == 3.0F,
+                    "pdcch dummy-bit recovery must only combine observed soft bits");
+    }
+}
+
+void test_pdcch_convolutional_rate_recovery_rejects_invalid_candidate() {
+    mmse::pdcch::PdcchCandidateLlr candidate{};
+    candidate.chain.aggregation_level = 4U;
+    candidate.encoded_bit_count = 288U;
+    candidate.llrs.assign(287U, 1.0F);
+    mmse::pdcch::PdcchRateRecoveredLlr recovered{};
+    expect_true(mmse::pdcch::recover_pdcch_convolutional_rate_matched_llrs(
+                    candidate, 16U, recovered) == MmseStatus::kInvalidArgument,
+                "pdcch rate recovery should reject inconsistent candidate LLR size");
+}
+
+void test_pdcch_tail_biting_decoder_adapter_contract() {
+    constexpr std::uint32_t kDciPayloadBits = 16U;
+    constexpr std::uint32_t kCodewordBits = kDciPayloadBits + mmse::pdcch::kPdcchCrcBitCount;
+    mmse::pdcch::PdcchRateRecoveredLlr recovered{};
+    recovered.codeword_bit_count = kCodewordBits;
+    recovered.convolutional_llrs.resize(kCodewordBits * mmse::pdcch::kPdcchConvolutionalCodeRate);
+    for (std::uint32_t i = 0U; i < recovered.convolutional_llrs.size(); ++i) {
+        recovered.convolutional_llrs[i] = static_cast<float>(i) * 0.5F;
+    }
+
+    TailBitingDecoderProbe probe{.expected_llrs = recovered.convolutional_llrs};
+    const mmse::pdcch::PdcchTailBitingConvolutionalDecoder decoder{
+        .context = &probe,
+        .decode = probe_tail_biting_decoder,
+    };
+    std::vector<std::uint8_t> decoded_bits;
+    expect_true(mmse::pdcch::invoke_pdcch_tail_biting_convolutional_decoder(
+                    recovered, decoder, decoded_bits) == MmseStatus::kOk,
+                "pdcch tail-biting adapter should succeed");
+    expect_true(probe.call_count == 1U && decoded_bits.size() == kCodewordBits,
+                "pdcch tail-biting adapter output size");
+    for (std::uint32_t bit = 0U; bit < decoded_bits.size(); ++bit) {
+        expect_true(decoded_bits[bit] == static_cast<std::uint8_t>(bit & 1U),
+                    "pdcch tail-biting adapter bit output");
+    }
+
+    probe.return_status = MmseStatus::kInternalError;
+    decoded_bits.assign(1U, 1U);
+    expect_true(mmse::pdcch::invoke_pdcch_tail_biting_convolutional_decoder(
+                    recovered, decoder, decoded_bits) == MmseStatus::kInternalError,
+                "pdcch tail-biting adapter should propagate external decoder failure");
+    expect_true(decoded_bits.empty(), "pdcch tail-biting adapter should clear failed output");
+}
+
+void test_pdcch_crc16_and_rnti_mask_check() {
+    std::vector<std::uint8_t> check_bits{};
+    for (const char character : std::string{"123456789"}) {
+        append_bits(check_bits, static_cast<std::uint8_t>(character), 8U);
+    }
+    expect_true(mmse::pdcch::calculate_pdcch_crc16(
+                    check_bits.data(), static_cast<std::uint32_t>(check_bits.size())) == 0x31C3U,
+                "pdcch CRC16 should match the 123456789 check value");
+
+    const std::vector<std::uint8_t> payload = {1U, 0U, 1U, 1U, 0U, 0U, 1U};
+    const std::vector<std::uint8_t> decoded =
+        append_pdcch_crc_rnti_mask(payload, mmse::pdcch::kSiRnti);
+    mmse::pdcch::PdcchCrcRntiCheck check{};
+    expect_true(mmse::pdcch::check_pdcch_crc_rnti(decoded.data(),
+                                                  static_cast<std::uint32_t>(decoded.size()),
+                                                  mmse::pdcch::kSiRnti, check) == MmseStatus::kOk,
+                "pdcch CRC-RNTI check should succeed");
+    expect_true(check.matches_expected_rnti && check.unmasked_rnti == mmse::pdcch::kSiRnti,
+                "pdcch CRC-RNTI must recover SI-RNTI");
+    expect_true(mmse::pdcch::check_pdcch_crc_rnti(decoded.data(),
+                                                  static_cast<std::uint32_t>(decoded.size()),
+                                                  0x1234U, check) == MmseStatus::kOk &&
+                    !check.matches_expected_rnti && check.unmasked_rnti == mmse::pdcch::kSiRnti,
+                "pdcch CRC-RNTI mismatch must remain a non-error blind-search result");
+}
+
+void test_pdcch_dci_format1a_fdd_si_rnti_parse() {
+    const mmse::pdcch::PdcchDciFormat1AConfig config{};
+    const std::uint16_t riv = reference_type2_riv(100U, 10U, 20U);
+    std::vector<std::uint8_t> payload{};
+    append_bits(payload, 1U, 1U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, riv, mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
+    append_bits(payload, 7U, 5U);
+    append_bits(payload, 5U, 3U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, 2U, 2U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, 1U, 1U);
+    expect_true(payload.size() == mmse::pdcch::pdcch_dci_format1a_payload_bit_count(config),
+                "FDD DCI 1A payload size");
+
+    const std::vector<std::uint8_t> decoded =
+        append_pdcch_crc_rnti_mask(payload, mmse::pdcch::kSiRnti);
+    mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+    const PdcchChainMetadata chain{
+        .request_id = 900U, .candidate_id = 2U, .first_cce = 8U, .aggregation_level = 4U};
+    expect_true(mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
+                    decoded.data(), static_cast<std::uint32_t>(decoded.size()),
+                    mmse::pdcch::kSiRnti, 17U, 19U, chain, config, result) == MmseStatus::kOk,
+                "FDD SI-RNTI DCI 1A decode should succeed");
+    expect_true(result.matched && result.crc.matches_expected_rnti,
+                "FDD SI-RNTI DCI 1A CRC result");
+    expect_true(!result.dci.is_pdcch_order && !result.dci.distributed_vrb_assignment &&
+                    result.dci.resource_indication_value == riv && result.dci.start_prb == 10U &&
+                    result.dci.n_prb == 20U && result.dci.mcs_tbs_index == 7U &&
+                    result.dci.harq_process == 5U && result.dci.redundancy_version == 2U &&
+                    result.dci.n_prb_1a_is_three && result.dci.chain.request_id == chain.request_id,
+                "FDD SI-RNTI DCI 1A parsed grant fields");
+}
+
+void test_pdcch_dci_format1a_tdd_distributed_parse() {
+    mmse::pdcch::PdcchDciFormat1AConfig config{};
+    config.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd;
+    const std::uint16_t riv = reference_type2_riv(100U, 7U, 30U);
+    std::vector<std::uint8_t> payload{};
+    append_bits(payload, 1U, 1U);
+    append_bits(payload, 1U, 1U);
+    append_bits(payload, riv, mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
+    append_bits(payload, 12U, 5U);
+    append_bits(payload, 9U, 4U);
+    append_bits(payload, 1U, 1U);
+    append_bits(payload, 3U, 2U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, 2U, 2U);
+    expect_true(payload.size() == mmse::pdcch::pdcch_dci_format1a_payload_bit_count(config),
+                "TDD DCI 1A payload size");
+
+    const std::vector<std::uint8_t> decoded =
+        append_pdcch_crc_rnti_mask(payload, mmse::pdcch::kSiRnti);
+    mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+    expect_true(mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
+                    decoded.data(), static_cast<std::uint32_t>(decoded.size()),
+                    mmse::pdcch::kSiRnti, 9U, 19U, {}, config, result) == MmseStatus::kOk,
+                "TDD SI-RNTI DCI 1A decode should succeed");
+    expect_true(result.matched && result.dci.distributed_vrb_assignment &&
+                    result.dci.n_gap_is_two && result.dci.start_prb == 7U &&
+                    result.dci.n_prb == 30U && result.dci.mcs_tbs_index == 12U &&
+                    result.dci.harq_process == 9U && result.dci.redundancy_version == 3U &&
+                    result.dci.downlink_assignment_index == 2U,
+                "TDD SI-RNTI DCI 1A parsed distributed fields");
+}
+
+void test_pdcch_dci_format1a_pdcch_order_and_crc_miss() {
+    const mmse::pdcch::PdcchDciFormat1AConfig config{};
+    std::vector<std::uint8_t> payload{};
+    append_bits(payload, 1U, 1U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, (1U << mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb)) - 1U,
+                mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
+    append_bits(payload, 42U, 6U);
+    append_bits(payload, 9U, 4U);
+    while (payload.size() < mmse::pdcch::pdcch_dci_format1a_payload_bit_count(config)) {
+        payload.push_back(0U);
+    }
+
+    std::vector<std::uint8_t> decoded = append_pdcch_crc_rnti_mask(payload, mmse::pdcch::kSiRnti);
+    mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+    expect_true(mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
+                    decoded.data(), static_cast<std::uint32_t>(decoded.size()),
+                    mmse::pdcch::kSiRnti, 0U, 0U, {}, config, result) == MmseStatus::kOk &&
+                    result.matched && result.dci.is_pdcch_order &&
+                    result.dci.preamble_index == 42U && result.dci.prach_mask_index == 9U,
+                "PDCCH order must parse after SI-RNTI CRC validation");
+
+    decoded.back() ^= 1U;
+    expect_true(mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
+                    decoded.data(), static_cast<std::uint32_t>(decoded.size()),
+                    mmse::pdcch::kSiRnti, 0U, 0U, {}, config, result) == MmseStatus::kOk &&
+                    !result.matched && !result.crc.matches_expected_rnti,
+                "CRC miss must not attempt DCI payload parsing");
+}
+
+void test_pdcch_dci_format1a_adapter_end_to_end() {
+    const mmse::pdcch::PdcchDciFormat1AConfig config{};
+    const std::uint16_t riv = reference_type2_riv(100U, 22U, 10U);
+    std::vector<std::uint8_t> payload{};
+    append_bits(payload, 1U, 1U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, riv, mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
+    append_bits(payload, 4U, 5U);
+    append_bits(payload, 1U, 3U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, 0U, 2U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, 0U, 1U);
+    const std::vector<std::uint8_t> decoded_bits =
+        append_pdcch_crc_rnti_mask(payload, mmse::pdcch::kSiRnti);
+
+    mmse::pdcch::PdcchRateRecoveredLlr recovered{};
+    recovered.sfn_subframe = 27U;
+    recovered.cell_id = 11U;
+    recovered.chain = {
+        .request_id = 12345U, .candidate_id = 1U, .first_cce = 4U, .aggregation_level = 4U};
+    recovered.codeword_bit_count = static_cast<std::uint32_t>(decoded_bits.size());
+    recovered.convolutional_llrs.assign(
+        recovered.codeword_bit_count * mmse::pdcch::kPdcchConvolutionalCodeRate, 0.0F);
+
+    TailBitingDecoderProbe probe{
+        .expected_llrs = recovered.convolutional_llrs,
+        .decoded_bits = decoded_bits,
+    };
+    const mmse::pdcch::PdcchTailBitingConvolutionalDecoder decoder{
+        .context = &probe,
+        .decode = probe_tail_biting_decoder,
+    };
+    mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+    expect_true(mmse::pdcch::decode_pdcch_dci_format1a_with_adapter(
+                    recovered, decoder, mmse::pdcch::kSiRnti, config, result) == MmseStatus::kOk,
+                "pdcch DCI 1A adapter end-to-end decode should succeed");
+    expect_true(probe.call_count == 1U && result.matched && result.crc.matches_expected_rnti &&
+                    result.dci.start_prb == 22U && result.dci.n_prb == 10U &&
+                    result.dci.mcs_tbs_index == 4U && result.dci.chain.request_id == 12345U,
+                "pdcch DCI 1A adapter end-to-end result");
+}
+
+void test_pdcch_type2_riv_decodes_long_allocation() {
+    const std::uint16_t riv = reference_type2_riv(100U, 5U, 80U);
+    std::uint16_t start_prb = 0U;
+    std::uint16_t allocated_prb_count = 0U;
+    expect_true(mmse::pdcch::decode_pdcch_type2_riv(riv, 100U, start_prb, allocated_prb_count) ==
+                        MmseStatus::kOk &&
+                    start_prb == 5U && allocated_prb_count == 80U,
+                "type2 RIV must decode the alternative long-allocation form");
 }
 
 void test_pdcch_helper_builds_pcfich_reserved_res() {
@@ -1811,7 +2389,19 @@ void test_pdcch_frontend_helper_auto_reserved_res_reduce_layout() {
     const std::uint32_t reserved_n_re = mmse::detail::build_pdcch_re_layout(desc, layout);
     expect_true(frontend.reserved_control_res.size() == 172U,
                 "pcfich plus phich should add expected unique reserved REs");
-    expect_true(reserved_n_re == base_n_re - 172U, "auto reserved RE helper should reduce layout");
+    expect_true(reserved_n_re < base_n_re,
+                "auto reserved RE helper should reduce the CCE-aligned layout");
+    expect_true((reserved_n_re % (mmse::pdcch::kPdcchRePerReg * mmse::pdcch::kPdcchRegsPerCce)) ==
+                    0U,
+                "auto reserved RE layout must contain complete CCEs");
+    for (std::uint32_t i = 0U; i < reserved_n_re; ++i) {
+        const auto coord = mmse::pdcch::decode_re_grid_index(layout.grid_indices[i]);
+        for (const auto& reserved_re : frontend.reserved_control_res) {
+            expect_true(coord.symbol != reserved_re.symbol || coord.prb != reserved_re.prb ||
+                            coord.tone_in_prb != reserved_re.tone_in_prb,
+                        "auto reserved RE helper must remove every reserved PDCCH RE");
+        }
+    }
 }
 
 void test_pdcch_frontend_dto_builds_mmse_input() {
@@ -1942,6 +2532,190 @@ void test_pdcch_td_backend_dto_packs_equalized_output() {
     expect_true(backend.re_grid_indices1[1] == 5U, "td backend dto second re1");
     expect_true(backend.x_hat_im[1] == 0.2F, "td backend dto imag");
     expect_true(backend.chain.request_id == meta.chain.request_id, "td backend dto chain");
+}
+
+void test_pdcch_td_normalization_restores_cce_re_order() {
+    mmse::pdcch::BackendPdcchTdEqualizedIndication td_backend{};
+    td_backend.sfn_subframe = 17U;
+    td_backend.cell_id = 21U;
+    td_backend.n_prb = 100U;
+    td_backend.n_tx_ports = 2U;
+    td_backend.n_rx_ant = 2U;
+    td_backend.n_layers = 1U;
+    td_backend.tx_mode = 2U;
+    td_backend.control_symbol_count = 1U;
+    td_backend.mod_order = 2U;
+    td_backend.chain.request_id = 991U;
+    td_backend.x_hat_re = {1.0F, 2.0F, 3.0F, 4.0F};
+    td_backend.x_hat_im = {-1.0F, -2.0F, -3.0F, -4.0F};
+    td_backend.sinr = {10.0F, 11.0F, 12.0F, 13.0F};
+    td_backend.re_grid_indices0 = {0U, 0U, 2U, 2U};
+    td_backend.re_grid_indices1 = {1U, 1U, 3U, 3U};
+
+    mmse::pdcch::BackendPdcchEqualizedIndication normalized{};
+    expect_true(mmse::pdcch::normalize_pdcch_td_cce_order(td_backend, normalized) ==
+                    MmseStatus::kOk,
+                "td normalization should accept paired output");
+    expect_true(normalized.re_grid_indices == std::vector<std::uint16_t>{0U, 1U, 2U, 3U},
+                "td normalization must restore source RE order");
+    expect_true(normalized.x_hat_re == td_backend.x_hat_re &&
+                    normalized.chain.request_id == td_backend.chain.request_id,
+                "td normalization must preserve soft symbols and chain metadata");
+
+    td_backend.re_grid_indices1[1] = 4U;
+    expect_true(mmse::pdcch::normalize_pdcch_td_cce_order(td_backend, normalized) ==
+                    MmseStatus::kInvalidArgument,
+                "td normalization should reject inconsistent RE pair metadata");
+}
+
+std::vector<std::uint8_t> make_si_rnti_dci_format1a_bits() {
+    const mmse::pdcch::PdcchDciFormat1AConfig config{};
+    const std::uint16_t riv = reference_type2_riv(config.n_prb, 10U, 20U);
+    std::vector<std::uint8_t> payload{};
+    append_bits(payload, 1U, 1U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, riv, mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
+    append_bits(payload, 7U, 5U);
+    append_bits(payload, 5U, 3U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, 2U, 2U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, 1U, 1U);
+    return append_pdcch_crc_rnti_mask(payload, mmse::pdcch::kSiRnti);
+}
+
+void test_pdcch_common_search_decode_returns_all_hits() {
+    constexpr std::uint32_t kCceCount = 4U;
+    constexpr std::uint32_t kReCount =
+        kCceCount * mmse::pdcch::kPdcchRegsPerCce * mmse::pdcch::kPdcchRePerReg;
+    mmse::pdcch::BackendPdcchEqualizedIndication backend{};
+    backend.sfn_subframe = 7U;
+    backend.cell_id = 19U;
+    backend.n_tx_ports = 1U;
+    backend.n_rx_ant = 2U;
+    backend.n_layers = 1U;
+    backend.tx_mode = 1U;
+    backend.control_symbol_count = 1U;
+    backend.mod_order = 2U;
+    backend.chain.request_id = 880U;
+    backend.x_hat_re.assign(kReCount, 0.5F);
+    backend.x_hat_im.assign(kReCount, -0.5F);
+    backend.sinr.assign(kReCount, 1.0F);
+    backend.re_grid_indices.resize(kReCount);
+    for (std::uint32_t re = 0U; re < kReCount; ++re) {
+        backend.re_grid_indices[re] = static_cast<std::uint16_t>(re);
+    }
+
+    FixedTailBitingDecoder fixed_decoder{.decoded_bits = make_si_rnti_dci_format1a_bits()};
+    mmse::pdcch::PdcchCommonSearchDecodeConfig config{};
+    config.decoder = {.context = &fixed_decoder, .decode = fixed_tail_biting_decoder};
+    mmse::pdcch::PdcchCommonSearchDecodeResult result{};
+    expect_true(mmse::pdcch::decode_pdcch_common_search_dci_format1a(backend, config, result) ==
+                    MmseStatus::kOk,
+                "common-search decode should complete");
+    expect_true(result.candidate_count == 1U && result.hits.size() == 1U &&
+                    fixed_decoder.call_count == 1U,
+                "common-search decode should retain every matching candidate");
+    expect_true(result.hits[0].dci.chain.request_id == backend.chain.request_id &&
+                    result.hits[0].dci.chain.first_cce == 0U &&
+                    result.hits[0].dci.chain.aggregation_level == 4U &&
+                    result.hits[0].dci.start_prb == 10U && result.hits[0].dci.n_prb == 20U,
+                "common-search hit must preserve CCE metadata and parsed DCI");
+}
+
+void test_pdcch_cpu_common_search_decode_runs_full_one_tx_chain() {
+    MmseEqualizerCpuContext context;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(context.init(cpu_config) == MmseStatus::kOk, "cpu common-search init");
+
+    const auto desc = make_pdcch_desc();
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 1.0F, 0.0F);
+    PdcchMmseInput input{};
+    input.grid = make_grid_view(buffers);
+    input.sfn_subframe = desc.sfn_subframe;
+    input.cell_id = desc.cell_id;
+    input.n_tx_ports = desc.n_tx_ports;
+    input.tx_mode = desc.tx_mode;
+    input.control_symbol_count = desc.control_symbol_count;
+    input.n_prb = desc.n_prb;
+    input.prb_bitmap = desc.prb_bitmap;
+    input.control_re_exclusion_masks = desc.control_re_exclusion_masks;
+    input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                              .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                              .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    input.chain.request_id = 90210U;
+
+    FixedTailBitingDecoder fixed_decoder{.decoded_bits = make_si_rnti_dci_format1a_bits()};
+    mmse::pdcch::PdcchCommonSearchDecodeConfig config{};
+    config.decoder = {.context = &fixed_decoder, .decode = fixed_tail_biting_decoder};
+    mmse::pdcch::PdcchCommonSearchDecodeResult result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_common_search_decode(context, input, config, result) ==
+                    MmseStatus::kOk,
+                "cpu common-search entry should run the complete one-tx chain");
+    expect_true(result.candidate_count == 6U && result.hits.size() == 6U &&
+                    fixed_decoder.call_count == 6U,
+                "cpu common-search entry should decode every public-search candidate");
+    for (const auto& hit : result.hits) {
+        expect_true(hit.dci.chain.request_id == input.chain.request_id &&
+                        hit.dci.rnti == mmse::pdcch::kSiRnti && hit.dci.start_prb == 10U &&
+                        hit.dci.n_prb == 20U,
+                    "cpu common-search hit fields");
+    }
+}
+
+void test_pdcch_cpu_common_search_decode_runs_full_two_tx_chain() {
+    MmseEqualizerCpuContext context;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(context.init(cpu_config) == MmseStatus::kOk, "cpu two-tx common-search init");
+
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 2U;
+    desc.tx_mode = 2U;
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+    fill_pdcch_td_layout(buffers, desc, layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                         {1.0F, 0.0F}, s0, s1);
+
+    PdcchMmseInput input{};
+    input.grid = make_grid_view(buffers);
+    input.sfn_subframe = desc.sfn_subframe;
+    input.cell_id = desc.cell_id;
+    input.n_tx_ports = desc.n_tx_ports;
+    input.tx_mode = desc.tx_mode;
+    input.control_symbol_count = desc.control_symbol_count;
+    input.n_prb = desc.n_prb;
+    input.prb_bitmap = desc.prb_bitmap;
+    input.control_re_exclusion_masks = desc.control_re_exclusion_masks;
+    input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                              .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                              .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    input.chain.request_id = 90211U;
+
+    FixedTailBitingDecoder fixed_decoder{.decoded_bits = make_si_rnti_dci_format1a_bits()};
+    mmse::pdcch::PdcchCommonSearchDecodeConfig config{};
+    config.decoder = {.context = &fixed_decoder, .decode = fixed_tail_biting_decoder};
+    mmse::pdcch::PdcchCommonSearchDecodeResult result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_common_search_decode(context, input, config, result) ==
+                    MmseStatus::kOk,
+                "cpu common-search entry should run the complete two-tx chain");
+    expect_true(n_source_re == 3168U && result.candidate_count == 6U && result.hits.size() == 6U &&
+                    fixed_decoder.call_count == 6U,
+                "two-tx entry should normalize all CCE-ordered candidates before decoding");
+    for (const auto& hit : result.hits) {
+        expect_true(hit.dci.chain.request_id == input.chain.request_id &&
+                        hit.dci.rnti == mmse::pdcch::kSiRnti && hit.dci.start_prb == 10U &&
+                        hit.dci.n_prb == 20U,
+                    "two-tx common-search hit fields");
+    }
 }
 
 void test_gpu_context_strict_cuda_init_succeeds_and_runs_via_fallback() {
@@ -3125,6 +3899,37 @@ int main() {
         std::pair{"pdcch_helper_mask_and_grid_index_decode",
                   &test_pdcch_helper_mask_and_grid_index_decode},
         std::pair{"pdcch_helper_apply_reserved_re_list", &test_pdcch_helper_apply_reserved_re_list},
+        std::pair{"pdcch_control_region_builds_regs_and_cces",
+                  &test_pdcch_control_region_builds_regs_and_cces},
+        std::pair{"pdcch_control_region_rejects_invalid_re_indices",
+                  &test_pdcch_control_region_rejects_invalid_re_indices},
+        std::pair{"pdcch_common_search_candidates_follow_lte_levels",
+                  &test_pdcch_common_search_candidates_follow_lte_levels},
+        std::pair{"pdcch_common_search_candidate_llrs_follow_cce_offsets",
+                  &test_pdcch_common_search_candidate_llrs_follow_cce_offsets},
+        std::pair{"pdcch_common_search_candidate_llrs_reject_invalid_backend",
+                  &test_pdcch_common_search_candidate_llrs_reject_invalid_backend},
+        std::pair{"pdcch_common_search_decode_returns_all_hits",
+                  &test_pdcch_common_search_decode_returns_all_hits},
+        std::pair{"pdcch_convolutional_rate_recovery_combines_repetitions",
+                  &test_pdcch_convolutional_rate_recovery_combines_repetitions},
+        std::pair{"pdcch_convolutional_rate_recovery_handles_dummy_bits",
+                  &test_pdcch_convolutional_rate_recovery_handles_dummy_bits},
+        std::pair{"pdcch_convolutional_rate_recovery_rejects_invalid_candidate",
+                  &test_pdcch_convolutional_rate_recovery_rejects_invalid_candidate},
+        std::pair{"pdcch_tail_biting_decoder_adapter_contract",
+                  &test_pdcch_tail_biting_decoder_adapter_contract},
+        std::pair{"pdcch_crc16_and_rnti_mask_check", &test_pdcch_crc16_and_rnti_mask_check},
+        std::pair{"pdcch_dci_format1a_fdd_si_rnti_parse",
+                  &test_pdcch_dci_format1a_fdd_si_rnti_parse},
+        std::pair{"pdcch_dci_format1a_tdd_distributed_parse",
+                  &test_pdcch_dci_format1a_tdd_distributed_parse},
+        std::pair{"pdcch_dci_format1a_pdcch_order_and_crc_miss",
+                  &test_pdcch_dci_format1a_pdcch_order_and_crc_miss},
+        std::pair{"pdcch_dci_format1a_adapter_end_to_end",
+                  &test_pdcch_dci_format1a_adapter_end_to_end},
+        std::pair{"pdcch_type2_riv_decodes_long_allocation",
+                  &test_pdcch_type2_riv_decodes_long_allocation},
         std::pair{"pdcch_helper_builds_pcfich_reserved_res",
                   &test_pdcch_helper_builds_pcfich_reserved_res},
         std::pair{"pdcch_helper_builds_fdd_phich_reserved_res_properties",
@@ -3146,6 +3951,12 @@ int main() {
                   &test_pdcch_backend_dto_packs_equalized_output},
         std::pair{"pdcch_td_backend_dto_packs_equalized_output",
                   &test_pdcch_td_backend_dto_packs_equalized_output},
+        std::pair{"pdcch_td_normalization_restores_cce_re_order",
+                  &test_pdcch_td_normalization_restores_cce_re_order},
+        std::pair{"pdcch_cpu_common_search_decode_runs_full_one_tx_chain",
+                  &test_pdcch_cpu_common_search_decode_runs_full_one_tx_chain},
+        std::pair{"pdcch_cpu_common_search_decode_runs_full_two_tx_chain",
+                  &test_pdcch_cpu_common_search_decode_runs_full_two_tx_chain},
         std::pair{"two_layer_scalar_golden_matches", &test_two_layer_scalar_golden_matches},
         std::pair{"two_layer_avx2_matches_scalar_kernel",
                   &test_two_layer_avx2_matches_scalar_kernel},

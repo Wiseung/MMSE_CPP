@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 
 #include "mmse/constants.h"
 #include "mmse/lte_descrambling.h"
@@ -545,6 +546,47 @@ make_backend_pdcch_td_equalized_indication(const PdcchTdMmseResult& meta,
     return backend;
 }
 
+inline MmseStatus
+normalize_pdcch_td_cce_order(const BackendPdcchTdEqualizedIndication& td_backend,
+                             BackendPdcchEqualizedIndication& cce_ordered_backend) {
+    cce_ordered_backend = {};
+    const std::size_t symbol_count = td_backend.x_hat_re.size();
+    if (td_backend.n_tx_ports != 2U || td_backend.n_layers != 1U || td_backend.tx_mode != 2U ||
+        td_backend.mod_order != 2U || symbol_count == 0U || (symbol_count & 1U) != 0U ||
+        td_backend.x_hat_im.size() != symbol_count || td_backend.sinr.size() != symbol_count ||
+        td_backend.re_grid_indices0.size() != symbol_count ||
+        td_backend.re_grid_indices1.size() != symbol_count) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    cce_ordered_backend.sfn_subframe = td_backend.sfn_subframe;
+    cce_ordered_backend.cell_id = td_backend.cell_id;
+    cce_ordered_backend.n_prb = td_backend.n_prb;
+    cce_ordered_backend.n_tx_ports = td_backend.n_tx_ports;
+    cce_ordered_backend.n_rx_ant = td_backend.n_rx_ant;
+    cce_ordered_backend.n_layers = td_backend.n_layers;
+    cce_ordered_backend.tx_mode = td_backend.tx_mode;
+    cce_ordered_backend.control_symbol_count = td_backend.control_symbol_count;
+    cce_ordered_backend.mod_order = td_backend.mod_order;
+    cce_ordered_backend.sigma2 = td_backend.sigma2;
+    cce_ordered_backend.chain = td_backend.chain;
+    cce_ordered_backend.x_hat_re = td_backend.x_hat_re;
+    cce_ordered_backend.x_hat_im = td_backend.x_hat_im;
+    cce_ordered_backend.sinr = td_backend.sinr;
+    cce_ordered_backend.re_grid_indices.resize(symbol_count);
+
+    for (std::size_t symbol = 0U; symbol < symbol_count; symbol += 2U) {
+        if (td_backend.re_grid_indices0[symbol] != td_backend.re_grid_indices0[symbol + 1U] ||
+            td_backend.re_grid_indices1[symbol] != td_backend.re_grid_indices1[symbol + 1U]) {
+            cce_ordered_backend = {};
+            return MmseStatus::kInvalidArgument;
+        }
+        cce_ordered_backend.re_grid_indices[symbol] = td_backend.re_grid_indices0[symbol];
+        cce_ordered_backend.re_grid_indices[symbol + 1U] = td_backend.re_grid_indices1[symbol];
+    }
+    return MmseStatus::kOk;
+}
+
 inline BackendPdcchTdDescrambledLlrIndication
 make_backend_pdcch_td_descrambled_llr_indication(const BackendPdcchTdEqualizedIndication& backend) {
     BackendPdcchTdDescrambledLlrIndication llr_backend{};
@@ -572,6 +614,564 @@ make_backend_pdcch_td_descrambled_llr_indication(const BackendPdcchTdEqualizedIn
         llr_backend.llrs.data(), static_cast<std::uint32_t>(llr_backend.llrs.size()),
         mmse::lte::pdcch_c_init(backend.cell_id, backend.sfn_subframe));
     return llr_backend;
+}
+
+inline MmseStatus build_pdcch_control_region(std::uint16_t cell_id,
+                                             std::uint8_t control_symbol_count,
+                                             const std::uint16_t* re_grid_indices,
+                                             std::uint32_t n_re,
+                                             PdcchControlRegion& control_region) {
+    control_region = {};
+    if (re_grid_indices == nullptr || n_re == 0U || control_symbol_count == 0U ||
+        control_symbol_count > kLteMaxControlSymbolsNormalCp ||
+        n_re > kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz || (n_re % kPdcchRePerReg) != 0U) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    std::array<bool, kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz> seen_grid_indices{};
+    for (std::uint32_t re = 0U; re < n_re; ++re) {
+        const std::uint16_t grid_index = re_grid_indices[re];
+        const std::uint32_t symbol = grid_index / kLteNumSubcarriers20MHz;
+        if (symbol >= control_symbol_count || seen_grid_indices[grid_index]) {
+            return MmseStatus::kInvalidArgument;
+        }
+        seen_grid_indices[grid_index] = true;
+    }
+
+    control_region.cell_id = cell_id;
+    control_region.control_symbol_count = control_symbol_count;
+    control_region.n_source_re = n_re;
+    control_region.regs.reserve(n_re / kPdcchRePerReg);
+    for (std::uint32_t re = 0U; re < n_re; re += kPdcchRePerReg) {
+        PdcchReg reg{};
+        for (std::uint32_t re_in_reg = 0U; re_in_reg < kPdcchRePerReg; ++re_in_reg) {
+            reg.source_re_indices[re_in_reg] = re + re_in_reg;
+            reg.grid_indices[re_in_reg] = re_grid_indices[re + re_in_reg];
+        }
+        control_region.regs.push_back(reg);
+    }
+
+    const std::uint32_t n_cce =
+        static_cast<std::uint32_t>(control_region.regs.size()) / kPdcchRegsPerCce;
+    control_region.n_unassigned_reg =
+        static_cast<std::uint32_t>(control_region.regs.size()) % kPdcchRegsPerCce;
+    control_region.cces.reserve(n_cce);
+    for (std::uint32_t cce = 0U; cce < n_cce; ++cce) {
+        PdcchCce entry{};
+        for (std::uint32_t reg_in_cce = 0U; reg_in_cce < kPdcchRegsPerCce; ++reg_in_cce) {
+            entry.reg_indices[reg_in_cce] =
+                static_cast<std::uint16_t>(cce * kPdcchRegsPerCce + reg_in_cce);
+        }
+        control_region.cces.push_back(entry);
+    }
+    return MmseStatus::kOk;
+}
+
+inline void
+build_pdcch_common_search_candidates(const PdcchControlRegion& control_region,
+                                     std::vector<PdcchCommonSearchCandidate>& candidates) {
+    candidates.clear();
+
+    struct SearchLevel {
+        std::uint8_t aggregation_level = 0;
+        std::uint8_t max_candidate_count = 0;
+    };
+    constexpr std::array<SearchLevel, 2> kCommonSearchLevels = {
+        SearchLevel{.aggregation_level = 4U, .max_candidate_count = 4U},
+        SearchLevel{.aggregation_level = 8U, .max_candidate_count = 2U},
+    };
+
+    const std::uint32_t n_cce = static_cast<std::uint32_t>(control_region.cces.size());
+    std::uint32_t candidate_id = 0U;
+    for (const SearchLevel level : kCommonSearchLevels) {
+        const std::uint32_t candidate_count =
+            std::min(static_cast<std::uint32_t>(level.max_candidate_count),
+                     n_cce / static_cast<std::uint32_t>(level.aggregation_level));
+        for (std::uint32_t candidate = 0U; candidate < candidate_count; ++candidate) {
+            candidates.push_back({
+                .candidate_id = candidate_id++,
+                .first_cce = static_cast<std::uint16_t>(candidate * level.aggregation_level),
+                .aggregation_level = level.aggregation_level,
+                .encoded_bit_count = 72U * level.aggregation_level,
+            });
+        }
+    }
+}
+
+inline MmseStatus
+build_pdcch_common_search_candidate_llrs(const BackendPdcchEqualizedIndication& backend,
+                                         std::vector<PdcchCandidateLlr>& candidate_llrs) {
+    candidate_llrs.clear();
+    if (backend.n_layers != 1U || backend.mod_order != 2U || backend.x_hat_re.empty() ||
+        backend.x_hat_re.size() != backend.x_hat_im.size() ||
+        backend.x_hat_re.size() != backend.sinr.size() ||
+        backend.x_hat_re.size() != backend.re_grid_indices.size()) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    PdcchControlRegion control_region{};
+    if (const MmseStatus status = build_pdcch_control_region(
+            backend.cell_id, backend.control_symbol_count, backend.re_grid_indices.data(),
+            static_cast<std::uint32_t>(backend.re_grid_indices.size()), control_region);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    std::vector<float> full_descrambled_llrs{};
+    if (const MmseStatus status = mmse::lte::build_max_log_descrambled_llrs(
+            backend.x_hat_re.data(), backend.x_hat_im.data(), backend.sinr.data(),
+            static_cast<std::uint32_t>(backend.x_hat_re.size()),
+            static_cast<std::uint32_t>(backend.x_hat_re.size()), 1U, backend.mod_order,
+            mmse::lte::pdcch_c_init(backend.cell_id, backend.sfn_subframe), full_descrambled_llrs);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    std::vector<PdcchCommonSearchCandidate> candidates{};
+    build_pdcch_common_search_candidates(control_region, candidates);
+    candidate_llrs.reserve(candidates.size());
+    for (const PdcchCommonSearchCandidate& candidate : candidates) {
+        const std::uint32_t llr_offset = static_cast<std::uint32_t>(candidate.first_cce) * 72U;
+        if (llr_offset > full_descrambled_llrs.size() ||
+            candidate.encoded_bit_count > full_descrambled_llrs.size() - llr_offset) {
+            candidate_llrs.clear();
+            return MmseStatus::kInternalError;
+        }
+
+        PdcchCandidateLlr candidate_llr{};
+        candidate_llr.sfn_subframe = backend.sfn_subframe;
+        candidate_llr.cell_id = backend.cell_id;
+        candidate_llr.chain = backend.chain;
+        candidate_llr.chain.candidate_id = candidate.candidate_id;
+        candidate_llr.chain.first_cce = candidate.first_cce;
+        candidate_llr.chain.aggregation_level = candidate.aggregation_level;
+        candidate_llr.encoded_bit_count = candidate.encoded_bit_count;
+        candidate_llr.llrs.assign(full_descrambled_llrs.begin() + llr_offset,
+                                  full_descrambled_llrs.begin() + llr_offset +
+                                      candidate.encoded_bit_count);
+        candidate_llrs.push_back(std::move(candidate_llr));
+    }
+    return MmseStatus::kOk;
+}
+
+inline MmseStatus recover_pdcch_convolutional_rate_matched_llrs(const PdcchCandidateLlr& candidate,
+                                                                std::uint32_t dci_payload_bit_count,
+                                                                PdcchRateRecoveredLlr& recovered) {
+    recovered = {};
+    if (dci_payload_bit_count == 0U || dci_payload_bit_count > kPdcchMaxDciPayloadBits ||
+        candidate.encoded_bit_count == 0U || candidate.encoded_bit_count != candidate.llrs.size() ||
+        candidate.encoded_bit_count > kPdcchMaxCandidateEncodedBits ||
+        (candidate.chain.aggregation_level != 4U && candidate.chain.aggregation_level != 8U) ||
+        candidate.encoded_bit_count != 72U * candidate.chain.aggregation_level) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    constexpr std::uint32_t kColumns = 32U;
+    constexpr std::array<std::uint8_t, kColumns> kPermutation = {
+        1U, 17U, 9U, 25U, 5U, 21U, 13U, 29U, 3U, 19U, 11U, 27U, 7U, 23U, 15U, 31U,
+        0U, 16U, 8U, 24U, 4U, 20U, 12U, 28U, 2U, 18U, 10U, 26U, 6U, 22U, 14U, 30U,
+    };
+    constexpr std::array<std::uint8_t, kColumns> kInversePermutation = {
+        16U, 0U, 24U, 8U, 20U, 4U, 28U, 12U, 18U, 2U, 26U, 10U, 22U, 6U, 30U, 14U,
+        17U, 1U, 25U, 9U, 21U, 5U, 29U, 13U, 19U, 3U, 27U, 11U, 23U, 7U, 31U, 15U,
+    };
+
+    const std::uint32_t codeword_bit_count = dci_payload_bit_count + kPdcchCrcBitCount;
+    const std::uint32_t row_count = (codeword_bit_count + kColumns - 1U) / kColumns;
+    const std::uint32_t interleaver_size = row_count * kColumns;
+    const std::uint32_t dummy_bit_count = interleaver_size - codeword_bit_count;
+    const std::uint32_t collection_size = kPdcchConvolutionalCodeRate * interleaver_size;
+    std::vector<float> collected_llrs(collection_size, 0.0F);
+    std::vector<std::uint8_t> collected_present(collection_size, 0U);
+
+    std::uint32_t input_index = 0U;
+    std::uint32_t collection_index = 0U;
+    while (input_index < candidate.encoded_bit_count) {
+        const std::uint32_t intra_stream_index = collection_index % interleaver_size;
+        const std::uint32_t permutation_column = intra_stream_index / row_count;
+        const std::uint32_t row = intra_stream_index % row_count;
+        const std::uint32_t original_bit_index = row * kColumns + kPermutation[permutation_column];
+        if (original_bit_index >= dummy_bit_count) {
+            if (collected_present[collection_index] == 0U) {
+                collected_llrs[collection_index] = candidate.llrs[input_index];
+                collected_present[collection_index] = 1U;
+            } else {
+                collected_llrs[collection_index] += candidate.llrs[input_index];
+            }
+            ++input_index;
+        }
+        collection_index = (collection_index + 1U) % collection_size;
+    }
+
+    recovered.sfn_subframe = candidate.sfn_subframe;
+    recovered.cell_id = candidate.cell_id;
+    recovered.chain = candidate.chain;
+    recovered.encoded_bit_count = candidate.encoded_bit_count;
+    recovered.codeword_bit_count = codeword_bit_count;
+    recovered.convolutional_llrs.assign(kPdcchConvolutionalCodeRate * codeword_bit_count, 0.0F);
+    for (std::uint32_t bit = 0U; bit < codeword_bit_count; ++bit) {
+        const std::uint32_t padded_bit = bit + dummy_bit_count;
+        const std::uint32_t row = padded_bit / kColumns;
+        const std::uint32_t column = padded_bit % kColumns;
+        const std::uint32_t interleaved_index = kInversePermutation[column] * row_count + row;
+        for (std::uint32_t stream = 0U; stream < kPdcchConvolutionalCodeRate; ++stream) {
+            const std::uint32_t collection_slot = stream * interleaver_size + interleaved_index;
+            recovered.convolutional_llrs[bit * kPdcchConvolutionalCodeRate + stream] =
+                collected_present[collection_slot] != 0U ? collected_llrs[collection_slot] : 0.0F;
+        }
+    }
+    return MmseStatus::kOk;
+}
+
+inline MmseStatus
+invoke_pdcch_tail_biting_convolutional_decoder(const PdcchRateRecoveredLlr& recovered,
+                                               const PdcchTailBitingConvolutionalDecoder& decoder,
+                                               std::vector<std::uint8_t>& decoded_bits) {
+    decoded_bits.clear();
+    if (decoder.decode == nullptr || recovered.codeword_bit_count == 0U ||
+        recovered.convolutional_llrs.size() !=
+            static_cast<std::size_t>(kPdcchConvolutionalCodeRate) * recovered.codeword_bit_count) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    decoded_bits.resize(recovered.codeword_bit_count);
+    const PdcchTailBitingConvolutionalDecodeRequest request{
+        .convolutional_llrs = recovered.convolutional_llrs.data(),
+        .convolutional_llr_count = static_cast<std::uint32_t>(recovered.convolutional_llrs.size()),
+        .decoded_bits = decoded_bits.data(),
+        .decoded_bit_count = static_cast<std::uint32_t>(decoded_bits.size()),
+        .soft_bit_polarity = recovered.soft_bit_polarity,
+        .llr_order = recovered.llr_order,
+        .tail_biting = true,
+    };
+    const MmseStatus status = decoder.decode(decoder.context, request);
+    if (status != MmseStatus::kOk) {
+        decoded_bits.clear();
+    }
+    return status;
+}
+
+inline std::uint16_t calculate_pdcch_crc16(const std::uint8_t* bits,
+                                           std::uint32_t bit_count) noexcept {
+    constexpr std::uint16_t kCrc16Polynomial = 0x1021U;
+    std::uint16_t crc = 0U;
+    if (bits == nullptr && bit_count != 0U) {
+        return 0U;
+    }
+    for (std::uint32_t bit_index = 0U; bit_index < bit_count; ++bit_index) {
+        const std::uint16_t feedback =
+            static_cast<std::uint16_t>(((crc >> 15U) ^ (bits[bit_index] & 1U)) & 1U);
+        crc = static_cast<std::uint16_t>(crc << 1U);
+        if (feedback != 0U) {
+            crc = static_cast<std::uint16_t>(crc ^ kCrc16Polynomial);
+        }
+    }
+    return crc;
+}
+
+inline MmseStatus check_pdcch_crc_rnti(const std::uint8_t* decoded_bits,
+                                       std::uint32_t decoded_bit_count, std::uint16_t expected_rnti,
+                                       PdcchCrcRntiCheck& check) {
+    check = {};
+    if (decoded_bits == nullptr || decoded_bit_count <= kPdcchCrcBitCount) {
+        return MmseStatus::kInvalidArgument;
+    }
+    const std::uint32_t payload_bit_count = decoded_bit_count - kPdcchCrcBitCount;
+    std::uint16_t transmitted_crc = 0U;
+    for (std::uint32_t bit = 0U; bit < kPdcchCrcBitCount; ++bit) {
+        if (decoded_bits[payload_bit_count + bit] > 1U) {
+            return MmseStatus::kInvalidArgument;
+        }
+        transmitted_crc = static_cast<std::uint16_t>(
+            (transmitted_crc << 1U) |
+            static_cast<std::uint16_t>(decoded_bits[payload_bit_count + bit]));
+    }
+    for (std::uint32_t bit = 0U; bit < payload_bit_count; ++bit) {
+        if (decoded_bits[bit] > 1U) {
+            return MmseStatus::kInvalidArgument;
+        }
+    }
+
+    check.transmitted_crc = transmitted_crc;
+    check.calculated_crc = calculate_pdcch_crc16(decoded_bits, payload_bit_count);
+    check.unmasked_rnti = static_cast<std::uint16_t>(transmitted_crc ^ check.calculated_crc);
+    check.matches_expected_rnti = check.unmasked_rnti == expected_rnti;
+    return MmseStatus::kOk;
+}
+
+inline constexpr std::uint8_t pdcch_dci_riv_bit_count(std::uint16_t n_prb) noexcept {
+    std::uint32_t max_value = static_cast<std::uint32_t>(n_prb) * (n_prb + 1U) / 2U;
+    std::uint8_t bits = 0U;
+    --max_value;
+    while (max_value != 0U) {
+        ++bits;
+        max_value >>= 1U;
+    }
+    return bits;
+}
+
+inline constexpr std::uint32_t
+pdcch_dci_format1a_payload_bit_count(const PdcchDciFormat1AConfig& config) noexcept {
+    if (config.n_prb != kLteNumPrb20MHz) {
+        return 0U;
+    }
+    const std::uint32_t harq_pid_bits = config.duplex_mode == PhichDuplexMode::kFdd ? 3U : 4U;
+    return (config.cif_enabled ? 3U : 0U) + 1U + 1U + pdcch_dci_riv_bit_count(config.n_prb) + 5U +
+           harq_pid_bits + 1U + 2U + 2U + (config.duplex_mode == PhichDuplexMode::kTdd ? 2U : 0U);
+}
+
+inline MmseStatus decode_pdcch_type2_riv(std::uint16_t resource_indication_value,
+                                         std::uint16_t n_prb, std::uint16_t& start_prb,
+                                         std::uint16_t& allocated_prb_count) {
+    start_prb = 0U;
+    allocated_prb_count = 0U;
+    if (n_prb == 0U || n_prb > kLteNumPrb20MHz ||
+        resource_indication_value >= static_cast<std::uint32_t>(n_prb) * (n_prb + 1U) / 2U) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    std::uint32_t length = resource_indication_value / n_prb + 1U;
+    std::uint32_t start = resource_indication_value % n_prb;
+    if (length > n_prb - start) {
+        length = n_prb - resource_indication_value / n_prb + 1U;
+        start = n_prb - resource_indication_value % n_prb - 1U;
+    }
+    if (length == 0U || start + length > n_prb) {
+        return MmseStatus::kInvalidArgument;
+    }
+    start_prb = static_cast<std::uint16_t>(start);
+    allocated_prb_count = static_cast<std::uint16_t>(length);
+    return MmseStatus::kOk;
+}
+
+namespace detail {
+
+struct PdcchBitReader {
+    const std::uint8_t* bits = nullptr;
+    std::uint32_t count = 0U;
+    std::uint32_t position = 0U;
+
+    bool read(std::uint8_t width, std::uint32_t& value) {
+        value = 0U;
+        if (bits == nullptr || width > 24U || position + width > count) {
+            return false;
+        }
+        for (std::uint8_t bit = 0U; bit < width; ++bit) {
+            if (bits[position] > 1U) {
+                return false;
+            }
+            value = (value << 1U) | bits[position++];
+        }
+        return true;
+    }
+
+    bool remaining_bits_are_zero() const {
+        if (bits == nullptr) {
+            return false;
+        }
+        for (std::uint32_t bit = position; bit < count; ++bit) {
+            if (bits[bit] != 0U) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+} // namespace detail
+
+inline MmseStatus parse_pdcch_dci_format1a(const std::uint8_t* payload_bits,
+                                           std::uint32_t payload_bit_count,
+                                           std::uint32_t sfn_subframe, std::uint16_t cell_id,
+                                           std::uint16_t rnti, const PdcchChainMetadata& chain,
+                                           const PdcchDciFormat1AConfig& config,
+                                           PdcchDciFormat1A& dci) {
+    dci = {};
+    const std::uint32_t expected_bit_count = pdcch_dci_format1a_payload_bit_count(config);
+    if (payload_bits == nullptr || expected_bit_count == 0U ||
+        payload_bit_count != expected_bit_count) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    detail::PdcchBitReader reader{.bits = payload_bits, .count = payload_bit_count};
+    std::uint32_t value = 0U;
+    dci.sfn_subframe = sfn_subframe;
+    dci.cell_id = cell_id;
+    dci.rnti = rnti;
+    dci.chain = chain;
+    dci.raw_payload_bits.assign(payload_bits, payload_bits + payload_bit_count);
+
+    if (config.cif_enabled) {
+        if (!reader.read(3U, value)) {
+            return MmseStatus::kInvalidArgument;
+        }
+        dci.cif_present = true;
+        dci.carrier_indicator = static_cast<std::uint8_t>(value);
+    }
+    if (!reader.read(1U, value) || value != 1U) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (!reader.read(1U, value)) {
+        return MmseStatus::kInvalidArgument;
+    }
+    dci.distributed_vrb_assignment = value != 0U;
+
+    const std::uint8_t riv_bits = pdcch_dci_riv_bit_count(config.n_prb);
+    if (!reader.read(riv_bits, value)) {
+        return MmseStatus::kInvalidArgument;
+    }
+    const std::uint16_t riv = static_cast<std::uint16_t>(value);
+
+    if (!dci.distributed_vrb_assignment &&
+        riv == static_cast<std::uint16_t>((1U << riv_bits) - 1U)) {
+        std::uint32_t preamble_index = 0U;
+        std::uint32_t prach_mask_index = 0U;
+        if (!reader.read(6U, preamble_index) || !reader.read(4U, prach_mask_index) ||
+            !reader.remaining_bits_are_zero()) {
+            return MmseStatus::kInvalidArgument;
+        }
+        dci.is_pdcch_order = true;
+        dci.preamble_index = static_cast<std::uint8_t>(preamble_index);
+        dci.prach_mask_index = static_cast<std::uint8_t>(prach_mask_index);
+        return MmseStatus::kOk;
+    }
+
+    dci.resource_indication_value = riv;
+    if (!reader.read(5U, value)) {
+        return MmseStatus::kInvalidArgument;
+    }
+    dci.mcs_tbs_index = static_cast<std::uint8_t>(value);
+    const std::uint8_t harq_pid_bits = config.duplex_mode == PhichDuplexMode::kFdd ? 3U : 4U;
+    if (!reader.read(harq_pid_bits, value)) {
+        return MmseStatus::kInvalidArgument;
+    }
+    dci.harq_process = static_cast<std::uint8_t>(value);
+
+    if (dci.distributed_vrb_assignment && config.n_prb >= 50U) {
+        if (!reader.read(1U, value)) {
+            return MmseStatus::kInvalidArgument;
+        }
+        dci.n_gap_is_two = value != 0U;
+    } else if (!reader.read(1U, value)) {
+        return MmseStatus::kInvalidArgument;
+    }
+    if (!reader.read(2U, value)) {
+        return MmseStatus::kInvalidArgument;
+    }
+    dci.redundancy_version = static_cast<std::uint8_t>(value);
+    if (!reader.read(1U, value) || value != 0U || !reader.read(1U, value)) {
+        return MmseStatus::kInvalidArgument;
+    }
+    dci.n_prb_1a_is_three = value != 0U;
+    if (config.duplex_mode == PhichDuplexMode::kTdd) {
+        if (!reader.read(2U, value)) {
+            return MmseStatus::kInvalidArgument;
+        }
+        dci.downlink_assignment_index = static_cast<std::uint8_t>(value);
+    }
+    if (!reader.remaining_bits_are_zero()) {
+        return MmseStatus::kInvalidArgument;
+    }
+    return decode_pdcch_type2_riv(dci.resource_indication_value, config.n_prb, dci.start_prb,
+                                  dci.n_prb);
+}
+
+inline MmseStatus validate_and_parse_pdcch_dci_format1a(
+    const std::uint8_t* decoded_bits, std::uint32_t decoded_bit_count, std::uint16_t expected_rnti,
+    std::uint32_t sfn_subframe, std::uint16_t cell_id, const PdcchChainMetadata& chain,
+    const PdcchDciFormat1AConfig& config, PdcchDciFormat1ADecodeResult& result) {
+    result = {};
+    const std::uint32_t payload_bit_count = pdcch_dci_format1a_payload_bit_count(config);
+    if (payload_bit_count == 0U || decoded_bit_count != payload_bit_count + kPdcchCrcBitCount) {
+        return MmseStatus::kInvalidArgument;
+    }
+    if (const MmseStatus status =
+            check_pdcch_crc_rnti(decoded_bits, decoded_bit_count, expected_rnti, result.crc);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    if (!result.crc.matches_expected_rnti) {
+        return MmseStatus::kOk;
+    }
+    const MmseStatus status =
+        parse_pdcch_dci_format1a(decoded_bits, payload_bit_count, sfn_subframe, cell_id,
+                                 expected_rnti, chain, config, result.dci);
+    if (status != MmseStatus::kOk) {
+        return status;
+    }
+    result.matched = true;
+    return MmseStatus::kOk;
+}
+
+inline MmseStatus decode_pdcch_dci_format1a_with_adapter(
+    const PdcchRateRecoveredLlr& recovered, const PdcchTailBitingConvolutionalDecoder& decoder,
+    std::uint16_t expected_rnti, const PdcchDciFormat1AConfig& config,
+    PdcchDciFormat1ADecodeResult& result) {
+    result = {};
+    const std::uint32_t payload_bit_count = pdcch_dci_format1a_payload_bit_count(config);
+    if (payload_bit_count == 0U ||
+        recovered.codeword_bit_count != payload_bit_count + kPdcchCrcBitCount) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    std::vector<std::uint8_t> decoded_bits{};
+    if (const MmseStatus status =
+            invoke_pdcch_tail_biting_convolutional_decoder(recovered, decoder, decoded_bits);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    return validate_and_parse_pdcch_dci_format1a(
+        decoded_bits.data(), static_cast<std::uint32_t>(decoded_bits.size()), expected_rnti,
+        recovered.sfn_subframe, recovered.cell_id, recovered.chain, config, result);
+}
+
+inline MmseStatus
+decode_pdcch_common_search_dci_format1a(const BackendPdcchEqualizedIndication& backend,
+                                        const PdcchCommonSearchDecodeConfig& config,
+                                        PdcchCommonSearchDecodeResult& result) {
+    result = {};
+    if (config.decoder.decode == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    const std::uint32_t payload_bit_count =
+        pdcch_dci_format1a_payload_bit_count(config.dci_format1a);
+    if (payload_bit_count == 0U) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    std::vector<PdcchCandidateLlr> candidates{};
+    if (const MmseStatus status = build_pdcch_common_search_candidate_llrs(backend, candidates);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    result.candidate_count = static_cast<std::uint32_t>(candidates.size());
+    result.hits.reserve(candidates.size());
+    for (const PdcchCandidateLlr& candidate : candidates) {
+        PdcchRateRecoveredLlr recovered{};
+        if (const MmseStatus status = recover_pdcch_convolutional_rate_matched_llrs(
+                candidate, payload_bit_count, recovered);
+            status != MmseStatus::kOk) {
+            result = {};
+            return status;
+        }
+
+        // The external decoder callback has no thread-safety contract, so blind-search candidates
+        // are deliberately decoded serially.
+        PdcchDciFormat1ADecodeResult candidate_result{};
+        if (const MmseStatus status = decode_pdcch_dci_format1a_with_adapter(
+                recovered, config.decoder, config.expected_rnti, config.dci_format1a,
+                candidate_result);
+            status != MmseStatus::kOk) {
+            result = {};
+            return status;
+        }
+        if (candidate_result.matched) {
+            result.hits.push_back(std::move(candidate_result));
+        }
+    }
+    return MmseStatus::kOk;
 }
 
 inline ReCoord decode_re_grid_index(std::uint16_t grid_index) {
