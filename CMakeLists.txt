@@ -117,6 +117,13 @@ if(MMSE_BUILD_BENCH)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 
+    add_executable(pdcch_decode_bench bench/pdcch_decode_bench.cpp)
+    target_link_libraries(pdcch_decode_bench PRIVATE mmse_cpp)
+    target_include_directories(pdcch_decode_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    install(TARGETS pdcch_decode_bench
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+
     add_executable(mmse_cuda_profile bench/mmse_cuda_profile.cpp)
     target_link_libraries(mmse_cuda_profile PRIVATE mmse_cpp)
     target_include_directories(mmse_cuda_profile PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

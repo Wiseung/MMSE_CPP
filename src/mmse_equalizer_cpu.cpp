@@ -441,27 +441,107 @@ std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layo
 std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
     reset_layout(layout);
 
-    for (std::uint32_t symbol = 0; symbol < desc.control_symbol_count; ++symbol) {
-        const std::uint32_t segment_begin = layout.n_re;
-        for (std::uint32_t prb = 0; prb < kLteNumPrb20MHz; ++prb) {
-            if (!bitmap_has_prb(desc, prb)) {
-                continue;
+    using PdcchRegIndices = std::array<std::uint16_t, mmse::pdcch::kPdcchRePerReg>;
+    constexpr std::uint32_t kPdcchPermutationColumns = 32U;
+    constexpr std::array<std::uint8_t, kPdcchPermutationColumns> kPdcchPermutation = {
+        1U, 17U, 9U, 25U, 5U, 21U, 13U, 29U, 3U, 19U, 11U, 27U, 7U, 23U, 15U, 31U,
+        0U, 16U, 8U, 24U, 4U, 20U, 12U, 28U, 2U, 18U, 10U, 26U, 6U, 22U, 14U, 30U,
+    };
+    std::array<PdcchRegIndices, kMaxDataRe / mmse::pdcch::kPdcchRePerReg> physical_regs{};
+    std::array<std::uint32_t, kMaxDataRe / mmse::pdcch::kPdcchRePerReg> interleaved_reg_indices{};
+    std::uint32_t n_physical_regs = 0U;
+
+    const auto append_reg = [&](std::uint32_t symbol, std::uint32_t prb,
+                                const PdcchRegIndices& tones) {
+        PdcchRegIndices grid_indices{};
+        for (std::uint32_t re_in_reg = 0U; re_in_reg < tones.size(); ++re_in_reg) {
+            const std::uint32_t tone = tones[re_in_reg];
+            if (control_re_excluded(desc, symbol, prb, tone)) {
+                return;
             }
-            for (std::uint32_t tone = 0; tone < kLteNumSubcarriersPerPrb; ++tone) {
-                const std::uint32_t sc = prb * kLteNumSubcarriersPerPrb + tone;
-                if (is_crs_re(desc, static_cast<std::uint8_t>(symbol), sc) ||
-                    control_re_excluded(desc, symbol, prb, tone)) {
-                    continue;
-                }
-                const std::uint32_t grid_idx = symbol * kLteNumSubcarriers20MHz + sc;
-                append_layout_re(layout, grid_idx);
-            }
+            grid_indices[re_in_reg] = static_cast<std::uint16_t>(
+                symbol * kLteNumSubcarriers20MHz + prb * kLteNumSubcarriersPerPrb + tone);
         }
-        if (layout.n_re > segment_begin) {
-            layout.prb_segment_offsets[layout.n_segments++] = segment_begin;
+        physical_regs[n_physical_regs++] = grid_indices;
+    };
+
+    constexpr std::array<PdcchRegIndices, 3> kSymbol0FirstRegTones = {
+        PdcchRegIndices{1U, 2U, 4U, 5U},
+        PdcchRegIndices{0U, 2U, 3U, 5U},
+        PdcchRegIndices{0U, 1U, 3U, 4U},
+    };
+    const PdcchRegIndices symbol0_reg0 = kSymbol0FirstRegTones[desc.cell_id % 3U];
+    PdcchRegIndices symbol0_reg1{};
+    for (std::uint32_t re_in_reg = 0U; re_in_reg < symbol0_reg1.size(); ++re_in_reg) {
+        symbol0_reg1[re_in_reg] = static_cast<std::uint16_t>(symbol0_reg0[re_in_reg] + 6U);
+    }
+    constexpr std::array<PdcchRegIndices, 3> kLaterSymbolRegs = {
+        PdcchRegIndices{0U, 1U, 2U, 3U},
+        PdcchRegIndices{4U, 5U, 6U, 7U},
+        PdcchRegIndices{8U, 9U, 10U, 11U},
+    };
+
+    for (std::uint32_t prb = 0U; prb < kLteNumPrb20MHz; ++prb) {
+        if (!bitmap_has_prb(desc, prb)) {
+            continue;
+        }
+        append_reg(0U, prb, symbol0_reg0);
+        if (desc.control_symbol_count >= 2U) {
+            append_reg(1U, prb, kLaterSymbolRegs[0]);
+        }
+        if (desc.control_symbol_count >= 3U) {
+            append_reg(2U, prb, kLaterSymbolRegs[0]);
+        }
+        if (desc.control_symbol_count >= 2U) {
+            append_reg(1U, prb, kLaterSymbolRegs[1]);
+        }
+        if (desc.control_symbol_count >= 3U) {
+            append_reg(2U, prb, kLaterSymbolRegs[1]);
+        }
+        append_reg(0U, prb, symbol0_reg1);
+        if (desc.control_symbol_count >= 2U) {
+            append_reg(1U, prb, kLaterSymbolRegs[2]);
+        }
+        if (desc.control_symbol_count >= 3U) {
+            append_reg(2U, prb, kLaterSymbolRegs[2]);
         }
     }
 
+    if (n_physical_regs == 0U) {
+        layout.prb_segment_offsets[0] = 0U;
+        return 0U;
+    }
+
+    const std::uint32_t n_rows =
+        (n_physical_regs + kPdcchPermutationColumns - 1U) / kPdcchPermutationColumns;
+    const std::uint32_t n_dummy = kPdcchPermutationColumns * n_rows - n_physical_regs;
+    std::uint32_t cyclic_shift_source_reg = 0U;
+    for (std::uint32_t column = 0U; column < kPdcchPermutationColumns; ++column) {
+        for (std::uint32_t row = 0U; row < n_rows; ++row) {
+            const std::uint32_t matrix_index =
+                row * kPdcchPermutationColumns + kPdcchPermutation[column];
+            if (matrix_index < n_dummy) {
+                continue;
+            }
+            const std::uint32_t mapped_reg = matrix_index - n_dummy;
+            interleaved_reg_indices[mapped_reg] =
+                (n_physical_regs + cyclic_shift_source_reg - (desc.cell_id % n_physical_regs)) %
+                n_physical_regs;
+            ++cyclic_shift_source_reg;
+        }
+    }
+
+    const std::uint32_t n_mapped_regs =
+        (n_physical_regs / mmse::pdcch::kPdcchRegsPerCce) * mmse::pdcch::kPdcchRegsPerCce;
+    for (std::uint32_t mapped_reg = 0U; mapped_reg < n_mapped_regs; ++mapped_reg) {
+        const PdcchRegIndices& reg = physical_regs[interleaved_reg_indices[mapped_reg]];
+        for (const std::uint16_t grid_idx : reg) {
+            append_layout_re(layout, grid_idx);
+        }
+    }
+
+    layout.n_segments = layout.n_re == 0U ? 0U : 1U;
+    layout.prb_segment_offsets[0] = 0U;
     layout.prb_segment_offsets[layout.n_segments] = layout.n_re;
     return layout.n_re;
 }

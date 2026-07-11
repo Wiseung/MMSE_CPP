@@ -9,6 +9,14 @@
 
 namespace mmse::pdcch {
 
+inline constexpr std::uint16_t kSiRnti = 0xFFFFU;
+inline constexpr std::uint8_t kPdcchRePerReg = 4U;
+inline constexpr std::uint8_t kPdcchRegsPerCce = 9U;
+inline constexpr std::uint8_t kPdcchCrcBitCount = 16U;
+inline constexpr std::uint8_t kPdcchConvolutionalCodeRate = 3U;
+inline constexpr std::uint32_t kPdcchMaxCandidateEncodedBits = 576U;
+inline constexpr std::uint32_t kPdcchMaxDciPayloadBits = 128U;
+
 struct ReservedControlRe {
     std::uint32_t symbol = 0;
     std::uint32_t prb = 0;
@@ -96,6 +104,129 @@ struct BackendPdcchTdDescrambledLlrIndication {
     std::vector<float> llrs{};
     std::vector<std::uint16_t> re_grid_indices0{};
     std::vector<std::uint16_t> re_grid_indices1{};
+};
+
+struct PdcchReg {
+    std::array<std::uint32_t, kPdcchRePerReg> source_re_indices{};
+    std::array<std::uint16_t, kPdcchRePerReg> grid_indices{};
+};
+
+struct PdcchCce {
+    std::array<std::uint16_t, kPdcchRegsPerCce> reg_indices{};
+};
+
+struct PdcchControlRegion {
+    std::uint16_t cell_id = 0;
+    std::uint8_t control_symbol_count = 0;
+    std::uint32_t n_source_re = 0;
+    std::uint32_t n_unassigned_reg = 0;
+    std::vector<PdcchReg> regs{};
+    std::vector<PdcchCce> cces{};
+};
+
+struct PdcchCommonSearchCandidate {
+    std::uint32_t candidate_id = 0;
+    std::uint16_t first_cce = 0;
+    std::uint8_t aggregation_level = 0;
+    std::uint32_t encoded_bit_count = 0;
+};
+
+struct PdcchCandidateLlr {
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    PdcchChainMetadata chain{};
+    std::uint32_t encoded_bit_count = 0;
+    std::vector<float> llrs{};
+};
+
+enum class PdcchSoftBitPolarity : std::uint8_t {
+    kNegativeFavorsZero = 0,
+};
+
+enum class PdcchConvolutionalLlrOrder : std::uint8_t {
+    kLteRateRecoveredTriplets = 0,
+};
+
+struct PdcchRateRecoveredLlr {
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    PdcchChainMetadata chain{};
+    std::uint32_t encoded_bit_count = 0;
+    std::uint32_t codeword_bit_count = 0;
+    PdcchSoftBitPolarity soft_bit_polarity = PdcchSoftBitPolarity::kNegativeFavorsZero;
+    PdcchConvolutionalLlrOrder llr_order = PdcchConvolutionalLlrOrder::kLteRateRecoveredTriplets;
+    std::vector<float> convolutional_llrs{};
+};
+
+struct PdcchTailBitingConvolutionalDecodeRequest {
+    const float* convolutional_llrs = nullptr;
+    std::uint32_t convolutional_llr_count = 0;
+    std::uint8_t* decoded_bits = nullptr;
+    std::uint32_t decoded_bit_count = 0;
+    PdcchSoftBitPolarity soft_bit_polarity = PdcchSoftBitPolarity::kNegativeFavorsZero;
+    PdcchConvolutionalLlrOrder llr_order = PdcchConvolutionalLlrOrder::kLteRateRecoveredTriplets;
+    bool tail_biting = true;
+};
+
+using PdcchTailBitingConvolutionalDecodeFn =
+    MmseStatus (*)(void* context, const PdcchTailBitingConvolutionalDecodeRequest& request);
+
+struct PdcchTailBitingConvolutionalDecoder {
+    void* context = nullptr;
+    PdcchTailBitingConvolutionalDecodeFn decode = nullptr;
+};
+
+struct PdcchDciFormat1AConfig {
+    std::uint16_t n_prb = kLteNumPrb20MHz;
+    PhichDuplexMode duplex_mode = PhichDuplexMode::kFdd;
+    bool cif_enabled = false;
+};
+
+struct PdcchCrcRntiCheck {
+    std::uint16_t transmitted_crc = 0;
+    std::uint16_t calculated_crc = 0;
+    std::uint16_t unmasked_rnti = 0;
+    bool matches_expected_rnti = false;
+};
+
+struct PdcchDciFormat1A {
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t rnti = 0;
+    PdcchChainMetadata chain{};
+    bool cif_present = false;
+    std::uint8_t carrier_indicator = 0;
+    bool is_pdcch_order = false;
+    std::uint8_t preamble_index = 0;
+    std::uint8_t prach_mask_index = 0;
+    bool distributed_vrb_assignment = false;
+    bool n_gap_is_two = false;
+    bool n_prb_1a_is_three = false;
+    std::uint16_t resource_indication_value = 0;
+    std::uint16_t start_prb = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t mcs_tbs_index = 0;
+    std::uint8_t harq_process = 0;
+    std::uint8_t redundancy_version = 0;
+    std::uint8_t downlink_assignment_index = 0;
+    std::vector<std::uint8_t> raw_payload_bits{};
+};
+
+struct PdcchDciFormat1ADecodeResult {
+    PdcchCrcRntiCheck crc{};
+    bool matched = false;
+    PdcchDciFormat1A dci{};
+};
+
+struct PdcchCommonSearchDecodeConfig {
+    PdcchTailBitingConvolutionalDecoder decoder{};
+    std::uint16_t expected_rnti = kSiRnti;
+    PdcchDciFormat1AConfig dci_format1a{};
+};
+
+struct PdcchCommonSearchDecodeResult {
+    std::uint32_t candidate_count = 0;
+    std::vector<PdcchDciFormat1ADecodeResult> hits{};
 };
 
 } // namespace mmse::pdcch
