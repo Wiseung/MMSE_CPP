@@ -70,6 +70,7 @@ struct PlanarGridViewF32 {
     std::uint32_t n_rx_ant = 0;
     std::uint32_t n_symbols = 0;
     std::uint32_t n_subcarriers = 0;
+    std::uint64_t generation = 0;
 };
 
 struct ExtractDescriptor {
@@ -184,6 +185,24 @@ struct PdcchTdMmseOutputView {
     std::uint32_t capacity_symbols = 0;
 };
 
+struct PbchTdMmseOutputView {
+    float* x_hat_re = nullptr;
+    float* x_hat_im = nullptr;
+    float* sinr = nullptr;
+    std::uint16_t* re_grid_indices0 = nullptr;
+    std::uint16_t* re_grid_indices1 = nullptr;
+    std::uint32_t capacity_symbols = 0;
+};
+
+struct PcfichTdMmseOutputView {
+    float* x_hat_re = nullptr;
+    float* x_hat_im = nullptr;
+    float* sinr = nullptr;
+    std::uint16_t* re_grid_indices0 = nullptr;
+    std::uint16_t* re_grid_indices1 = nullptr;
+    std::uint32_t capacity_symbols = 0;
+};
+
 struct PbchMmseResult {
     std::uint32_t n_re = 0;
     std::uint32_t sfn_subframe = 0;
@@ -255,6 +274,44 @@ struct PdcchTdMmseResult {
     float sigma2 = 0.0F;
     std::array<std::uint16_t, 7> prb_bitmap{};
     PdcchChainMetadata chain{};
+};
+
+struct PbchTdMmseResult {
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_source_re = 0;
+    std::uint32_t sfn_subframe = 0;
+    std::uint32_t grid_symbol_count = 0;
+    std::uint32_t grid_subcarrier_count = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t start_prb = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t start_symbol = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t mod_order = 0;
+    float sigma2 = 0.0F;
+    PbchChainMetadata chain{};
+};
+
+struct PcfichTdMmseResult {
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_source_re = 0;
+    std::uint32_t sfn_subframe = 0;
+    std::uint32_t grid_symbol_count = 0;
+    std::uint32_t grid_subcarrier_count = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t start_symbol = 0;
+    std::uint8_t reg_count = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t mod_order = 0;
+    float sigma2 = 0.0F;
+    PcfichChainMetadata chain{};
 };
 
 struct MmseEqualizerCpuConfig {

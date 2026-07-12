@@ -85,8 +85,8 @@ MmseStatus run(const PlanarGridViewF32& grid,
 
 `descriptor_supported(...)` 在 [src/mmse_equalizer_cpu.cpp](G:\MMSE_CPP\src\mmse_equalizer_cpu.cpp) 中对配置做统一过滤，核心边界包括：
 
-- `n_rx_ant == 2`
-- `n_layers` 只支持 `1` 或 `2`
+- `n_rx_ant` 支持 `1` 或 `2`
+- `n_layers` 只支持 `1` 或 `2`，且不能超过 `n_rx_ant`
 - `n_tx_ports` 在不同信道类型下有明确限制
 - `pmi == -1`
 - `mod_order` 只支持 `2 / 4 / 6 / 8`

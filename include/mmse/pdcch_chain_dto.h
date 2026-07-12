@@ -16,6 +16,25 @@ inline constexpr std::uint8_t kPdcchCrcBitCount = 16U;
 inline constexpr std::uint8_t kPdcchConvolutionalCodeRate = 3U;
 inline constexpr std::uint32_t kPdcchMaxCandidateEncodedBits = 576U;
 inline constexpr std::uint32_t kPdcchMaxDciPayloadBits = 128U;
+inline constexpr std::uint8_t kPdcchAggregationLevelMaskL1 = 1U << 0U;
+inline constexpr std::uint8_t kPdcchAggregationLevelMaskL2 = 1U << 1U;
+inline constexpr std::uint8_t kPdcchAggregationLevelMaskL4 = 1U << 2U;
+inline constexpr std::uint8_t kPdcchAggregationLevelMaskL8 = 1U << 3U;
+inline constexpr std::uint8_t kPdcchAggregationLevelMaskAll =
+    kPdcchAggregationLevelMaskL1 | kPdcchAggregationLevelMaskL2 | kPdcchAggregationLevelMaskL4 |
+    kPdcchAggregationLevelMaskL8;
+
+enum class PhichResource : std::uint8_t {
+    kOneSixth = 0,
+    kHalf,
+    kOne,
+    kTwo,
+};
+
+enum class PhichDuration : std::uint8_t {
+    kNormal = 0,
+    kExtended,
+};
 
 struct ReservedControlRe {
     std::uint32_t symbol = 0;
@@ -131,6 +150,18 @@ struct PdcchCommonSearchCandidate {
     std::uint32_t encoded_bit_count = 0;
 };
 
+struct PdcchSearchCandidate {
+    std::uint32_t candidate_id = 0;
+    std::uint16_t first_cce = 0;
+    std::uint8_t aggregation_level = 0;
+    std::uint32_t encoded_bit_count = 0;
+};
+
+struct PdcchUeSpecificSearchCandidate {
+    std::uint16_t rnti = 0;
+    PdcchSearchCandidate search_candidate{};
+};
+
 struct PdcchCandidateLlr {
     std::uint32_t sfn_subframe = 0;
     std::uint16_t cell_id = 0;
@@ -202,6 +233,7 @@ struct PdcchDciFormat1A {
     bool distributed_vrb_assignment = false;
     bool n_gap_is_two = false;
     bool n_prb_1a_is_three = false;
+    std::uint8_t n_prb_1a = 0;
     std::uint16_t resource_indication_value = 0;
     std::uint16_t start_prb = 0;
     std::uint16_t n_prb = 0;
@@ -227,6 +259,90 @@ struct PdcchCommonSearchDecodeConfig {
 struct PdcchCommonSearchDecodeResult {
     std::uint32_t candidate_count = 0;
     std::vector<PdcchDciFormat1ADecodeResult> hits{};
+};
+
+struct PdcchUeSpecificSearchConfig {
+    std::vector<std::uint16_t> rntis{};
+    std::uint8_t aggregation_level_mask = kPdcchAggregationLevelMaskAll;
+    PdcchTailBitingConvolutionalDecoder decoder{};
+    PdcchDciFormat1AConfig dci_format1a{};
+};
+
+struct PdcchUeSpecificDciFormat1AHit {
+    std::uint16_t rnti = 0;
+    std::uint16_t first_cce = 0;
+    std::uint8_t aggregation_level = 0;
+    PdcchDciFormat1ADecodeResult decoded{};
+};
+
+struct PdcchUeSpecificSearchResult {
+    std::uint32_t candidate_count = 0;
+    std::uint32_t decoded_candidate_count = 0;
+    std::uint32_t crc_rnti_miss_count = 0;
+    std::uint32_t semantic_reject_count = 0;
+    std::vector<PdcchUeSpecificDciFormat1AHit> hits{};
+};
+
+struct PdcchSiRntiSearchConfig {
+    // A non-null callback preserves an SDK-provided decoder; otherwise native Viterbi is used.
+    PdcchTailBitingConvolutionalDecoder decoder{};
+};
+
+struct PdcchSiRntiDciFormat1AHit {
+    std::uint16_t first_cce = 0;
+    std::uint8_t aggregation_level = 0;
+    PdcchDciFormat1ADecodeResult decoded{};
+};
+
+struct PdcchSiRntiSearchResult {
+    std::uint32_t candidate_count = 0;
+    std::vector<PdcchSiRntiDciFormat1AHit> hits{};
+};
+
+struct PdcchControlGeometry {
+    std::uint8_t control_symbol_count = 0;
+    PhichResource phich_resource = PhichResource::kOne;
+    PhichDuration phich_duration = PhichDuration::kNormal;
+    bool standard_reg_order = true;
+};
+
+enum class PdcchSiRntiGeometrySearchStatus : std::uint8_t {
+    kAcquired = 0,
+    kLocked,
+    kMiss,
+    kAmbiguous,
+};
+
+struct PdcchSiRntiGeometrySearchRequest {
+    PlanarGridViewF32 grid{};
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    std::uint8_t n_tx_ports = 1;
+    std::uint8_t tx_mode = 1;
+    LteControlSubframeContext control_subframe{};
+    PdcchChainMetadata chain{};
+};
+
+struct PdcchSiRntiGeometrySearchConfig {
+    PdcchTailBitingConvolutionalDecoder decoder{};
+};
+
+struct PdcchSiRntiGeometrySearchCache {
+    bool locked = false;
+    std::uint16_t cell_id = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t tx_mode = 0;
+    LteControlSubframeKind subframe_kind = LteControlSubframeKind::kRegular;
+    PdcchControlGeometry geometry{};
+    std::uint8_t consecutive_miss_count = 0;
+};
+
+struct PdcchSiRntiGeometrySearchResult {
+    PdcchSiRntiGeometrySearchStatus status = PdcchSiRntiGeometrySearchStatus::kMiss;
+    std::uint32_t geometry_attempt_count = 0;
+    std::uint32_t candidate_count = 0;
+    PdcchControlGeometry geometry{};
+    PdcchSiRntiSearchResult decoded{};
 };
 
 } // namespace mmse::pdcch

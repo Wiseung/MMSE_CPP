@@ -12,7 +12,8 @@ namespace mmse::detail {
 inline constexpr std::uint32_t kCudaMaxGridRe = kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz;
 inline constexpr std::uint32_t kCudaMaxDataRe = kCudaMaxGridRe;
 inline constexpr std::uint32_t kCudaEstimateStubComplexCount =
-    kLteNumSymbolsNormalCp * kLteNumTxPortsV1 * kLteNumRxAntV1 * kLteNumSubcarriers20MHz;
+    kLteNumSymbolsNormalCp * kMmseV1MaxNumCrsTxPorts * kMmseV1MaxNumRxAntennas *
+    kLteNumSubcarriers20MHz;
 inline constexpr std::uint32_t kCudaEstimateStubFloatCount = 2U * kCudaEstimateStubComplexCount;
 inline constexpr std::uint32_t kCudaValidationSampleCount = 12U;
 inline constexpr std::uint32_t kCudaEqualizeTraceFloatCount = 32U;
@@ -44,6 +45,7 @@ struct CudaGridMeta {
     std::uint32_t n_layers = 0;
     std::uint32_t n_tx_ports = 0;
     std::uint32_t channel_type = 0;
+    std::uint32_t td_pair_count = 0;
     std::uint32_t n_segments = 0;
     std::uint32_t spot_check_sample_count = 0;
     std::uint32_t trace_sample_count = 0;
@@ -54,14 +56,16 @@ struct CudaGridMeta {
     float g_min = 0.0F;
     float gamma_max = 0.0F;
     std::uint16_t grid_indices[kCudaMaxDataRe]{};
+    std::uint16_t td_pair_grid_indices0[kCudaMaxDataRe / 2U]{};
+    std::uint16_t td_pair_grid_indices1[kCudaMaxDataRe / 2U]{};
     std::uint16_t spot_check_re_slots[kCudaValidationSampleCount]{};
     std::uint32_t output_slot_by_grid_re[kCudaMaxGridRe]{};
     std::uint32_t prb_segment_offsets[kCudaMaxDataRe + 1]{};
     std::uint16_t prb_bitmap[7]{};
     std::uint8_t crs_symbols[kLteNumCrsSymbols]{};
-    std::uint8_t crs_freq_offsets[kLteNumTxPortsV1][kLteNumCrsSymbols]{};
-    float crs_pilot_re[kLteNumTxPortsV1][kLteNumCrsSymbols][kLteNumPilotTonesPerCrsSymbol]{};
-    float crs_pilot_im[kLteNumTxPortsV1][kLteNumCrsSymbols][kLteNumPilotTonesPerCrsSymbol]{};
+    std::uint8_t crs_freq_offsets[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols]{};
+    float crs_pilot_re[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols][kLteNumPilotTonesPerCrsSymbol]{};
+    float crs_pilot_im[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols][kLteNumPilotTonesPerCrsSymbol]{};
 };
 
 struct CudaDeviceInfo {

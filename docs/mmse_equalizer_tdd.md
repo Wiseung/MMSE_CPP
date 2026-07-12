@@ -1,6 +1,6 @@
 # 4G LTE 下行 MMSE 信道均衡模块 — 技术设计文档 (TDD)
 
-> 适用范围：FDD LTE / 20 MHz（2048-FFT, 1200 子载波, 100 PRB, Normal CP）/ 2×2 MIMO / 1 ms TTI 硬实时。
+> 适用范围：FDD LTE / 20 MHz（2048-FFT, 1200 子载波, 100 PRB, Normal CP）/ 1 或 2Rx、最多 2 个 CRS 发射端口 / 1 ms TTI 硬实时。
 > 设计目标：在 x86 CPU 与 NVIDIA GPU 上实现「FFT 输出 → 软解调 LLR 输入」之间的 DSP 段（CRS 插值 + MMSE 均衡），输出星座点 X̂ 与后验 SINR。
 > 对齐标准：3GPP TS 36.211（物理信道与调制）、3GPP TS 36.212（复用与信道编码）。
 
@@ -28,10 +28,10 @@
 
 ### 1.1 输入 (Inputs)
 
-| 名称 | 类型 | 布局 | 说明 |
-|---|---|---|---|
+| 名称   | 类型                      | 布局                         | 说明                                              |
+| ------ | ------------------------- | ---------------------------- | ------------------------------------------------- |
 | `grid` | 复数 `int16_t` 或 `float` | **SoA**: `re[]`, `im[]` 分离 | 频域资源栅格，按 `[ant][symbol][subcarrier]` 排列 |
-| `desc` | `extract_descriptor_t` | 结构体 | ARM 下发的提取描述符 |
+| `desc` | `extract_descriptor_t`    | 结构体                       | ARM 下发的提取描述符                              |
 
 前级 FFT 通常给出 **block-floating-point 的 int16**（带共享指数）。建议输入侧保留 int16 以省 PCIe/内存带宽（见 §5.1），在均衡核内部转 float32。
 
@@ -43,8 +43,8 @@
 typedef struct {
     uint32_t sfn_subframe;   // SFN*10 + subframe，时间戳/对齐用
     uint16_t cell_id;        // 物理小区 ID → 决定 v_shift 与 CRS 序列
-    uint8_t  n_tx_ports;     // CRS 端口数 {1,2,4}
-    uint8_t  n_rx_ant;       // 接收天线数 (本设计=2)
+    uint8_t  n_tx_ports;     // CRS 端口数 {1,2}（v1 实现上限，不是 LTE 协议上限）
+    uint8_t  n_rx_ant;       // 接收天线数 {1,2}（v1 实现上限为 2）
     uint8_t  n_layers;       // 传输层数 (1 或 2)
     uint8_t  tx_mode;        // 传输模式 TM2/3/4 (决定是否需解预编码)
     uint8_t  start_symbol;   // PDSCH 起始 OFDM 符号 (跨过控制区, 1~4)
@@ -55,7 +55,7 @@ typedef struct {
 } extract_descriptor_t;
 ```
 
-> 设计要点：用 **位图** 而非 `prb_list[]`。位图天然映射成 SIMD/CUDA 的 RE 有效性掩码，避免分支化的「这个 RE 要不要处理」判断。
+> 设计要点：用 **位图** 而非 `prb_list[]`。位图天然映射成 SIMD/CUDA 的 RE 有效性掩码，避免分支化的「这个 RE 要不要处理」判断。`1Rx` 仅支持单层检测；`2Tx/2-layer` 空间复用至少需要两个接收观测。`1Rx/2Tx` 的单层发射分集仍受支持。
 
 ### 1.2 输出 (Outputs) — 含 SINR 的传递契约
 
@@ -111,13 +111,14 @@ c_init = 2^10 · (7(ns+1) + l + 1)(2·N_ID_cell + 1) + 2·N_ID_cell + N_CP
 Ĥ_LS(p) = Y(p) · X_p*  =  Y(p) · conj(r(p))
 ```
 
-即一次复乘。得到稀疏（频率每 6 个、时间 4 个符号）的信道样点 Ĥ_LS，对每个 (tx_port, rx_ant) 对各一份，2×2 共 4 组。
+即一次复乘。得到稀疏（频率每 6 个、时间 4 个符号）的信道样点 Ĥ_LS，对每个已启用的 `(tx_port, rx_ant)` 对各一份；v1 最多保留 2×2 的信道缓冲区。
 
 ### 2.3 时频二维信道插值引擎
 
 采用 **可分离（separable）2D 插值**，对延迟与吞吐都友好：
 
 **Step A — 频率插值**（在 4 个 CRS 符号上各自做一次，把每 6 个子载波的样点补满 1200 个）：
+
 - 默认：**线性 / 三次样条**（低时延、无需信道统计）。
 - 高性能可选：**Wiener / MMSE 插值** `Ĥ = R_hp · R_pp⁻¹ · Ĥ_LS`，其中 `R_pp = R_hh + σ²I`。按假设的延迟扩展/多普勒**离线预算滤波抽头**，运行时只做 FIR 卷积。
 
@@ -125,7 +126,7 @@ c_init = 2^10 · (7(ns+1) + l + 1)(2·N_ID_cell + 1) + 2·N_ID_cell + N_CP
 
 ```text
 estimate_channel(grid, crs_tab, desc) -> H[2][2][nsym][nsc]:
-  for (tx,rx) in 2x2:
+    for tx in 0..n_tx_ports-1, rx in 0..1:
       for l in {0,4,7,11}:                      # CRS 符号
           H_ls[l] = gather(grid[rx], crs_pos(tx,l)) * conj(crs_tab[tx,l])   # §2.2
           H_freq[l][:] = freq_interp(H_ls[l])   # 每6→满1200  (Step A)
@@ -133,7 +134,7 @@ estimate_channel(grid, crs_tab, desc) -> H[2][2][nsym][nsc]:
           H[tx][rx][:][k] = time_interp(H_freq[{0,4,7,11}][k])              # Step B
 ```
 
-> 端口 2/3（4 端口场景）导频更稀疏（每子帧 2 个符号），时间插值精度下降，需在描述符里据 `n_tx_ports` 切换抽头集。
+> LTE 的端口 2/3 场景不属于当前 v1 支持范围；扩展到 4 个 CRS 端口需要同时扩展 CRS 表、信道存储、接口校验、CPU/CUDA 核和控制信道映射。
 
 ### 2.4 噪声方差 σ² 实时估算
 
@@ -178,6 +179,7 @@ A⁻¹ = ─────────────── [             ]
 **因为加了 σ²I（对角加载），只要 σ² > 0，A 必正定、det A > 0，结构上不会奇异**——这是 MMSE 相对 ZF 的天然鲁棒性。然后 `W = A⁻¹·Hᴴ`。
 
 计算流（每 RE）：
+
 1. 由 H 算 `A = Hᴴ·H + σ²I`（4 个复乘累加 + 对角加 σ²）。
 2. det、1/det。
 3. A⁻¹，再 `W = A⁻¹·Hᴴ`。
@@ -311,13 +313,13 @@ inline void mmse_inv_8re(const __m256 a11, const __m256 a22,
 
 **强烈推荐手写 Kernel 解析解，不要用 cuBLAS Batched。** 权衡如下：
 
-| 维度 | 手写解析解 (thread/RE) | cuBLAS `getrfBatched`+`getriBatched` |
-|---|---|---|
-| 单矩阵规模 | 2×2，闭式（§2.5），~20 FLOP | 通用 LU，对 2×2 是杀鸡用牛刀 |
-| 启动/调度开销 | 一次 kernel launch | 需指针数组、多次 launch，per-batch 开销高 |
-| 数据布局 | 寄存器内，无中间写回 | 需把每个矩阵搬成 cuBLAS 要求的布局 |
-| 鲁棒性 | 可内联 det floor / NaN 守卫 | 奇异时返回 info 码，需额外分支处理 |
-| 结论 | **几十万个 2×2 → 完胜** | 仅当矩阵 ≥ 8×8 且批量大时才划算 |
+| 维度          | 手写解析解 (thread/RE)      | cuBLAS `getrfBatched`+`getriBatched`      |
+| ------------- | --------------------------- | ----------------------------------------- |
+| 单矩阵规模    | 2×2，闭式（§2.5），~20 FLOP | 通用 LU，对 2×2 是杀鸡用牛刀              |
+| 启动/调度开销 | 一次 kernel launch          | 需指针数组、多次 launch，per-batch 开销高 |
+| 数据布局      | 寄存器内，无中间写回        | 需把每个矩阵搬成 cuBLAS 要求的布局        |
+| 鲁棒性        | 可内联 det floor / NaN 守卫 | 奇异时返回 info 码，需额外分支处理        |
+| 结论          | **几十万个 2×2 → 完胜**     | 仅当矩阵 ≥ 8×8 且批量大时才划算           |
 
 对 ~1.7×10⁴ 个 2×2 这种「海量小矩阵」，cuBLAS Batched 的固定开销和布局转换会吃掉所有优势。闭式解直接在寄存器里跑完。
 
@@ -390,4 +392,3 @@ __global__ void mmse_equalize_kernel(
 - **参考实现**：用 MATLAB LTE Toolbox 或 srsRAN/OAI 的 PDSCH 均衡作 golden，逐 RE 比对 X̂ 与 γ（误差阈值如相对 1e-3）。
 - **CPU/GPU 一致性**：同一输入两端跑，比对输出；浮点差异容忍 ULP 级，但 SINR 趋势必须一致。
 - **时延门限**：用合成满负载子帧测 p99 端到端时延，确认 < 1 ms 且抖动可控；GPU 路线重点验证流水线重叠率。
-

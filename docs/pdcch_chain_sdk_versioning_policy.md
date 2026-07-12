@@ -10,8 +10,21 @@
 - `PdcchTdMmseResult`
 - `BackendPdcchTdEqualizedIndication`
 
+以及一组可加式的 blind-decode helper：
+
+- `build_pdcch_control_region(...)`
+- `build_pdcch_common_search_candidate_llrs(...)`
+- `recover_pdcch_convolutional_rate_matched_llrs(...)`
+- `decode_pdcch_dci_format1a_with_adapter(...)`
+- `run_pdcch_cpu_common_search_decode(...)`
+- `run_pdcch_cpu_si_rnti_search(...)`
+- `build_pdcch_ue_specific_search_candidates(...)`
+- `decode_pdcch_ue_specific_search_dci_format1a(...)`
+- `run_pdcch_cpu_ue_specific_search(...)`
+- `run_pdcch_cpu_si_rnti_geometry_search(...)`
+
 这些符号不属于下面定义的冻结 `v1` 单 RE 契约。`v1` 边界仍然专门约束
-`run_pdcch(...)` 及其 per-RE DTO 语义。
+`run_pdcch(...)` 及其 per-RE DTO 语义；新增 helper 维持向后兼容，但不改变冻结 core 的解释方式。
 
 相关页面：
 

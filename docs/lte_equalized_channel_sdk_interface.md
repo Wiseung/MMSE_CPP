@@ -29,6 +29,7 @@
 - LTE PBCH 的 equalized RE 提取接口面
 - LTE PDSCH 的下游 `LLR / descrambling` helper
 - LTE PDCCH 控制区的 equalized RE 提取接口面
+- LTE PDCCH common-search、UE-specific 与 SI-RNTI 几何 `DCI 1A` 的 CPU helper 链路
 - LTE PCFICH 的 equalized RE 提取接口面
 - 基于 CRS 的信道估计
 - MMSE 均衡
@@ -101,6 +102,8 @@
   - 新增 TD 路径：
     - `MmseEqualizerCpuContext::run_pdcch_td(...)`
     - `MmseEqualizerGpuContext::run_pdcch_td(...)`
+  - 新增 CPU helper 路径：
+    - `mmse::pdcch::run_pdcch_cpu_common_search_decode(...)`
 
 ### PCFICH
 

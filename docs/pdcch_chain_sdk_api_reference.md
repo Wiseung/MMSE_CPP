@@ -40,6 +40,10 @@
 - `MmseEqualizerCpuContext::init`
 - `MmseEqualizerCpuContext::run_pdcch`
 - `MmseEqualizerCpuContext::run_pdcch_td`
+- `mmse::pdcch::run_pdcch_cpu_common_search_decode`
+- `mmse::pdcch::run_pdcch_cpu_si_rnti_search`
+- `mmse::pdcch::run_pdcch_cpu_ue_specific_search`
+- `mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search`
 - `MmseEqualizerGpuContext::init`
 - `MmseEqualizerGpuContext::run_pdcch`
 - `MmseEqualizerGpuContext::run_pdcch_td`
@@ -57,6 +61,35 @@
 2. helper 把它转换成 `mmse::PdcchMmseInput`
 3. TD CE/MMSE 阶段填充 `mmse::PdcchTdMmseOutputView` 和 `mmse::PdcchTdMmseResult`
 4. helper 把它们打包成 `mmse::pdcch::BackendPdcchTdEqualizedIndication`
+
+新增 CPU `common search DCI 1A` 流程：
+
+1. 上游构造 `mmse::pdcch::FrontendPdcchIndication`
+2. helper 把它转换成 `mmse::PdcchMmseInput`
+3. 调用方可选提供 `PdcchTailBitingConvolutionalDecoder`
+4. 调用 `mmse::pdcch::run_pdcch_cpu_common_search_decode(...)`
+5. 返回 `PdcchCommonSearchDecodeResult::hits`
+
+新增 CPU `SI-RNTI DCI 1A` 流程：
+
+1. 上游构造 `mmse::pdcch::FrontendPdcchIndication`
+2. helper 把它转换成 `mmse::PdcchMmseInput`
+3. 调用 `mmse::pdcch::run_pdcch_cpu_si_rnti_search(...)`
+4. 返回 `PdcchSiRntiSearchResult::hits`
+
+新增 CPU `UE-specific DCI 1A` 流程：
+
+1. 上游构造 `PdcchMmseInput` 和有序的目标 RNTI 列表
+2. SDK 基于 `sfn_subframe % 10` 的 LTE `Y_k` 递推构造 `L=1/2/4/8` 候选
+3. 调用 `mmse::pdcch::run_pdcch_cpu_ue_specific_search(...)`
+4. 返回 `PdcchUeSpecificSearchResult::hits`
+
+新增 CPU `SI-RNTI` 未知几何流程：
+
+1. 上游构造 `PdcchSiRntiGeometrySearchRequest` 和调用方持有的 cache
+2. SDK 在当前 `20 MHz / FDD` 边界内枚举有效 CFI/PHICH 保留几何
+3. 唯一 `SI-RNTI + DCI 1A` 命中后锁定 `PdcchControlGeometry`
+4. 调用 `mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(...)` 返回状态与命中
 
 ## 字段索引
 
@@ -162,24 +195,22 @@
 
 ### 网格字段
 
-| 字段            | 所属类型            | 对应章节               |
-| --------------- | ------------------- | ---------------------- |
-| `re`            | `PlanarGridViewF32` | [3](#3-base-grid-type) |
-| `im`            | `PlanarGridViewF32` | [3](#3-base-grid-type) |
-| `n_rx_ant`      | `PlanarGridViewF32` | [3](#3-base-grid-type) |
-| `n_symbols`     | `PlanarGridViewF32` | [3](#3-base-grid-type) |
-| `n_subcarriers` | `PlanarGridViewF32` | [3](#3-base-grid-type) |
+| 字段            | 所属类型            | 对应章节             |
+| --------------- | ------------------- | -------------------- |
+| `re`            | `PlanarGridViewF32` | [3](#3-基础网格类型) |
+| `im`            | `PlanarGridViewF32` | [3](#3-基础网格类型) |
+| `n_rx_ant`      | `PlanarGridViewF32` | [3](#3-基础网格类型) |
+| `n_symbols`     | `PlanarGridViewF32` | [3](#3-基础网格类型) |
+| `n_subcarriers` | `PlanarGridViewF32` | [3](#3-基础网格类型) |
 
 ## 状态码索引
 
-| 状态码                           | 摘要                                 | 详细章节            |
-| -------------------------------- | ------------------------------------ | ------------------- |
-| `MmseStatus::kOk`                | 调用成功                             | [7](#7-error-codes) |
-| `MmseStatus::kNotInitialized`    | 使用前未初始化 context               | [7](#7-error-codes) |
-| `MmseStatus::kInvalidArgument`   | 调用方提供的指针、配置或输入参数非法 | [7](#7-error-codes) |
-| `MmseStatus::kUnsupportedConfig` | 请求超出当前 LTE PDCCH 支持边界      | [7](#7-error-codes) |
-| `MmseStatus::kBufferTooSmall`    | 调用方输出容量不足                   | [7](#7-error-codes) |
-| `MmseStatus::kInternalError`     | 运行时 / 内部传输或校验失败          | [7](#7-error-codes) |
+- `MmseStatus::kOk`：调用成功。详见 [7](#7-错误码)。
+- `MmseStatus::kNotInitialized`：使用前未初始化 context。详见 [7](#7-错误码)。
+- `MmseStatus::kInvalidArgument`：调用方提供的指针、配置或输入参数非法。详见 [7](#7-错误码)。
+- `MmseStatus::kUnsupportedConfig`：请求超出当前 LTE PDCCH 支持边界。详见 [7](#7-错误码)。
+- `MmseStatus::kBufferTooSmall`：调用方输出容量不足。详见 [7](#7-错误码)。
+- `MmseStatus::kInternalError`：运行时或内部传输/校验失败。详见 [7](#7-错误码)。
 
 ## 1. 公开入口
 
@@ -217,6 +248,20 @@ DTO / helper 工具：
 mmse::pdcch::make_pdcch_mmse_input(...)
 mmse::pdcch::make_backend_pdcch_equalized_indication(...)
 mmse::pdcch::make_backend_pdcch_td_equalized_indication(...)
+mmse::pdcch::normalize_pdcch_td_cce_order(...)
+mmse::pdcch::build_pdcch_control_region(...)
+mmse::pdcch::build_pdcch_common_search_candidates(...)
+mmse::pdcch::build_pdcch_common_search_candidate_llrs(...)
+mmse::pdcch::recover_pdcch_convolutional_rate_matched_llrs(...)
+mmse::pdcch::decode_pdcch_dci_format1a_with_adapter(...)
+mmse::pdcch::decode_pdcch_dci_format1a(...)
+mmse::pdcch::decode_pdcch_common_search_dci_format1a(...)
+mmse::pdcch::build_pdcch_ue_specific_search_candidates(...)
+mmse::pdcch::decode_pdcch_ue_specific_search_dci_format1a(...)
+mmse::pdcch::run_pdcch_cpu_common_search_decode(...)
+mmse::pdcch::run_pdcch_cpu_si_rnti_search(...)
+mmse::pdcch::run_pdcch_cpu_ue_specific_search(...)
+mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(...)
 mmse::pdcch::decode_re_grid_index(...)
 mmse::pdcch::append_pcfich_reserved_control_re_list(...)
 mmse::pdcch::append_phich_reserved_control_re_list(...)
@@ -417,15 +462,42 @@ helper 打包得到的正式下游 owning DTO。
 
 - `x_hat_re.size() == x_hat_im.size() == sinr.size() == re_grid_indices.size()`
 
+### 2.8 新增 blind-decode helper DTO
+
+下表列出当前文档化的 PDCCH 下游 blind-decode helper 类型。
+
+| 类型                                  | 作用                                       | 关键约束                                                     |
+| ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
+| `BackendPdcchTdEqualizedIndication`   | 表示 `2Tx TD` 去分集后的 owning 软符号输出 | 使用 `re_grid_indices0/re_grid_indices1` 表达源 RE 对        |
+| `PdcchControlRegion`                  | 表示按 LTE `REG/CCE` 恢复后的控制区        | `n_source_re % 4 == 0`，并且必须位于控制区内                 |
+| `PdcchCommonSearchCandidate`          | 表示一个 `common search` 候选              | 当前仅覆盖聚合级别 `4` 和 `8`                                |
+| `PdcchSearchCandidate`                | 搜索空间无关的候选描述                     | `encoded_bit_count == 72 * aggregation_level`                |
+| `PdcchUeSpecificSearchCandidate`      | 一个 RNTI 对应的 UE-specific 候选          | 保存 RNTI 与 `PdcchSearchCandidate`                          |
+| `PdcchCandidateLlr`                   | 表示单个候选的 descrambled `LLR` 切片      | `encoded_bit_count == 72 * aggregation_level`                |
+| `PdcchRateRecoveredLlr`               | 表示候选速率恢复后的卷积码输入软比特       | 支持 `L=1/2/4/8`；输出顺序固定为 `kLteRateRecoveredTriplets` |
+| `PdcchTailBitingConvolutionalDecoder` | 可选外部尾咬卷积码覆盖器                   | 未设置时使用内建 `64-state` 尾咬 Viterbi                     |
+| `PdcchDciFormat1AConfig`              | `DCI 1A` 解析配置                          | 当前 payload 位宽仅文档化 `20 MHz`                           |
+| `PdcchDciFormat1ADecodeResult`        | `CRC-RNTI + DCI 1A` 校验与解析结果         | 只有 `matched == true` 才表示命中                            |
+| `PdcchCommonSearchDecodeConfig`       | 正式 CPU `common search DCI 1A` 入口配置   | `decoder.decode` 可选；默认内建 Viterbi                      |
+| `PdcchSiRntiSearchConfig`             | 固定 SI-RNTI 搜索入口配置                  | 仅允许外部 decoder 覆盖                                      |
+| `PdcchSiRntiSearchResult`             | 固定 SI-RNTI 搜索输出                      | 返回全部命中及其 `first_cce`                                 |
+| `PdcchCommonSearchDecodeResult`       | 正式 CPU `common search DCI 1A` 入口输出   | `hits` 保存所有命中候选，而不是单个命中                      |
+| `PdcchUeSpecificSearchConfig`         | UE-specific DCI 1A 搜索配置                | `rntis` 必须非空、唯一且不含 `0` 或 `kSiRnti`                |
+| `PdcchUeSpecificSearchResult`         | UE-specific 搜索输出                       | 报告候选、译码、CRC miss、语义拒绝和命中统计                 |
+| `PdcchControlGeometry`                | 可搜索或锁定的控制区几何                   | 包含 CFI、PHICH resource/duration 与标准 REG 顺序标记        |
+| `PdcchSiRntiGeometrySearchRequest`    | 未知几何 SI-RNTI 搜索输入                  | 当前仅 `20 MHz / FDD / normal CP`                            |
+| `PdcchSiRntiGeometrySearchCache`      | 调用方持有的几何锁定 cache                 | PCI、端口、发射模式或子帧类型变化时失效                      |
+| `PdcchSiRntiGeometrySearchResult`     | 未知几何搜索诊断和命中                     | 状态为 `kAcquired/kLocked/kMiss/kAmbiguous`                  |
+
 ## 3. 基础网格类型
 
 ### `mmse::PlanarGridViewF32`
 
 | 字段            | 含义                   | 单位           | 约束                 |
 | --------------- | ---------------------- | -------------- | -------------------- |
-| `re[0..1]`      | 每个 RX 天线的实部平面 | float32 arrays | 非空                 |
-| `im[0..1]`      | 每个 RX 天线的虚部平面 | float32 arrays | 非空                 |
-| `n_rx_ant`      | 接收天线数             | antennas       | 当前 SDK 要求 `2`    |
+| `re[0..1]`      | 每个 RX 天线的实部平面 | float32 arrays | 前 `n_rx_ant` 个非空 |
+| `im[0..1]`      | 每个 RX 天线的虚部平面 | float32 arrays | 前 `n_rx_ant` 个非空 |
+| `n_rx_ant`      | 接收天线数             | antennas       | 支持 `1` / `2`       |
 | `n_symbols`     | 网格 symbol 数         | symbols        | 当前 SDK 要求 `14`   |
 | `n_subcarriers` | 网格宽度               | subcarriers    | 当前 SDK 要求 `1200` |
 
@@ -510,6 +582,139 @@ helper 打包得到的正式下游 owning DTO。
 - 深拷贝 `x_hat_re`、`x_hat_im`、`sinr` 和 `re_grid_indices`
 - 输出向量大小严格等于 `meta.n_re`
 
+### `normalize_pdcch_td_cce_order(td_backend, cce_ordered_backend)`
+
+把 `run_pdcch_td(...)` 的去分集软符号输出归一化为与 `1Tx` 一致的连续 CCE 顺序。
+
+行为：
+
+- 校验每两个相邻软符号必须共享同一对 `re_grid_indices0/re_grid_indices1`
+- 若输入合法，则输出 `BackendPdcchEqualizedIndication`
+- `re_grid_indices[2n]` 对应原 `re_grid_indices0[2n]`
+- `re_grid_indices[2n+1]` 对应原 `re_grid_indices1[2n]`
+
+### `build_pdcch_control_region(...)`
+
+从按 RE 顺序输出的 PDCCH backend DTO 恢复 LTE 控制区的 `REG/CCE` 组织。
+
+行为：
+
+- 每 `4 RE` 组装成一个 `REG`
+- 每 `9 REG` 组装成一个 `CCE`
+- 会校验 `re_grid_indices` 不重复且全部位于 `control_symbol_count` 覆盖的控制区内
+
+### `build_pdcch_common_search_candidates(...)`
+
+基于 `PdcchControlRegion` 构造当前文档化的 `common search` 候选集合。
+
+行为：
+
+- 当前覆盖聚合级别 `4` 和 `8`
+- 当前候选数上限分别是 `4` 和 `2`
+
+### `build_pdcch_common_search_candidate_llrs(...)`
+
+从 `BackendPdcchEqualizedIndication` 直接构造 `common search` 候选的 descrambled `LLR`。
+
+行为：
+
+- 内部执行 `QPSK LLR + descrambling`
+- 内部恢复控制区 `REG/CCE`
+- 输出的 `chain.first_cce / chain.aggregation_level / chain.candidate_id` 与候选位置一致
+
+### `build_pdcch_ue_specific_search_candidates(...)`
+
+从 `PdcchControlRegion`、`sfn_subframe` 和 `PdcchUeSpecificSearchConfig` 构造
+UE-specific 搜索空间候选。
+
+行为：
+
+- 对每个目标 RNTI，以 `Y_-1 = RNTI` 和 `Y_k = (39827 * Y_(k-1)) mod 65537` 推导当前子帧位置
+- 仅使用 `sfn_subframe % 10` 选择 `Y_k`，因此相同子帧号在相邻无线帧具有相同候选位置
+- 依次枚举 RNTI 列表、`L=1/2/4/8` 和候选序号 `m`
+- 每级的最大候选数为 `6/6/2/2`，并按实际 `floor(N_CCE / L)` 截断
+- 同一 `first_cce` 在不同 `L` 下保留为独立候选，因为编码比特数不同
+- `rntis` 为空、含重复项、`0`、`kSiRnti`，或聚合掩码含未知 bit 时返回 `kInvalidArgument`
+
+### `build_pdcch_search_candidate_llrs(...)`
+
+从 `BackendPdcchEqualizedIndication` 和通用 `PdcchSearchCandidate` 列表构造候选的
+descrambled LLR 切片。它是 common-search 与 UE-specific helper 共用的底层接口。
+
+行为：
+
+- 内部执行 `QPSK LLR + PDCCH descrambling`
+- 校验每个候选的 `L in {1,2,4,8}`、`encoded_bit_count == 72 * L` 和 CCE 范围
+- 对候选越界或协议字段不一致返回 `kInvalidArgument`
+
+### `recover_pdcch_convolutional_rate_matched_llrs(...)`
+
+对单个候选做 LTE PDCCH 速率恢复，得到卷积码模块输入软比特。
+
+行为：
+
+- 输出长度固定为 `3 * (payload_bit_count + 16)`
+- 当前 soft-bit 极性固定为 `kNegativeFavorsZero`
+- 当前输出顺序固定为 `kLteRateRecoveredTriplets`
+- 有效聚合级别为 `1/2/4/8`，并继续校验 `encoded_bit_count == 72 * aggregation_level`
+
+### `decode_pdcch_dci_format1a_with_adapter(...)`
+
+对单个候选执行外部尾咬卷积码回调、`CRC-RNTI` 校验和 `DCI 1A` 解析。
+
+### `decode_pdcch_dci_format1a(...)`
+
+对单个候选执行：
+
+1. 内建尾咬 Viterbi，或可选外部回调覆盖
+2. `CRC-RNTI` 校验
+3. `DCI 1A` 解析
+
+### `decode_pdcch_common_search_dci_format1a(...)`
+
+对整个 `BackendPdcchEqualizedIndication` 直接执行 `common search DCI 1A` helper 链路。
+
+行为：
+
+- 内部构造所有 `common search` 候选
+- 对每个候选做速率恢复、内建尾咬 Viterbi（或外部覆盖）、`CRC-RNTI` 校验和 `DCI 1A` 解析
+- 只把 `matched == true` 的候选加入 `PdcchCommonSearchDecodeResult::hits`
+
+### `decode_pdcch_ue_specific_search_dci_format1a(...)`
+
+对整个 `BackendPdcchEqualizedIndication` 直接执行 UE-specific `DCI 1A` helper 链路。
+
+行为：
+
+- 使用 `PdcchUeSpecificSearchConfig::rntis` 和当前子帧构造 LTE `Y_k` 候选
+- 对每个候选完成 LLR 切片、速率恢复、内建或外部尾咬 decoder、CRC-RNTI 与 DCI 1A 解析
+- CRC-RNTI 不匹配是正常 miss，增加 `crc_rnti_miss_count` 并保持 `kOk`
+- CRC 通过但 DCI 1A 语义不合法时增加 `semantic_reject_count` 并保持 `kOk`
+- decoder 或内部结构错误会清空结果并传播对应 `MmseStatus`
+
+### `run_pdcch_cpu_ue_specific_search(...)`
+
+CPU 一站式 UE-specific `DCI 1A` 入口。它根据 `PdcchMmseInput::n_tx_ports` 自动选择
+`run_pdcch(...)` 或 `run_pdcch_td(...)`，对 2Tx 输出调用
+`normalize_pdcch_td_cce_order(...)`，随后执行 UE-specific helper 链路。
+
+约束：当前只支持 `20 MHz / FDD / normal CP / DCI 1A`，但接受 `1Tx` 或 `2Tx TD`。
+
+### `run_pdcch_cpu_si_rnti_geometry_search(...)`
+
+CPU 一站式 SI-RNTI 未知控制区几何入口。调用方传入当前频域网格、PCI、子帧、端口、
+发射模式、FDD 控制子帧上下文和 `PdcchSiRntiGeometrySearchCache`。
+
+行为：
+
+- 无有效 cache 时枚举 CFI `1/2/3`、PHICH `Ng={1/6,1/2,1,2}` 和有效 duration
+- normal duration 对全部 CFI 有效；extended duration 仅在 `CFI=3` 纳入枚举，因此总计 16 个几何
+- 每个几何通过现有 PCFICH/PHICH reservation helper 构造临时 PDCCH 输入，再执行 SI-RNTI `DCI 1A` 搜索
+- 唯一命中返回 `kAcquired` 并写 cache；缓存命中返回 `kLocked`
+- 缓存命中连续 4 次 miss 时只尝试缓存几何；第 5 次调用清锁并在同一次调用全量重探
+- 多个几何命中返回 `kAmbiguous`、清空可消费 hit 且不写 cache；无命中返回 `kMiss`
+- cache 在 PCI、端口数、发射模式或控制子帧类型改变时失效
+
 ### `decode_re_grid_index(grid_index)`
 
 把一个 LTE 网格索引解码为：
@@ -533,15 +738,18 @@ helper 打包得到的正式下游 owning DTO。
 - 仅 LTE
 - 仅 20 MHz
 - 仅 normal CP
-- `n_rx_ant == 2`
+- `n_rx_ant == 1 or 2`
 - `n_symbols == 14`
 - `n_subcarriers == 1200`
 - 仅 PDCCH
 - `control_symbol_count in [1, 3]`
 - 对 PDCCH 而言 `mod_order == 2`
 - `n_layers == 1`
-- `n_tx_ports == 1`
 - `tx_mode == 1 or 2`
+- `run_pdcch_cpu_common_search_decode(...)` 仅限 CPU
+- `run_pdcch_cpu_common_search_decode(...)`、`run_pdcch_cpu_si_rnti_search(...)` 与 `run_pdcch_cpu_ue_specific_search(...)` 接受 `1Tx` 或 `2Tx TD`
+- 正式 blind-decode helper 覆盖 common-search 与 UE-specific `DCI 1A`
+- `run_pdcch_cpu_si_rnti_geometry_search(...)` 仅支持 `20 MHz / FDD / normal CP`，并接受 `1Tx` 或 `2Tx TD`
 
 重要的不支持项：
 
@@ -549,6 +757,8 @@ helper 打包得到的正式下游 owning DTO。
 - `2 Tx port` 发射分集只通过新增的 `run_pdcch_td(...)` 支持
 - SDK 不负责解码 `PCFICH` 或 `PHICH`
 - 基于 helper 的自动 PHICH 保留只限于文档化的 FDD normal-CP 边界
+- 内建尾咬 Viterbi 仅覆盖 `rate-1/3`、constraint length `7` 的 LTE PDCCH 卷积码
+- 当前 helper 不覆盖非 `DCI 1A` 的其它 `DCI` 格式
 
 ## 6. 容量要求
 
@@ -560,6 +770,25 @@ helper 打包得到的正式下游 owning DTO。
 如果容量不足，调用会返回 `kBufferTooSmall`。
 
 如果暂时无法精确知道 `expected_n_re`，则应针对 LTE normal-CP 控制区场景做保守分配。
+
+调用 `run_pdcch_td(...)` 之前，调用方必须提供：
+
+- `capacity_symbols >= expected_n_soft_symbols`
+
+调用 `run_pdcch_cpu_common_search_decode(...)`、`run_pdcch_cpu_si_rnti_search(...)` 或
+`run_pdcch_cpu_ue_specific_search(...)` 时，equalized 中间缓冲区由 helper 内部分配。
+调用方只需提供：
+
+- 合法的 `PdcchMmseInput`
+- 可选的 `PdcchTailBitingConvolutionalDecoder` 覆盖器
+- 对应的搜索配置和结果对象
+
+调用 `run_pdcch_cpu_si_rnti_geometry_search(...)` 时，不需要先构造
+`PdcchMmseInput`、CFI 或保留 RE mask；调用方需要提供：
+
+- 合法的 `PdcchSiRntiGeometrySearchRequest`
+- 调用方持有并跨子帧复用的 `PdcchSiRntiGeometrySearchCache`
+- `PdcchSiRntiGeometrySearchResult`
 
 ## 7. 错误码
 
@@ -600,6 +829,8 @@ helper 打包得到的正式下游 owning DTO。
 - `n_tx_ports != 1`
 - `n_layers != 1`
 - backend 选择不受支持
+- UE-specific RNTI 列表为空、含重复项、含 `0` 或 `kSiRnti`
+- 把正式 CPU blind-decode 入口用在非 `DCI 1A`、非 FDD 或非 20 MHz 的文档化边界之外
 
 处理建议：
 
@@ -647,3 +878,23 @@ ctx.run_pdcch(in, out, meta);
 mmse::pdcch::BackendPdcchEqualizedIndication backend =
     mmse::pdcch::make_backend_pdcch_equalized_indication(meta, out);
 ```
+
+如果你要直接做 CPU `common search DCI 1A` 验收：
+
+```cpp
+#include "mmse/pdcch_chain_sdk.h"
+
+mmse::PdcchMmseInput in = mmse::pdcch::make_pdcch_mmse_input(grid, frontend);
+
+mmse::pdcch::PdcchCommonSearchDecodeConfig decode_cfg{};
+decode_cfg.expected_rnti = mmse::pdcch::kSiRnti;
+decode_cfg.decoder = {.context = decoder_ctx, .decode = external_tail_biting_decode};
+
+mmse::pdcch::PdcchCommonSearchDecodeResult result{};
+mmse::pdcch::run_pdcch_cpu_common_search_decode(ctx, in, decode_cfg, result);
+```
+
+固定 `SI-RNTI` 时，可改用 `PdcchSiRntiSearchConfig + run_pdcch_cpu_si_rnti_search(...)`。
+已知 UE RNTI 列表时，使用 `PdcchUeSpecificSearchConfig + run_pdcch_cpu_ue_specific_search(...)`；
+未知 CFI/PHICH 几何时，使用 `PdcchSiRntiGeometrySearchRequest +
+run_pdcch_cpu_si_rnti_geometry_search(...)`。

@@ -7,13 +7,15 @@
 - 基于 CRS 的信道估计
 - LTE 控制区内的 PDCCH RE 提取
 - MMSE 均衡
+- `REG / CCE` 恢复 helper
+- common-search 与 UE-specific 候选构造、速率恢复、`CRC-RNTI` 和 `DCI 1A` 解析 helper
+- 当前 `20 MHz / FDD` 边界内的 SI-RNTI 未知控制区几何搜索与缓存锁定
 
 该模块不负责：
 
 - PCFICH 译码
 - PHICH 译码
-- REG/CCE 重组
-- DCI 盲检索或信道译码
+- 非 `DCI 1A` 的通用 `DCI` 译码
 
 对于 `2 Tx port` 的 LTE PDCCH 发射分集场景，请使用新增 TD 调用面
 `run_pdcch_td(...)`，而不是下面展示的传统单 RE `run_pdcch(...)` 接口面。
@@ -178,7 +180,103 @@ for (std::size_t i = 0; i < td_backend.x_hat_re.size(); ++i) {
 - `run_pdcch_td(...)` 是新增的 `2 Tx port` 发射分集接口面，并通过
   `re_grid_indices0/re_grid_indices1` 提供 RE 对映射
 
-## 5. 可编译 demo
+## 5. 正式 CPU `DCI 1A` 验收入口
+
+可以直接走正式 CPU 入口；默认使用内建尾咬 Viterbi，也可提供回调覆盖：
+
+```cpp
+mmse::PdcchMmseInput in = mmse::pdcch::make_pdcch_mmse_input(fft_grid_view, frontend);
+
+mmse::MmseEqualizerCpuContext ctx;
+mmse::MmseEqualizerCpuConfig cfg{};
+cfg.worker_count = 1;
+ctx.init(cfg);
+
+mmse::pdcch::PdcchCommonSearchDecodeConfig decode_cfg{};
+decode_cfg.expected_rnti = mmse::pdcch::kSiRnti;
+decode_cfg.decoder = {.context = decoder_ctx, .decode = external_tail_biting_decode};
+
+mmse::pdcch::PdcchCommonSearchDecodeResult result{};
+const mmse::MmseStatus status =
+    mmse::pdcch::run_pdcch_cpu_common_search_decode(ctx, in, decode_cfg, result);
+if (status != mmse::MmseStatus::kOk) {
+    return;
+}
+
+for (const auto& hit : result.hits) {
+    downstream_consume_dci(hit.dci, hit.crc);
+}
+```
+
+如果目标固定为 `SI-RNTI`，也可以改用 `run_pdcch_cpu_si_rnti_search(...)`。
+
+这条入口当前会在仓库内顺序完成：
+
+1. `run_pdcch(...)` 或 `run_pdcch_td(...)`
+2. `REG / CCE` 恢复与 `common search` 候选构造
+3. `QPSK LLR + descrambling`
+4. 速率恢复
+5. 内建尾咬 Viterbi；外部回调可选覆盖
+6. `CRC-RNTI` 校验与 `DCI 1A` 解析
+
+对 `2 Tx port` 场景，这条入口会先把 `run_pdcch_td(...)` 的输出归一化为与 `1Tx` 一致的
+连续 CCE 顺序，再进入候选链路。
+
+## 6. UE-specific `DCI 1A` 入口
+
+当上游已知一个或多个目标 UE RNTI 时，使用 `run_pdcch_cpu_ue_specific_search(...)`。该入口
+复用上面的 `PdcchMmseInput`，按当前 `sfn_subframe` 的 LTE `Y_k` 递推枚举候选。
+
+```cpp
+mmse::pdcch::PdcchUeSpecificSearchConfig ue_cfg{};
+ue_cfg.rntis = {0x1234U, 0x2345U};
+ue_cfg.aggregation_level_mask = mmse::pdcch::kPdcchAggregationLevelMaskAll;
+ue_cfg.decoder = {.context = decoder_ctx, .decode = external_tail_biting_decode};
+
+mmse::pdcch::PdcchUeSpecificSearchResult ue_result{};
+const mmse::MmseStatus ue_status =
+    mmse::pdcch::run_pdcch_cpu_ue_specific_search(ctx, in, ue_cfg, ue_result);
+if (ue_status != mmse::MmseStatus::kOk) {
+    return;
+}
+
+for (const auto& hit : ue_result.hits) {
+    downstream_consume_dci(hit.decoded.dci, hit.decoded.crc);
+}
+```
+
+`rntis` 必须非空、唯一且不含 `0` 或 `kSiRnti`。该入口支持 `L=1/2/4/8`，并同时接受
+传统 1Tx 与 2Tx transmit-diversity 输入；非匹配 CRC 是正常 miss，不返回错误。
+
+## 7. SI-RNTI 未知控制区几何入口
+
+当调用方没有可信的 CFI、PHICH `Ng` 或 PHICH duration，但已有当前频域网格与小区上下文时，
+使用 `run_pdcch_cpu_si_rnti_geometry_search(...)`。该入口只支持当前 `20 MHz / FDD / normal CP`
+边界，内部枚举有效控制区几何，唯一命中后写入调用方持有的 cache。
+
+```cpp
+mmse::pdcch::PdcchSiRntiGeometrySearchRequest request{};
+request.grid = fft_grid_view;
+request.sfn_subframe = sfn_subframe;
+request.cell_id = cell_id;
+request.n_tx_ports = n_tx_ports;
+request.tx_mode = tx_mode;
+request.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                            .subframe = static_cast<std::uint8_t>(sfn_subframe % 10U),
+                            .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+mmse::pdcch::PdcchSiRntiGeometrySearchCache geometry_cache{};
+mmse::pdcch::PdcchSiRntiGeometrySearchResult geometry_result{};
+const mmse::MmseStatus geometry_status =
+    mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(ctx, request, {}, geometry_cache,
+                                                        geometry_result);
+```
+
+`kAcquired` 表示唯一几何已锁定，`kLocked` 表示缓存几何命中，`kMiss` 表示没有合法
+SI-RNTI 候选，`kAmbiguous` 表示多个几何命中且没有任何 hit 可被消费。缓存命中连续 5 次
+miss 后会在第 5 次调用全量重新枚举。
+
+## 8. 可编译 demo
 
 仓库还提供了一个小型可编译 demo：
 

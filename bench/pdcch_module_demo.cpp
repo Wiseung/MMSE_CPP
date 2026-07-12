@@ -18,7 +18,7 @@ struct GridBuffers {
 
 GridBuffers make_zero_grid() {
     GridBuffers buffers;
-    for (std::uint32_t rx = 0; rx < kLteNumRxAntV1; ++rx) {
+    for (std::uint32_t rx = 0; rx < kMmseV1MaxNumRxAntennas; ++rx) {
         buffers.re[rx].assign(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz, 0.0F);
         buffers.im[rx].assign(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz, 0.0F);
     }
@@ -29,7 +29,7 @@ PlanarGridViewF32 make_grid_view(const GridBuffers& buffers) {
     PlanarGridViewF32 grid{};
     grid.re = {buffers.re[0].data(), buffers.re[1].data()};
     grid.im = {buffers.im[0].data(), buffers.im[1].data()};
-    grid.n_rx_ant = kLteNumRxAntV1;
+    grid.n_rx_ant = kMmseV1MaxNumRxAntennas;
     grid.n_symbols = kLteNumSymbolsNormalCp;
     grid.n_subcarriers = kLteNumSubcarriers20MHz;
     return grid;

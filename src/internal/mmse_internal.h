@@ -56,7 +56,7 @@ struct Equalize2x2Trace {
     float gamma1 = 0.0F;
 };
 
-struct PdcchTdEqualizePair {
+struct TransmitDiversityEqualizePair {
     EqualizedSymbol symbol0{};
     EqualizedSymbol symbol1{};
 };
@@ -92,9 +92,11 @@ struct PreparedSubframeKey {
     std::array<const float*, 2> im{};
     std::uint32_t sfn_subframe = 0;
     std::uint16_t cell_id = 0;
+    std::uint8_t n_tx_ports = 0;
     std::uint8_t n_rx_ant = 0;
     std::uint32_t n_symbols = 0;
     std::uint32_t n_subcarriers = 0;
+    std::uint64_t generation = 0;
     std::uint32_t backend_mode = 0;
 };
 
@@ -192,7 +194,14 @@ Equalize2x2Trace trace_equalize_2x2_scalar(Complex32 h00, Complex32 h01, Complex
 
 EqualizedSymbol equalize_1x2_scalar(Complex32 h0, Complex32 h1, Complex32 y0, Complex32 y1,
                                     float sigma2, float g_min, float gamma_max);
-PdcchTdEqualizePair
+TransmitDiversityEqualizePair
+demap_transmit_diversity_mmse_scalar(Complex32 h00, Complex32 h01, Complex32 h10, Complex32 h11,
+                                     Complex32 h00_next, Complex32 h01_next, Complex32 h10_next,
+                                     Complex32 h11_next, Complex32 y0, Complex32 y1,
+                                     Complex32 y0_next, Complex32 y1_next, float sigma2,
+                                     float det_floor, float g_min, float gamma_max);
+
+TransmitDiversityEqualizePair
 demap_pdcch_transmit_diversity_scalar(Complex32 h00, Complex32 h01, Complex32 h10, Complex32 h11,
                                       Complex32 h00_next, Complex32 h01_next, Complex32 h10_next,
                                       Complex32 h11_next, Complex32 y0, Complex32 y1,

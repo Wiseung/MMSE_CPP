@@ -39,22 +39,10 @@ __device__ inline float cnorm2(CudaComplex32 a) {
 }
 
 __device__ inline float clampf(float value, float lo, float hi) {
+    if (!isfinite(value)) {
+        return lo;
+    }
     return value < lo ? lo : (value > hi ? hi : value);
-}
-
-__device__ inline bool is_pdcch_td_pair_start(const CudaGridMeta* grid_meta,
-                                              std::uint32_t re,
-                                              std::uint32_t grid_idx) {
-    if (grid_meta == nullptr || grid_meta->channel_type != 1U || grid_meta->n_layers != 1U ||
-        grid_meta->n_tx_ports != 2U) {
-        return false;
-    }
-    if ((re & 1U) != 0U || re + 1U >= grid_meta->n_valid_re) {
-        return false;
-    }
-    const std::uint32_t next_grid_idx = grid_meta->grid_indices[re + 1U];
-    return (grid_idx / grid_meta->n_subcarriers) == (next_grid_idx / grid_meta->n_subcarriers) &&
-           next_grid_idx == grid_idx + 1U;
 }
 
 __host__ __device__ inline std::uint32_t min_u32(std::uint32_t lhs, std::uint32_t rhs) {
@@ -76,6 +64,8 @@ __device__ inline CudaComplex32 load_grid_sample(const float* re_plane,
     if (im_plane != nullptr) {
         y_im = im_plane[grid_idx];
     }
+    y_re = isfinite(y_re) ? y_re : 0.0F;
+    y_im = isfinite(y_im) ? y_im : 0.0F;
     return {y_re, y_im};
 }
 
@@ -103,22 +93,29 @@ __device__ inline CudaComplex32 interpolate_freq(const float* re_plane,
                                                  std::uint32_t cs,
                                                  std::uint32_t sc) {
     const std::uint32_t first_offset = grid_meta->crs_freq_offsets[tx][cs];
+    const std::uint32_t last_sc =
+        6U * (kLteNumPilotTonesPerCrsSymbol - 1U) + first_offset;
+    const bool below_first = sc < first_offset;
+    const bool above_last = sc > last_sc;
     const std::uint32_t lower_pilot =
-        (sc < first_offset) ? 0U : (sc - first_offset) / 6U;
-    const std::uint32_t clamped_lower =
-        min_u32(lower_pilot, kLteNumPilotTonesPerCrsSymbol - 1U);
-    const std::uint32_t upper_pilot =
-        min_u32(clamped_lower + 1U, kLteNumPilotTonesPerCrsSymbol - 1U);
-    const std::uint32_t left_sc = 6U * clamped_lower + first_offset;
-    const std::uint32_t right_sc = 6U * upper_pilot + first_offset;
-    const CudaComplex32 left = ls_at(re_plane, im_plane, grid_meta, tx, rx, cs, clamped_lower);
-    const CudaComplex32 right = ls_at(re_plane, im_plane, grid_meta, tx, rx, cs, upper_pilot);
-    if (left_sc != right_sc && sc > left_sc && sc < right_sc) {
-        const float t =
-            static_cast<float>(sc - left_sc) / static_cast<float>(right_sc - left_sc);
-        return {left.re + (right.re - left.re) * t, left.im + (right.im - left.im) * t};
+        min_u32((sc < first_offset ? 0U : (sc - first_offset) / 6U),
+                kLteNumPilotTonesPerCrsSymbol - 1U);
+    const std::uint32_t left_pilot =
+        below_first ? 0U : (above_last ? kLteNumPilotTonesPerCrsSymbol - 2U : lower_pilot);
+    const std::uint32_t right_pilot =
+        below_first ? 1U : (above_last ? kLteNumPilotTonesPerCrsSymbol - 1U
+                                       : min_u32(lower_pilot + 1U,
+                                                 kLteNumPilotTonesPerCrsSymbol - 1U));
+    const std::uint32_t left_sc = 6U * left_pilot + first_offset;
+    const std::uint32_t right_sc = 6U * right_pilot + first_offset;
+    const CudaComplex32 left = ls_at(re_plane, im_plane, grid_meta, tx, rx, cs, left_pilot);
+    const CudaComplex32 right = ls_at(re_plane, im_plane, grid_meta, tx, rx, cs, right_pilot);
+    if (left_sc == right_sc) {
+        return left;
     }
-    return (sc >= right_sc) ? right : left;
+    const float t = static_cast<float>(static_cast<int>(sc) - static_cast<int>(left_sc)) /
+                    static_cast<float>(right_sc - left_sc);
+    return {left.re + (right.re - left.re) * t, left.im + (right.im - left.im) * t};
 }
 
 __device__ inline CudaComplex32 estimate_h_at(const float* re_plane,
@@ -134,8 +131,8 @@ __device__ inline CudaComplex32 estimate_h_at(const float* re_plane,
     }
     std::uint32_t lower = (upper == 0U) ? 0U : upper - 1U;
     if (upper >= kLteNumCrsSymbols) {
+        lower = kLteNumCrsSymbols - 2U;
         upper = kLteNumCrsSymbols - 1U;
-        lower = upper;
     }
     const std::uint32_t left_symbol = grid_meta->crs_symbols[lower];
     const std::uint32_t right_symbol = grid_meta->crs_symbols[upper];
@@ -212,8 +209,9 @@ __global__ void estimate_residual_kernel(const float* grid_re0,
         return;
     }
 
+    const std::uint32_t tx_count = min_u32(grid_meta->n_tx_ports, kMmseV1MaxNumCrsTxPorts);
     const std::uint32_t total_items =
-        kLteNumTxPortsV1 * min_u32(grid_meta->n_rx_ant, kLteNumRxAntV1) * kLteNumCrsSymbols *
+        tx_count * min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas) * kLteNumCrsSymbols *
         (kLteNumPilotTonesPerCrsSymbol - 2U);
 
     float local_sigma2 = 0.0F;
@@ -226,8 +224,8 @@ __global__ void estimate_residual_kernel(const float* grid_re0,
         index /= (kLteNumPilotTonesPerCrsSymbol - 2U);
         const std::uint32_t cs = index % kLteNumCrsSymbols;
         index /= kLteNumCrsSymbols;
-        const std::uint32_t rx = index % min_u32(grid_meta->n_rx_ant, kLteNumRxAntV1);
-        index /= min_u32(grid_meta->n_rx_ant, kLteNumRxAntV1);
+        const std::uint32_t rx = index % min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas);
+        index /= min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas);
         const std::uint32_t tx = index;
 
         const float* re_plane = (rx == 0U) ? grid_re0 : grid_re1;
@@ -239,7 +237,7 @@ __global__ void estimate_residual_kernel(const float* grid_re0,
         const float smooth_im = 0.5F * (prev.im + next.im);
         const float diff_re = curr.re - smooth_re;
         const float diff_im = curr.im - smooth_im;
-        local_sigma2 += diff_re * diff_re + diff_im * diff_im;
+        local_sigma2 += (2.0F / 3.0F) * (diff_re * diff_re + diff_im * diff_im);
         local_count += 1U;
     }
 
@@ -257,8 +255,8 @@ __global__ void estimate_channel_kernel(const float* grid_re0,
         return;
     }
 
-    const std::uint32_t tx_count = kLteNumTxPortsV1;
-    const std::uint32_t rx_count = min_u32(grid_meta->n_rx_ant, kLteNumRxAntV1);
+    const std::uint32_t tx_count = min_u32(grid_meta->n_tx_ports, kMmseV1MaxNumCrsTxPorts);
+    const std::uint32_t rx_count = min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas);
     const std::uint32_t total_h = tx_count * rx_count * kLteNumSymbolsNormalCp *
                                   grid_meta->n_subcarriers;
     const std::uint32_t stride = blockDim.x * gridDim.x;
@@ -277,7 +275,7 @@ __global__ void estimate_channel_kernel(const float* grid_re0,
         const float* im_plane = (rx == 0U) ? grid_im0 : grid_im1;
         const CudaComplex32 h = estimate_h_at(re_plane, im_plane, grid_meta, tx, rx, symbol, sc);
         const std::uint32_t base =
-            2U * (((tx * kLteNumRxAntV1 + rx) * kLteNumSymbolsNormalCp + symbol) *
+            2U * (((tx * kMmseV1MaxNumRxAntennas + rx) * kLteNumSymbolsNormalCp + symbol) *
                       kLteNumSubcarriers20MHz +
                   sc);
         h_estimate[base] = h.re;
@@ -295,8 +293,11 @@ __global__ void finalize_sigma2_kernel(const CudaGridMeta* grid_meta,
     }
 
     const std::uint32_t residual_count = *residual_count_in;
-    float sigma2 =
-        residual_count == 0U ? 0.0F : *sigma2_accum_in / static_cast<float>(residual_count);
+    float sigma2 = residual_count == 0U ? grid_meta->sigma2
+                                         : *sigma2_accum_in / static_cast<float>(residual_count);
+    if (!isfinite(sigma2) || sigma2 < 0.0F) {
+        sigma2 = grid_meta->sigma2;
+    }
     sigma2 = sigma2 < grid_meta->sigma2 ? grid_meta->sigma2 : sigma2;
     if (grid_meta->sigma2_device_owned == 0U) {
         *sigma2_state = sigma2;
@@ -357,114 +358,130 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
         const float det_floor = grid_meta->det_floor;
         const float g_min = grid_meta->g_min;
         const float gamma_max = grid_meta->gamma_max;
-        const std::uint32_t grid_idx = grid_meta->grid_indices[re];
+        const bool td_mode = grid_meta->td_pair_count != 0U;
+        const std::uint32_t grid_idx =
+            td_mode && re < grid_meta->td_pair_count ? grid_meta->td_pair_grid_indices0[re]
+                                                     : grid_meta->grid_indices[re];
         const std::uint32_t out_slot = grid_meta->output_slot_by_grid_re[grid_idx];
         const std::uint32_t symbol = grid_idx / grid_meta->n_subcarriers;
         const std::uint32_t sc = grid_idx % grid_meta->n_subcarriers;
-        const bool td_pdcch_mode =
-            grid_meta->channel_type == 1U && grid_meta->n_layers == 1U &&
-            grid_meta->n_tx_ports == 2U;
+        const bool has_rx1 = grid_meta->n_rx_ant > 1U;
 
         const float y0_re = grid_re0[grid_idx];
         const float y0_im = grid_im0[grid_idx];
-        const float y1_re = grid_re1[grid_idx];
-        const float y1_im = grid_im1[grid_idx];
+        const float y1_re = has_rx1 ? grid_re1[grid_idx] : 0.0F;
+        const float y1_im = has_rx1 ? grid_im1[grid_idx] : 0.0F;
 
         const std::uint32_t h00_base =
-            2U * (((0U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + symbol) *
+            2U * (((0U * kMmseV1MaxNumRxAntennas + 0U) * kLteNumSymbolsNormalCp + symbol) *
                       kLteNumSubcarriers20MHz +
                   sc);
         const std::uint32_t h01_base =
-            2U * (((1U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + symbol) *
+            2U * (((1U * kMmseV1MaxNumRxAntennas + 0U) * kLteNumSymbolsNormalCp + symbol) *
                       kLteNumSubcarriers20MHz +
                   sc);
         const std::uint32_t h10_base =
-            2U * (((0U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + symbol) *
+            2U * (((0U * kMmseV1MaxNumRxAntennas + 1U) * kLteNumSymbolsNormalCp + symbol) *
                       kLteNumSubcarriers20MHz +
                   sc);
         const std::uint32_t h11_base =
-            2U * (((1U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + symbol) *
+            2U * (((1U * kMmseV1MaxNumRxAntennas + 1U) * kLteNumSymbolsNormalCp + symbol) *
                       kLteNumSubcarriers20MHz +
                   sc);
 
         const float h00_re = h_estimate[h00_base];
         const float h00_im = h_estimate[h00_base + 1U];
-        const float h10_re = h_estimate[h10_base];
-        const float h10_im = h_estimate[h10_base + 1U];
+        const float h10_re = has_rx1 ? h_estimate[h10_base] : 0.0F;
+        const float h10_im = has_rx1 ? h_estimate[h10_base + 1U] : 0.0F;
 
-        if (td_pdcch_mode && is_pdcch_td_pair_start(grid_meta, re, grid_idx)) {
-            const std::uint32_t next_grid_idx = grid_meta->grid_indices[re + 1U];
+        if (td_mode && re < grid_meta->td_pair_count) {
+            const std::uint32_t next_grid_idx = grid_meta->td_pair_grid_indices1[re];
             const std::uint32_t next_symbol = next_grid_idx / grid_meta->n_subcarriers;
             const std::uint32_t next_sc = next_grid_idx % grid_meta->n_subcarriers;
             const float y0n_re = grid_re0[next_grid_idx];
             const float y0n_im = grid_im0[next_grid_idx];
-            const float y1n_re = grid_re1[next_grid_idx];
-            const float y1n_im = grid_im1[next_grid_idx];
+            const float y1n_re = has_rx1 ? grid_re1[next_grid_idx] : 0.0F;
+            const float y1n_im = has_rx1 ? grid_im1[next_grid_idx] : 0.0F;
 
             const std::uint32_t h00n_base =
-                2U * (((0U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + next_symbol) *
+                2U * (((0U * kMmseV1MaxNumRxAntennas + 0U) * kLteNumSymbolsNormalCp + next_symbol) *
                           kLteNumSubcarriers20MHz +
                       next_sc);
             const std::uint32_t h01n_base =
-                2U * (((1U * kLteNumRxAntV1 + 0U) * kLteNumSymbolsNormalCp + next_symbol) *
+                2U * (((1U * kMmseV1MaxNumRxAntennas + 0U) * kLteNumSymbolsNormalCp + next_symbol) *
                           kLteNumSubcarriers20MHz +
                       next_sc);
             const std::uint32_t h10n_base =
-                2U * (((0U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + next_symbol) *
+                2U * (((0U * kMmseV1MaxNumRxAntennas + 1U) * kLteNumSymbolsNormalCp + next_symbol) *
                           kLteNumSubcarriers20MHz +
                       next_sc);
             const std::uint32_t h11n_base =
-                2U * (((1U * kLteNumRxAntV1 + 1U) * kLteNumSymbolsNormalCp + next_symbol) *
+                2U * (((1U * kMmseV1MaxNumRxAntennas + 1U) * kLteNumSymbolsNormalCp + next_symbol) *
                           kLteNumSubcarriers20MHz +
                       next_sc);
 
             const CudaComplex32 h00{h00_re, h00_im};
             const CudaComplex32 h01{h_estimate[h01_base], h_estimate[h01_base + 1U]};
             const CudaComplex32 h10{h10_re, h10_im};
-            const CudaComplex32 h11{h_estimate[h11_base], h_estimate[h11_base + 1U]};
+            const CudaComplex32 h11{
+                has_rx1 ? h_estimate[h11_base] : 0.0F,
+                has_rx1 ? h_estimate[h11_base + 1U] : 0.0F};
             const CudaComplex32 h00n{h_estimate[h00n_base], h_estimate[h00n_base + 1U]};
             const CudaComplex32 h01n{h_estimate[h01n_base], h_estimate[h01n_base + 1U]};
-            const CudaComplex32 h10n{h_estimate[h10n_base], h_estimate[h10n_base + 1U]};
-            const CudaComplex32 h11n{h_estimate[h11n_base], h_estimate[h11n_base + 1U]};
+            const CudaComplex32 h10n{
+                has_rx1 ? h_estimate[h10n_base] : 0.0F,
+                has_rx1 ? h_estimate[h10n_base + 1U] : 0.0F};
+            const CudaComplex32 h11n{
+                has_rx1 ? h_estimate[h11n_base] : 0.0F,
+                has_rx1 ? h_estimate[h11n_base + 1U] : 0.0F};
             const CudaComplex32 y0{y0_re, y0_im};
             const CudaComplex32 y1{y1_re, y1_im};
             const CudaComplex32 y0n{y0n_re, y0n_im};
             const CudaComplex32 y1n{y1n_re, y1n_im};
 
-            const CudaComplex32 z0_rx0 =
-                cadd(cmul(cconj(h00), y0), cscale(cmul(h01n, cconj(y0n)), -1.0F));
-            const CudaComplex32 z0_rx1 =
-                cadd(cmul(cconj(h10), y1), cscale(cmul(h11n, cconj(y1n)), -1.0F));
-            const CudaComplex32 z0 = cadd(z0_rx0, z0_rx1);
+            const CudaComplex32 a00[] = {h00, h10, cscale(cconj(h01n), -1.0F),
+                                         cscale(cconj(h11n), -1.0F)};
+            const CudaComplex32 a01[] = {h01, h11, cconj(h00n), cconj(h10n)};
+            const CudaComplex32 observations[] = {y0, y1, cconj(y0n), cconj(y1n)};
+            float gram00 = sigma2 > 0.0F ? sigma2 : 0.0F;
+            float gram11 = gram00;
+            CudaComplex32 gram01{};
+            CudaComplex32 z0{};
+            CudaComplex32 z1{};
+            for (std::uint32_t row = 0U; row < 4U; ++row) {
+                gram00 += cnorm2(a00[row]);
+                gram11 += cnorm2(a01[row]);
+                gram01 = cadd(gram01, cmul(cconj(a00[row]), a01[row]));
+                z0 = cadd(z0, cmul(cconj(a00[row]), observations[row]));
+                z1 = cadd(z1, cmul(cconj(a01[row]), observations[row]));
+            }
+            float det = gram00 * gram11 - cnorm2(gram01);
+            det = det < det_floor ? det_floor : det;
+            const float inv_det = 1.0F / det;
+            const float inv00 = gram11 * inv_det;
+            const float inv11 = gram00 * inv_det;
+            const CudaComplex32 inv01 = cscale(gram01, -inv_det);
+            const CudaComplex32 inv10 = cconj(inv01);
+            const CudaComplex32 x0 = cadd(cscale(z0, inv00), cmul(inv01, z1));
+            const CudaComplex32 x1 = cadd(cmul(inv10, z0), cscale(z1, inv11));
+            const float regularization = sigma2 > 0.0F ? sigma2 : 0.0F;
+            float g0 = 1.0F - regularization * inv00;
+            float g1 = 1.0F - regularization * inv11;
+            g0 = clampf(g0, g_min, 1.0F - g_min);
+            g1 = clampf(g1, g_min, 1.0F - g_min);
 
-            const CudaComplex32 z1_rx0 =
-                cadd(cmul(cconj(h01), y0), cmul(h00n, cconj(y0n)));
-            const CudaComplex32 z1_rx1 =
-                cadd(cmul(cconj(h11), y1), cmul(h10n, cconj(y1n)));
-            const CudaComplex32 z1 = cadd(z1_rx0, z1_rx1);
-
-            const float energy0 =
-                cnorm2(h00) + cnorm2(h01n) + cnorm2(h10) + cnorm2(h11n);
-            const float energy1 =
-                cnorm2(h01) + cnorm2(h00n) + cnorm2(h11) + cnorm2(h10n);
-            const float denom0 = energy0 + sigma2 < det_floor ? det_floor : energy0 + sigma2;
-            const float denom1 = energy1 + sigma2 < det_floor ? det_floor : energy1 + sigma2;
-            float g0 = clampf(energy0 / denom0, g_min, 1.0F - g_min);
-            float g1 = clampf(energy1 / denom1, g_min, 1.0F - g_min);
-
-            const std::uint32_t out0 = re;
-            const std::uint32_t out1 = re + 1U;
-            xhat_re[out0] = (z0.re / denom0) / g0;
-            xhat_im[out0] = (z0.im / denom0) / g0;
-            xhat_re[out1] = (z1.re / denom1) / g1;
-            xhat_im[out1] = (z1.im / denom1) / g1;
+            const std::uint32_t out0 = re * 2U;
+            const std::uint32_t out1 = out0 + 1U;
+            xhat_re[out0] = x0.re / g0;
+            xhat_im[out0] = x0.im / g0;
+            xhat_re[out1] = x1.re / g1;
+            xhat_im[out1] = x1.im / g1;
             float gamma0 = g0 / (1.0F - g0);
             float gamma1 = g1 / (1.0F - g1);
             sinr[out0] = gamma0 > gamma_max ? gamma_max : gamma0;
             sinr[out1] = gamma1 > gamma_max ? gamma_max : gamma1;
-        } else if (td_pdcch_mode) {
-            // In TD PDCCH mode, even RE threads write both symbols for one RE pair.
-            // The odd RE partner must not fall back to the legacy single-RE equalizer path.
+        } else if (td_mode) {
+            // One CUDA thread processes a complete explicit TD pair.
         } else if (grid_meta->n_layers == 1U) {
             const float denom = h00_re * h00_re + h00_im * h00_im + h10_re * h10_re +
                                 h10_im * h10_im + sigma2;
@@ -488,7 +505,9 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
             const CudaComplex32 h00{h00_re, h00_im};
             const CudaComplex32 h01{h_estimate[h01_base], h_estimate[h01_base + 1U]};
             const CudaComplex32 h10{h10_re, h10_im};
-            const CudaComplex32 h11{h_estimate[h11_base], h_estimate[h11_base + 1U]};
+            const CudaComplex32 h11{
+                has_rx1 ? h_estimate[h11_base] : 0.0F,
+                has_rx1 ? h_estimate[h11_base + 1U] : 0.0F};
             const CudaComplex32 y0{y0_re, y0_im};
             const CudaComplex32 y1{y1_re, y1_im};
 
@@ -835,6 +854,22 @@ MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffer
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
+    if (const cudaError_t status = cudaMemcpyAsync(
+            reinterpret_cast<std::byte*>(buffers.grid_meta) +
+                offsetof(CudaGridMeta, td_pair_grid_indices0),
+            grid_meta.td_pair_grid_indices0, sizeof(grid_meta.td_pair_grid_indices0),
+            cudaMemcpyHostToDevice, stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    if (const cudaError_t status = cudaMemcpyAsync(
+            reinterpret_cast<std::byte*>(buffers.grid_meta) +
+                offsetof(CudaGridMeta, td_pair_grid_indices1),
+            grid_meta.td_pair_grid_indices1, sizeof(grid_meta.td_pair_grid_indices1),
+            cudaMemcpyHostToDevice, stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
     if (const cudaError_t status =
             cudaMemcpyAsync(reinterpret_cast<std::byte*>(buffers.grid_meta) +
                                 offsetof(CudaGridMeta, output_slot_by_grid_re),
@@ -916,7 +951,7 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
         }
     }
 
-    const std::uint32_t total_h = kLteNumTxPortsV1 * kLteNumRxAntV1 * kLteNumSymbolsNormalCp *
+    const std::uint32_t total_h = kMmseV1MaxNumCrsTxPorts * kMmseV1MaxNumRxAntennas * kLteNumSymbolsNormalCp *
                                   kLteNumSubcarriers20MHz;
     const std::uint32_t estimate_blocks =
         max(1U, ceil_div_u32(total_h, kEstimateThreadsPerBlock));

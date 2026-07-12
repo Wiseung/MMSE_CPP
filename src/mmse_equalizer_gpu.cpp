@@ -44,6 +44,19 @@ bool use_device_owned_sigma2(const MmseEqualizerGpuConfig& config) {
     return config.sigma2_ownership == MmseGpuSigma2Ownership::kDeviceOwnedState;
 }
 
+bool pack_transmit_diversity_pairs(const detail::ReLayout& layout,
+                                   detail::CudaGridMeta& grid_meta) {
+    if ((layout.n_re & 1U) != 0U || layout.n_re / 2U > detail::kCudaMaxDataRe / 2U) {
+        return false;
+    }
+    grid_meta.td_pair_count = layout.n_re / 2U;
+    for (std::uint32_t pair = 0; pair < grid_meta.td_pair_count; ++pair) {
+        grid_meta.td_pair_grid_indices0[pair] = layout.grid_indices[pair * 2U];
+        grid_meta.td_pair_grid_indices1[pair] = layout.grid_indices[pair * 2U + 1U];
+    }
+    return true;
+}
+
 } // namespace
 
 struct MmseEqualizerGpuContext::Impl {
@@ -143,6 +156,8 @@ struct MmseEqualizerGpuContext::Impl {
     MmseStatus execute_cuda_transport_stub(const ExtractDescriptor& desc, HostPinnedSlot& slot,
                                            bool reuse_estimate);
     MmseStatus stage_outputs(EqualizerOutputView& out) const;
+    MmseStatus run_transmit_diversity(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
+                                      EqualizerOutputView& out);
     static double elapsed_us(const Clock::time_point& start, const Clock::time_point& end);
 
     MmseEqualizerGpuConfig config{};
@@ -217,7 +232,7 @@ MmseEqualizerGpuContext::Impl::compare_equalize_trace_sample(const HostPinnedSlo
     const float y1_im = slot.transport_im[1][grid_idx];
     const auto h_at = [&](std::uint32_t tx, std::uint32_t rx) {
         const std::size_t base =
-            2U * (((tx * kLteNumRxAntV1 + rx) * kLteNumSymbolsNormalCp + symbol) *
+            2U * (((tx * kMmseV1MaxNumRxAntennas + rx) * kLteNumSymbolsNormalCp + symbol) *
                       kLteNumSubcarriers20MHz +
                   sc);
         return detail::Complex32{slot.h_estimate[base], slot.h_estimate[base + 1U]};
@@ -433,7 +448,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_storage(HostPinnedSlot
 
     slot.grid_view.re = {slot.transport_re[0], slot.transport_re[1]};
     slot.grid_view.im = {slot.transport_im[0], slot.transport_im[1]};
-    slot.grid_view.n_rx_ant = kLteNumRxAntV1;
+    slot.grid_view.n_rx_ant = kMmseV1MaxNumRxAntennas;
     slot.grid_view.n_symbols = kLteNumSymbolsNormalCp;
     slot.grid_view.n_subcarriers = kLteNumSubcarriers20MHz;
 
@@ -579,10 +594,16 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& 
 
     auto& slot = buffers.slots[buffers.next_stage_slot];
     const Clock::time_point transport_start = Clock::now();
-    for (std::uint32_t rx = 0; rx < kLteNumRxAntV1; ++rx) {
+    for (std::uint32_t rx = 0; rx < grid.n_rx_ant; ++rx) {
         std::copy_n(grid.re[rx], detail::kMaxGridRe, slot.transport_re[rx]);
         std::copy_n(grid.im[rx], detail::kMaxGridRe, slot.transport_im[rx]);
     }
+    for (std::uint32_t rx = grid.n_rx_ant; rx < kMmseV1MaxNumRxAntennas; ++rx) {
+        std::fill_n(slot.transport_re[rx], detail::kMaxGridRe, 0.0F);
+        std::fill_n(slot.transport_im[rx], detail::kMaxGridRe, 0.0F);
+    }
+    slot.grid_view.n_rx_ant = grid.n_rx_ant;
+    slot.grid_view.generation = grid.generation;
     last_host_profile.quantize_us = elapsed_us(transport_start, Clock::now());
     slot.layout = {};
     slot.grid_meta.n_rx_ant = grid.n_rx_ant;
@@ -597,6 +618,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& 
     slot.grid_meta.n_segments = 0;
     slot.grid_meta.spot_check_sample_count = 0;
     slot.grid_meta.trace_sample_count = 0;
+    slot.grid_meta.channel_type = 0U;
+    slot.grid_meta.td_pair_count = 0U;
     slot.grid_meta.sigma2_device_owned = 0U;
     slot.grid_meta.sigma2_iir_alpha = config.sigma2_iir_alpha;
     std::fill_n(slot.grid_meta.output_slot_by_grid_re, detail::kCudaMaxGridRe,
@@ -645,17 +668,18 @@ MmseStatus MmseEqualizerGpuContext::Impl::validate_estimate_stub(const ExtractDe
     detail::estimate_channel(slot.grid_view, desc, h_full, sigma2_estimate);
 
     constexpr std::array<std::uint32_t, 3> kCheckSymbols = {0U, 6U, 13U};
-    constexpr std::array<std::uint32_t, 3> kCheckSc = {0U, 127U, 1199U};
-    for (std::uint32_t tx = 0; tx < kLteNumTxPortsV1; ++tx) {
-        for (std::uint32_t rx = 0; rx < kLteNumRxAntV1; ++rx) {
+    constexpr std::array<std::uint32_t, 4> kCheckSc = {0U, 127U, 601U, 1199U};
+    for (std::uint32_t tx = 0; tx < desc.n_tx_ports; ++tx) {
+        for (std::uint32_t rx = 0; rx < desc.n_rx_ant; ++rx) {
             for (std::uint32_t symbol : kCheckSymbols) {
                 for (std::uint32_t sc : kCheckSc) {
                     const std::size_t base =
-                        2U * (((tx * kLteNumRxAntV1 + rx) * kLteNumSymbolsNormalCp + symbol) *
-                                  kLteNumSubcarriers20MHz +
-                              sc);
+                        2U *
+                        (((tx * kMmseV1MaxNumRxAntennas + rx) * kLteNumSymbolsNormalCp + symbol) *
+                             kLteNumSubcarriers20MHz +
+                         sc);
                     const detail::Complex32 ref =
-                        h_full[((static_cast<std::size_t>(tx) * kLteNumRxAntV1 + rx) *
+                        h_full[((static_cast<std::size_t>(tx) * kMmseV1MaxNumRxAntennas + rx) *
                                     kLteNumSymbolsNormalCp +
                                 symbol) *
                                    kLteNumSubcarriers20MHz +
@@ -763,6 +787,11 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     slot.grid_meta.n_layers = desc.n_layers;
     slot.grid_meta.n_tx_ports = desc.n_tx_ports;
     slot.grid_meta.channel_type = static_cast<std::uint32_t>(desc.channel_type);
+    slot.grid_meta.td_pair_count = 0U;
+    if (desc.n_tx_ports == 2U && desc.n_layers == 1U && desc.tx_mode == 2U &&
+        !pack_transmit_diversity_pairs(slot.layout, slot.grid_meta)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
     slot.grid_meta.n_segments = slot.layout.n_segments;
     slot.grid_meta.sigma2_device_owned = use_device_owned_sigma2(config) ? 1U : 0U;
     slot.grid_meta.sigma2 = config.sigma2_min;
@@ -780,7 +809,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         slot.grid_meta.spot_check_re_slots[i] = static_cast<std::uint16_t>(validation_re_slots[i]);
     }
 
-    if (deep_validation_enabled()) {
+    if (deep_validation_enabled() && slot.grid_meta.td_pair_count == 0U) {
         const MmseStatus cpu_status = cpu_fallback.run(slot.grid_view, desc, slot.out_view);
         if (cpu_status != MmseStatus::kOk) {
             return cpu_status;
@@ -808,7 +837,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     std::copy_n(desc.prb_bitmap.begin(), desc.prb_bitmap.size(), slot.grid_meta.prb_bitmap);
     std::copy_n(detail::kCrsSymbols.begin(), detail::kCrsSymbols.size(),
                 slot.grid_meta.crs_symbols);
-    for (std::uint32_t tx = 0; tx < kLteNumTxPortsV1; ++tx) {
+    for (std::uint32_t tx = 0; tx < kMmseV1MaxNumCrsTxPorts; ++tx) {
         for (std::uint32_t cs = 0; cs < kLteNumCrsSymbols; ++cs) {
             const std::uint8_t symbol = detail::kCrsSymbols[cs];
             slot.grid_meta.crs_freq_offsets[tx][cs] = static_cast<std::uint8_t>(
@@ -996,11 +1025,13 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     }
 
     if (deep_validation_enabled()) {
-        if (desc.n_layers == 2U) {
+        if (desc.n_layers == 2U || slot.grid_meta.td_pair_count != 0U) {
             if (const MmseStatus status = validate_estimate_stub(desc, slot);
                 status != MmseStatus::kOk) {
                 return status;
             }
+        }
+        if (desc.n_layers == 2U) {
             if (const MmseStatus status = validate_equalize_stub(slot); status != MmseStatus::kOk) {
                 return status;
             }
@@ -1012,6 +1043,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     }
     if (deep_validation_enabled()) {
         if (!(slot.scratch_host[3] >= config.sigma2_min)) {
+            return MmseStatus::kInternalError;
+        }
+        if (!nearly_equal(slot.scratch_host[3], slot.grid_meta.sigma2, 5.0e-2F, 1.0e-6F)) {
             return MmseStatus::kInternalError;
         }
         slot.completion_ready = (slot.completion_value == completion_value);
@@ -1101,6 +1135,25 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_outputs(EqualizerOutputView& out
     return MmseStatus::kOk;
 }
 
+MmseStatus MmseEqualizerGpuContext::Impl::run_transmit_diversity(const PlanarGridViewF32& grid,
+                                                                 const ExtractDescriptor& desc,
+                                                                 EqualizerOutputView& out) {
+    if (const MmseStatus status = detail::validate_grid(grid); status != MmseStatus::kOk) {
+        return status;
+    }
+    if (const MmseStatus status = detail::validate_output(out); status != MmseStatus::kOk) {
+        return status;
+    }
+    if (const MmseStatus status = prepare_subframe_if_needed(grid, desc);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    if (const MmseStatus status = execute_backend(desc); status != MmseStatus::kOk) {
+        return status;
+    }
+    return stage_outputs(out);
+}
+
 MmseStatus MmseEqualizerGpuContext::init(const MmseEqualizerGpuConfig& config) {
     if (const MmseStatus status = Impl::validate_config(config); status != MmseStatus::kOk) {
         return status;
@@ -1147,6 +1200,9 @@ MmseStatus MmseEqualizerGpuContext::run(const PlanarGridViewF32& grid,
     }
     if (const MmseStatus status = detail::validate_output(out); status != MmseStatus::kOk) {
         return status;
+    }
+    if (!detail::descriptor_supported(desc)) {
+        return MmseStatus::kUnsupportedConfig;
     }
     if (const MmseStatus status = impl_->prepare_subframe_if_needed(grid, desc);
         status != MmseStatus::kOk) {
@@ -1224,6 +1280,75 @@ MmseStatus MmseEqualizerGpuContext::run_pbch(const PbchMmseInput& in, PbchMmseOu
     return MmseStatus::kOk;
 }
 
+MmseStatus MmseEqualizerGpuContext::run_pbch_td(const PbchMmseInput& in, PbchTdMmseOutputView& out,
+                                                PbchTdMmseResult& meta) {
+    if (!impl_->initialized) {
+        return MmseStatus::kNotInitialized;
+    }
+    if (const MmseStatus status = mmse::pbch::validate_pbch_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    if (in.n_tx_ports != 2U || in.tx_mode != 2U) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (impl_->config.backend == MmseGpuBackend::kAuto) {
+        return impl_->cpu_fallback.run_pbch_td(in, out, meta);
+    }
+
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = 2U;
+    desc.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    desc.n_layers = 1U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPbch;
+    desc.start_symbol = kLtePbchStartSymbolNormalCp;
+    desc.mod_order = 2U;
+    desc.n_prb = kLtePbchNumPrb;
+    for (std::uint32_t prb = kLtePbchStartPrb; prb < kLtePbchStartPrb + kLtePbchNumPrb; ++prb) {
+        desc.prb_bitmap[prb / 16U] |= static_cast<std::uint16_t>(1U << (prb % 16U));
+    }
+    EqualizerOutputView base_out{out.x_hat_re, out.x_hat_im, out.sinr, out.capacity_symbols};
+    if (out.re_grid_indices0 == nullptr || out.re_grid_indices1 == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+    if (const MmseStatus status = impl_->run_transmit_diversity(in.grid, desc, base_out);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    const auto& slot = impl_->buffers.slots[impl_->buffers.completed_slot];
+    if (slot.grid_meta.td_pair_count * 2U != base_out.n_re_per_layer) {
+        return MmseStatus::kInternalError;
+    }
+    for (std::uint32_t pair = 0U; pair < slot.grid_meta.td_pair_count; ++pair) {
+        const std::uint32_t index = pair * 2U;
+        const std::uint16_t grid0 = slot.grid_meta.td_pair_grid_indices0[pair];
+        const std::uint16_t grid1 = slot.grid_meta.td_pair_grid_indices1[pair];
+        out.re_grid_indices0[index] = out.re_grid_indices0[index + 1U] = grid0;
+        out.re_grid_indices1[index] = out.re_grid_indices1[index + 1U] = grid1;
+    }
+    meta = {};
+    meta.n_symbols = base_out.n_re_per_layer;
+    meta.n_source_re = base_out.n_re_per_layer;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.grid_symbol_count = in.grid.n_symbols;
+    meta.grid_subcarrier_count = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.start_prb = kLtePbchStartPrb;
+    meta.n_prb = kLtePbchNumPrb;
+    meta.start_symbol = kLtePbchStartSymbolNormalCp;
+    meta.n_tx_ports = 2U;
+    meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    meta.n_layers = 1U;
+    meta.tx_mode = 2U;
+    meta.mod_order = 2U;
+    meta.sigma2 = slot.grid_meta.sigma2;
+    meta.chain = in.chain;
+    return MmseStatus::kOk;
+}
+
 MmseStatus MmseEqualizerGpuContext::run_pcfich(const PcfichMmseInput& in, PcfichMmseOutputView& out,
                                                PcfichMmseResult& meta) {
     if (const MmseStatus status = mmse::pcfich::validate_pcfich_mmse_input(in);
@@ -1280,6 +1405,75 @@ MmseStatus MmseEqualizerGpuContext::run_pcfich(const PcfichMmseInput& in, Pcfich
     meta.n_layers = base_out.n_layers;
     meta.tx_mode = in.tx_mode;
     meta.mod_order = base_out.mod_order;
+    meta.sigma2 = slot.grid_meta.sigma2;
+    meta.chain = in.chain;
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerGpuContext::run_pcfich_td(const PcfichMmseInput& in,
+                                                  PcfichTdMmseOutputView& out,
+                                                  PcfichTdMmseResult& meta) {
+    if (!impl_->initialized) {
+        return MmseStatus::kNotInitialized;
+    }
+    if (const MmseStatus status = mmse::pcfich::validate_pcfich_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    if (in.n_tx_ports != 2U || in.tx_mode != 2U) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (impl_->config.backend == MmseGpuBackend::kAuto) {
+        return impl_->cpu_fallback.run_pcfich_td(in, out, meta);
+    }
+
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = 2U;
+    desc.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    desc.n_layers = 1U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPcfich;
+    desc.control_symbol_count = 1U;
+    desc.mod_order = 2U;
+    desc.n_prb = kLteNumPrb20MHz;
+    desc.prb_bitmap.fill(0xFFFFU);
+    desc.prb_bitmap.back() = 0x000FU;
+    EqualizerOutputView base_out{out.x_hat_re, out.x_hat_im, out.sinr, out.capacity_symbols};
+    if (out.re_grid_indices0 == nullptr || out.re_grid_indices1 == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+    if (const MmseStatus status = impl_->run_transmit_diversity(in.grid, desc, base_out);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    const auto& slot = impl_->buffers.slots[impl_->buffers.completed_slot];
+    if (slot.grid_meta.td_pair_count * 2U != base_out.n_re_per_layer) {
+        return MmseStatus::kInternalError;
+    }
+    for (std::uint32_t pair = 0U; pair < slot.grid_meta.td_pair_count; ++pair) {
+        const std::uint32_t index = pair * 2U;
+        const std::uint16_t grid0 = slot.grid_meta.td_pair_grid_indices0[pair];
+        const std::uint16_t grid1 = slot.grid_meta.td_pair_grid_indices1[pair];
+        out.re_grid_indices0[index] = out.re_grid_indices0[index + 1U] = grid0;
+        out.re_grid_indices1[index] = out.re_grid_indices1[index + 1U] = grid1;
+    }
+    meta = {};
+    meta.n_symbols = base_out.n_re_per_layer;
+    meta.n_source_re = base_out.n_re_per_layer;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.grid_symbol_count = in.grid.n_symbols;
+    meta.grid_subcarrier_count = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.n_prb = kLteNumPrb20MHz;
+    meta.start_symbol = 0U;
+    meta.reg_count = static_cast<std::uint8_t>(kLtePcfichNumRegs);
+    meta.n_tx_ports = 2U;
+    meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
+    meta.n_layers = 1U;
+    meta.tx_mode = 2U;
+    meta.mod_order = 2U;
     meta.sigma2 = slot.grid_meta.sigma2;
     meta.chain = in.chain;
     return MmseStatus::kOk;
@@ -1391,23 +1585,29 @@ MmseStatus MmseEqualizerGpuContext::run_pdcch_td(const PdcchMmseInput& in,
     base_out.sinr = out.sinr;
     base_out.capacity_re_per_layer = out.capacity_symbols;
 
-    const MmseStatus status = run(in.grid, desc, base_out);
+    if (out.re_grid_indices0 == nullptr || out.re_grid_indices1 == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+    const MmseStatus status = impl_->run_transmit_diversity(in.grid, desc, base_out);
     if (status != MmseStatus::kOk) {
         return status;
     }
-    if (out.re_grid_indices0 == nullptr || out.re_grid_indices1 == nullptr ||
-        out.capacity_symbols < base_out.n_re_per_layer) {
+    if (out.capacity_symbols < base_out.n_re_per_layer) {
         return MmseStatus::kBufferTooSmall;
     }
 
     const auto& slot = impl_->buffers.slots[impl_->buffers.completed_slot];
-    for (std::uint32_t i = 0; i < base_out.n_re_per_layer; i += 2U) {
-        const std::uint16_t grid0 = slot.layout.grid_indices[i];
-        const std::uint16_t grid1 = slot.layout.grid_indices[i + 1U];
-        out.re_grid_indices0[i] = grid0;
-        out.re_grid_indices1[i] = grid1;
-        out.re_grid_indices0[i + 1U] = grid0;
-        out.re_grid_indices1[i + 1U] = grid1;
+    if (slot.grid_meta.td_pair_count * 2U != base_out.n_re_per_layer) {
+        return MmseStatus::kInternalError;
+    }
+    for (std::uint32_t pair = 0U; pair < slot.grid_meta.td_pair_count; ++pair) {
+        const std::uint32_t index = pair * 2U;
+        const std::uint16_t grid0 = slot.grid_meta.td_pair_grid_indices0[pair];
+        const std::uint16_t grid1 = slot.grid_meta.td_pair_grid_indices1[pair];
+        out.re_grid_indices0[index] = grid0;
+        out.re_grid_indices1[index] = grid1;
+        out.re_grid_indices0[index + 1U] = grid0;
+        out.re_grid_indices1[index + 1U] = grid1;
     }
 
     meta = {};

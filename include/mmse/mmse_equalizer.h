@@ -17,8 +17,12 @@ class MmseEqualizerCpuContext {
     MmseStatus run(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                    EqualizerOutputView& out);
     MmseStatus run_pbch(const PbchMmseInput& in, PbchMmseOutputView& out, PbchMmseResult& meta);
+    MmseStatus run_pbch_td(const PbchMmseInput& in, PbchTdMmseOutputView& out,
+                           PbchTdMmseResult& meta);
     MmseStatus run_pcfich(const PcfichMmseInput& in, PcfichMmseOutputView& out,
                           PcfichMmseResult& meta);
+    MmseStatus run_pcfich_td(const PcfichMmseInput& in, PcfichTdMmseOutputView& out,
+                             PcfichTdMmseResult& meta);
     MmseStatus run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out, PdcchMmseResult& meta);
     MmseStatus run_pdcch_td(const PdcchMmseInput& in, PdcchTdMmseOutputView& out,
                             PdcchTdMmseResult& meta);
@@ -40,8 +44,12 @@ class MmseEqualizerGpuContext {
     MmseStatus run(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                    EqualizerOutputView& out);
     MmseStatus run_pbch(const PbchMmseInput& in, PbchMmseOutputView& out, PbchMmseResult& meta);
+    MmseStatus run_pbch_td(const PbchMmseInput& in, PbchTdMmseOutputView& out,
+                           PbchTdMmseResult& meta);
     MmseStatus run_pcfich(const PcfichMmseInput& in, PcfichMmseOutputView& out,
                           PcfichMmseResult& meta);
+    MmseStatus run_pcfich_td(const PcfichMmseInput& in, PcfichTdMmseOutputView& out,
+                             PcfichTdMmseResult& meta);
     MmseStatus run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out, PdcchMmseResult& meta);
     MmseStatus run_pdcch_td(const PdcchMmseInput& in, PdcchTdMmseOutputView& out,
                             PdcchTdMmseResult& meta);

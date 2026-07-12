@@ -40,14 +40,19 @@ SDK 当前覆盖：
 - MMSE 均衡
 - 按 RE 输出软符号和 SINR
 - 通过新增的 `run_pdcch_td(...)` 接口支持 2Tx 发射分集去映射
+- `REG / CCE` 恢复 helper
+- `common search` 候选构造与候选 LLR 切片 helper
+- UE-specific 候选构造，按目标 RNTI 和子帧枚举 `L=1/2/4/8`
+- 候选级速率恢复、`CRC-RNTI` 校验和 `DCI 1A` 解析 helper
+- 默认内建尾咬卷积码译码的正式 CPU common-search 与 UE-specific `DCI 1A` 链路，可由外部回调覆盖
+- 当前 20 MHz/FDD 边界内的 SI-RNTI 未知控制区几何搜索与调用方持有的锁定缓存
 
 SDK 当前不覆盖：
 
 - PCFICH 译码
 - PHICH 译码
-- REG/CCE 重组
-- 盲检索
-- 信道译码
+- 非 `DCI 1A` 的通用 `DCI` 译码
+- GPU 版完整 PDCCH 解码阶段
 
 ## 页面摘要
 
@@ -57,6 +62,7 @@ SDK 当前不覆盖：
 
 - 最小 `include` 路径
 - 最小 DTO 流程
+- 正式 CPU common-search、SI-RNTI、UE-specific 和未知 SI-RNTI 几何 `DCI 1A` 链路入口
 - 紧凑集成步骤
 - 已验证的 demo 构建路径
 

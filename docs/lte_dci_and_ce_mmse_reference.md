@@ -17,25 +17,33 @@
 - 基于 `CRS` 的信道估计
 - `MMSE` 均衡
 - 输出 equalized 软符号与 `SINR`
+- `PDCCH` 的 `REG / CCE` 恢复 helper
+- `PDCCH common search` 与 UE-specific 候选构造、候选 LLR 切片与速率恢复 helper
+- `PDCCH` 的 `CRC-RNTI` 校验与 `DCI 1A` 解析 helper
+- 默认内建尾咬卷积码译码的正式 CPU common-search 与 UE-specific `DCI 1A` 链路，可由外部回调覆盖
+- 当前 `20 MHz / FDD` 范围内的 SI-RNTI 未知控制区几何搜索与调用方持有的缓存锁定
 
 当前仓库不负责：
 
-- `PDCCH` 盲检索
-- `DCI` 卷积译码
-- `CRC-RNTI` 校验后的 `DCI` 解析 / 翻译
+- 非 `DCI 1A` 的通用 `DCI` 解析 / 翻译
+- GPU 版完整 PDCCH 解码阶段
 
-因此，`DCI` 相关内容在本文中表示的是**下游译码阶段的推荐解释口径**，不是本仓库里已经存在的一份现成 `C++` 结构体。
+因此，`DCI` 相关内容在本文中既包括**下游译码阶段的推荐解释口径**，也包括当前仓库里已经存在的
+common-search、UE-specific 与 `DCI 1A` helper / CPU 链路边界；但它仍不等于仓库已经具备一套通用 LTE 控制信道接收机。
 
 ## 1. `DCI` 输出在整体链路中的位置
 
-对 `PDCCH` 而言，当前仓库给下游交付的是 `equalized RE` 或 `descrambled LLR`，而不是最终 `DCI`。
+对 `PDCCH` 而言，基础 equalizer 接口交付的是 `equalized RE` 或 `descrambled LLR`。
+调用正式 CPU blind-decode helper 时，仓库还可在当前边界内交付已通过 `CRC-RNTI` 的 `DCI 1A` 命中。
 
 推荐按下面这条链路理解：
 
 1. `run_pdcch(...)` 或 `run_pdcch_td(...)` 输出 `x_hat + sinr + re_grid_indices`
-2. 下游按 `REG / CCE / 搜索空间` 重组候选
-3. 下游做软解调、解扰、速率恢复、卷积译码、`CRC-RNTI` 校验
-4. 校验通过后，把结果翻译成可被调度器 / 解码器消费的 `DCI` 信息
+2. 使用仓库 helper 或下游逻辑恢复 `REG / CCE / common-search 或 UE-specific` 候选
+3. 使用仓库 helper 完成软解调、解扰、速率恢复
+4. 通过内建尾咬卷积码译码完成卷积译码，必要时可提供外部回调覆盖
+5. 使用仓库 helper 做 `CRC-RNTI` 校验和 `DCI 1A` 解析
+6. 若需要非 `DCI 1A` 格式、未知 UE RNTI 的全空间枚举或更宽 LTE PHY 配置，则继续交给仓库外下游模块
 
 如果下游直接使用仓库 helper，则常见交接点是：
 
@@ -43,6 +51,9 @@
 - `mmse::pdcch::BackendPdcchDescrambledLlrIndication`
 - `mmse::pdcch::BackendPdcchTdEqualizedIndication`
 - `mmse::pdcch::BackendPdcchTdDescrambledLlrIndication`
+- `mmse::pdcch::PdcchCommonSearchDecodeResult`
+- `mmse::pdcch::PdcchUeSpecificSearchResult`
+- `mmse::pdcch::PdcchSiRntiGeometrySearchResult`
 
 ## 2. `DCI` 翻译输出字段含义
 
@@ -74,6 +85,11 @@
 - 定位误检 / 漏检
 
 都很重要。
+
+对当前仓库已覆盖的 `DCI 1A` helper 路径而言，这组字段会被保留在：
+
+- `PdcchDciFormat1A::chain`
+- `PdcchDciFormat1ADecodeResult::dci.chain`
 
 ### 2.3 调度字段
 
@@ -122,7 +138,7 @@ mmse::PlanarGridViewF32
 
 当前稳定支持边界下，这份网格的固定形状是：
 
-- `n_rx_ant == 2`
+- `n_rx_ant in {1, 2}`
 - `n_symbols == 14`
 - `n_subcarriers == 1200`
 
@@ -130,7 +146,7 @@ mmse::PlanarGridViewF32
 
 按当前 planar `float` 布局计算，单次调用的输入网格数据量是：
 
-- `2 RX × 2 planes(re/im) × 14 × 1200 × 4 bytes = 268,800 bytes`
+- `n_rx_ant × 2 planes(re/im) × 14 × 1200 × 4 bytes`；1Rx 为 134,400 bytes，2Rx 为 268,800 bytes
 
 ### 3.2 公共输出
 
@@ -166,6 +182,15 @@ CE/MMSE 阶段的公共输出本质上是两类信息：
 | `run_pdcch(...)`      | `PdcchMmseInput`                        | `PdcchMmseOutputView + PdcchMmseResult`     | `3400 RE` 上界；带 `PCFICH/PHICH` helper 的常见路径为 `3228 RE`                              |
 | `run_pdcch_td(...)`   | `PdcchMmseInput`                        | `PdcchTdMmseOutputView + PdcchTdMmseResult` | 当前测试路径为 `3200` 个源 `RE / soft symbols`                                               |
 | `run(...)`（`PDSCH`） | `PlanarGridViewF32 + ExtractDescriptor` | `EqualizerOutputView`                       | 与 `start_symbol / PRB bitmap / layers` 有关；当前 full-band benchmark 为 `14400 RE / layer` |
+
+补充说明：
+
+- `run_pdcch_cpu_common_search_decode(...)` 的主要输入是 `PdcchMmseInput + PdcchCommonSearchDecodeConfig`
+- `run_pdcch_cpu_si_rnti_search(...)` 的主要输入是 `PdcchMmseInput + PdcchSiRntiSearchConfig`
+- `run_pdcch_cpu_ue_specific_search(...)` 的主要输入是 `PdcchMmseInput + PdcchUeSpecificSearchConfig`
+- `run_pdcch_cpu_si_rnti_geometry_search(...)` 的主要输入是 `PdcchSiRntiGeometrySearchRequest + PdcchSiRntiGeometrySearchCache`
+- 主要输出是 `PdcchCommonSearchDecodeResult`、`PdcchSiRntiSearchResult`、`PdcchUeSpecificSearchResult` 或 `PdcchSiRntiGeometrySearchResult`
+- 当前正式 helper 覆盖 common-search 与 UE-specific `DCI 1A`，默认使用内建尾咬卷积码译码
 
 ### 4.2 `PBCH`
 
@@ -298,6 +323,37 @@ run_pdcch_td(...)
 - 两组索引：`3200 × 2 × 2 = 12,800 bytes`
 - 合计约 `51,200 bytes`
 
+### 4.5a `PDCCH DCI 1A` CPU 入口
+
+当前仓库提供的正式 CPU 入口是：
+
+```cpp
+run_pdcch_cpu_common_search_decode(...)
+run_pdcch_cpu_si_rnti_search(...)
+run_pdcch_cpu_ue_specific_search(...)
+run_pdcch_cpu_si_rnti_geometry_search(...)
+```
+
+它们的作用都不是返回单个候选，而是返回命中列表：
+
+- `PdcchCommonSearchDecodeResult::candidate_count`
+- `PdcchCommonSearchDecodeResult::hits`
+- `PdcchSiRntiSearchResult::hits`
+- `PdcchUeSpecificSearchResult::{candidate_count, decoded_candidate_count, crc_rnti_miss_count, semantic_reject_count, hits}`
+- `PdcchSiRntiGeometrySearchResult::{status, geometry_attempt_count, geometry, decoded}`
+
+当前固定边界：
+
+- 仅 CPU
+- common-search 与 UE-specific
+- 仅 `DCI 1A`
+- `run_pdcch_cpu_common_search_decode(...)` 可选接受 `PdcchTailBitingConvolutionalDecoder` 覆盖默认内建译码
+- `run_pdcch_cpu_si_rnti_search(...)` 固定使用 `SI-RNTI` 语义，并仅允许外部 decoder 覆盖
+- `run_pdcch_cpu_ue_specific_search(...)` 接收目标 RNTI 列表并按 `Y_k` 搜索 `L=1/2/4/8`
+- `run_pdcch_cpu_si_rnti_geometry_search(...)` 当前仅支持 `20 MHz / FDD`；其 cache 在 PCI、端口、发射模式或子帧类型改变时失效
+
+如果你需要其它 `DCI` 格式、未知 UE RNTI 的通用搜索策略或 GPU 版完整解码阶段，仍应由仓库外模块完成。
+
 ### 4.6 `PDSCH`
 
 `PDSCH` 入口不是专用 DTO，而是通用：
@@ -390,12 +446,30 @@ run(const PlanarGridViewF32& grid,
 - 在一个 `10 ms` 业务窗口里，CE/MMSE 模块很容易被多次反复调用
 - 真正影响时延预算的，往往不是单个 `equalize` kernel，而是重复的 wrapper / estimate / transport 开销
 
+除此之外，当前仓库还新增了独立的：
+
+- `pdcch_decode_bench`
+
+它会把 `PDCCH` CPU 链路拆成：
+
+- `CE/MMSE`
+- `REG/CCE`
+- `LLR`
+- `candidate gather`
+- `rate recovery`
+- `native_tail_biting_viterbi`
+- `CRC/DCI`
+
+并同时输出每 `1 ms` 子帧和每 `10 ms` 窗口的 `avg / p50 / p95`。其中
+`native_tail_biting_viterbi` 明确表示仓库内建 `64-state` 尾咬 Viterbi 的阶段耗时；如果配置外部覆盖器，可据此对比接口边界成本。
+基准还报告 SI-RNTI 几何冷启动、锁定和第五次 miss 重探的耗时及几何尝试数。
+
 ## 6. 对外说明时建议使用的口径
 
 如果需要把这部分内容讲给项目外部调用方，推荐直接使用下面三句话：
 
 1. 当前仓库负责的是 LTE `PBCH / PCFICH / PDCCH / PDSCH` 的 **RE 提取 + CRS 信道估计 + MMSE 均衡**，不负责最终 `DCI / MIB / TB` 译码。
-2. `PDCCH` 的最终 `DCI` 是下游在 `equalized RE` 或 `descrambled LLR` 基础上，经盲检索、卷积译码和 `CRC-RNTI` 校验后得到的；`candidate_id / first_cce / aggregation_level` 应与译码结果一起透传。
+2. `PDCCH` 场景下，当前仓库提供 common-search 与 UE-specific `DCI 1A` 的 CPU helper 链路，默认使用内建尾咬卷积码译码，也可由外部回调覆盖；固定 `SI-RNTI` 可直接调用专用入口，缺少可信 CFI/PHICH 几何时可调用 SI-RNTI 几何搜索入口，`candidate_id / first_cce / aggregation_level` 会和译码结果一起透传。
 3. 当前 API 的基本粒度是 **一次处理一个 LTE `1 ms` 子帧**，因此 `10 ms` 的调用次数和数据量都应按 `10` 次 `1 ms` 调用去解释。
 
 ## 相关文档

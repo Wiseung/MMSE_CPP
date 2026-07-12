@@ -140,7 +140,7 @@ PlanarGridViewF32 make_grid_view(const GridBuffers& buffers) {
     PlanarGridViewF32 view{};
     view.re = {buffers.re[0].data(), buffers.re[1].data()};
     view.im = {buffers.im[0].data(), buffers.im[1].data()};
-    view.n_rx_ant = kLteNumRxAntV1;
+    view.n_rx_ant = kMmseV1MaxNumRxAntennas;
     view.n_symbols = kLteNumSymbolsNormalCp;
     view.n_subcarriers = kLteNumSubcarriers20MHz;
     return view;
@@ -202,8 +202,8 @@ ExtractDescriptor make_fullband_desc(std::uint32_t subframe_index) {
     ExtractDescriptor desc{};
     desc.sfn_subframe = subframe_index;
     desc.cell_id = 11U;
-    desc.n_tx_ports = kLteNumTxPortsV1;
-    desc.n_rx_ant = kLteNumRxAntV1;
+    desc.n_tx_ports = kMmseV1MaxNumCrsTxPorts;
+    desc.n_rx_ant = kMmseV1MaxNumRxAntennas;
     desc.n_layers = 2U;
     desc.tx_mode = 2U;
     desc.start_symbol = 1U;
@@ -217,7 +217,7 @@ ExtractDescriptor make_fullband_desc(std::uint32_t subframe_index) {
 
 GridBuffers make_empty_grid() {
     GridBuffers buffers;
-    for (std::uint32_t rx = 0; rx < kLteNumRxAntV1; ++rx) {
+    for (std::uint32_t rx = 0; rx < kMmseV1MaxNumRxAntennas; ++rx) {
         buffers.re[rx].assign(detail::kMaxGridRe, 0.0F);
         buffers.im[rx].assign(detail::kMaxGridRe, 0.0F);
     }
@@ -409,7 +409,8 @@ BufferAccounting build_buffer_accounting(const ExtractDescriptor& desc,
         static_cast<std::size_t>(valid_re) * desc.n_layers * sizeof(float);
 
     accounting.logical_input_bytes_per_subframe =
-        static_cast<std::size_t>(kLteNumRxAntV1) * 2U * detail::kCudaMaxGridRe * sizeof(float);
+        static_cast<std::size_t>(kMmseV1MaxNumRxAntennas) * 2U * detail::kCudaMaxGridRe *
+        sizeof(float);
     accounting.logical_output_bytes_per_subframe = logical_output_plane_bytes * 3U;
     accounting.logical_input_bytes_per_10ms =
         accounting.logical_input_bytes_per_subframe * kSubframesPer10msFrame;

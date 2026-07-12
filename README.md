@@ -14,7 +14,9 @@
 - 提供 `AVX2` 与 `CUDA` 加速路径，以及对应测试、基准和质量门禁
 
 这个仓库的核心输出是 **equalized symbols + SINR + 必要的资源网格元数据**。  
-它**不是**完整 LTE 接收机；当前并不负责最终的 `MIB / CFI / DCI / TB / MAC PDU` 解码输出。
+对 PDCCH，它还提供可选的 CPU `DCI 1A` 解码链路，覆盖 common-search、已知 RNTI 的
+UE-specific search，以及当前 `20 MHz / FDD` 范围内的 SI-RNTI 几何搜索。它仍然**不是**完整 LTE
+接收机，不负责 `MIB / CFI` 硬判决、非 `DCI 1A` 格式、`TB` 或 `MAC PDU` 的最终解码输出。
 
 ## 目录
 
@@ -40,13 +42,14 @@
 - 为 `PDSCH` 或控制信道构造高性能 `RE` 提取与均衡链路
 - 为 `PBCH / PCFICH / PDCCH` 提供可集成的 LTE SDK 入口
 - 为下游解码器提供 `PDCCH / PDSCH` 的 `LLR` 或 descrambled `LLR`
+- 为 `PDCCH common search + DCI 1A` 及 `UE-specific + DCI 1A` 提供内建尾咬卷积码译码的 CPU 可验收链路
 - 做 CPU/GPU 一致性验证、性能分析和预算评估
 
 它当前不做的事：
 
 - `PBCH -> MIB` 最终译码
 - `PCFICH -> CFI` 最终判决
-- `PDCCH` 的 `REG / CCE` 重组、盲检索、卷积译码、`CRC + RNTI` 校验和最终 `DCI` 输出
+- 非 `DCI 1A` 的通用最终 `DCI` 输出
 - `PDSCH` 的速率恢复、`HARQ` 软合并、`Turbo` 译码和 `MAC PDU` 解析
 
 ## 当前能力与边界
@@ -60,15 +63,29 @@
 | `PDCCH 2Tx` transmit-diversity 去映射输出 | 已支持     | `run_pdcch_td(...)`                                                       |
 | `PDSCH` descrambled `LLR` helper          | 已支持     | `mmse::pdsch::*`                                                          |
 | `PDCCH` `QPSK LLR + descrambling` helper  | 已支持     | `mmse::pdcch::make_backend_pdcch_descrambled_llr_indication(...)`         |
+| `PDCCH` `REG/CCE` 重组 helper             | 已支持     | `mmse::pdcch::build_pdcch_control_region(...)`                            |
+| `PDCCH` 分阶段 CPU 基准                   | 已支持     | `pdcch_decode_bench`                                                      |
+| `PDCCH UE-specific + DCI 1A` CPU 盲检索   | 已支持     | `run_pdcch_cpu_ue_specific_search(...)`，目标 RNTI 列表与 `L=1/2/4/8`     |
+| `PDCCH SI-RNTI` 未知几何 CPU 搜索         | 已支持     | `run_pdcch_cpu_si_rnti_geometry_search(...)`，当前限 20 MHz/FDD           |
 | `PBCH -> MIB` 最终译码                    | 不在仓库内 | 下游外部模块                                                              |
 | `PCFICH -> CFI` 最终译码                  | 不在仓库内 | 下游外部模块                                                              |
-| `PDCCH` 盲检索与最终 `DCI` 译码           | 不在仓库内 | 下游外部模块                                                              |
+| `PDCCH` 通用盲检索与通用最终 `DCI` 译码   | 部分支持   | 覆盖 common search 与 UE-specific 的 `DCI 1A`；不覆盖其它 DCI format      |
 | `PDSCH` `Turbo/HARQ/MAC` 解码             | 不在仓库内 | 下游外部模块                                                              |
+
+额外的 `PDCCH` helper / 正式入口：
+
+- `build_pdcch_common_search_candidate_llrs(...)` 与 `recover_pdcch_convolutional_rate_matched_llrs(...)`
+- `check_pdcch_crc_rnti(...)` 与 `decode_pdcch_dci_format1a_with_adapter(...)`
+- `run_pdcch_cpu_common_search_decode(...)`
+- `run_pdcch_cpu_si_rnti_search(...)`
+- `run_pdcch_cpu_ue_specific_search(...)`
+- `run_pdcch_cpu_si_rnti_geometry_search(...)`
 
 对 `PDCCH` 来说，当前最容易误解的边界是：
 
 - 仓库已经支持控制区大小约束、`PCFICH / PHICH` 保留资源排除、`CRS` 信道估计、`MMSE` 均衡、`2Tx` 去映射
-- 仓库还**没有**支持 `REG / CCE` 重组、盲检索、卷积译码和最终 `DCI` 输出
+- 仓库现在还支持 `REG / CCE` helper、common search、UE-specific 候选构造、`L=1/2/4/8` 速率恢复、内建尾咬卷积码译码、`CRC-RNTI` 与 `DCI 1A` 解析
+- 仓库仍不支持 `PCFICH -> CFI` 硬判决、非 `DCI 1A` 的通用最终 `DCI` 解码，以及 GPU 版完整解码阶段
 
 如果你需要完整背景，先读：
 
@@ -190,6 +207,11 @@ cmake --build build --target pdcch_module_demo --parallel
 | `PDCCH 2Tx` transmit-diversity 链路 | `mmse/pdcch_chain_sdk.h` | `run_pdcch_td(...)`                                                                           |
 | `PDSCH` descrambled `LLR` helper    | `mmse/lte_chain_sdk.h`   | `prepare_pdsch_descrambling_plan(...)` / `make_backend_pdsch_descrambled_llr_indication(...)` |
 
+另外，`mmse/pdcch_chain_sdk.h` 还导出正式 CPU 盲检索入口：
+
+- `run_pdcch_cpu_common_search_decode(...)`
+- `run_pdcch_cpu_si_rnti_search(...)`
+
 ### 最常见调用路径
 
 #### 1. 通用均衡路径
@@ -250,6 +272,31 @@ auto backend = mmse::pdcch::make_backend_pdcch_equalized_indication(meta, out);
 - `re_grid_indices0 / re_grid_indices1`
 
 也就是“每个软符号对应哪一对来源 `RE`”。
+
+#### 4. `PDCCH` CPU blind-decode 路径
+
+可以直接调用：
+
+- `run_pdcch_cpu_common_search_decode(...)`
+- `run_pdcch_cpu_si_rnti_search(...)`
+- `run_pdcch_cpu_ue_specific_search(...)`
+- `run_pdcch_cpu_si_rnti_geometry_search(...)`
+
+其中 `run_pdcch_cpu_si_rnti_search(...)` 固定使用 `SI-RNTI` 语义。
+`run_pdcch_cpu_ue_specific_search(...)` 接收目标 RNTI 列表，按 LTE `Y_k` 搜索空间
+枚举 `L=1/2/4/8`。`run_pdcch_cpu_si_rnti_geometry_search(...)` 则在当前 20 MHz/FDD
+边界内枚举 CFI 与 PHICH 资源几何，利用唯一 `SI-RNTI + DCI 1A` 命中锁定缓存。
+
+这条路径会在仓库内顺序完成：
+
+1. `run_pdcch(...)` 或 `run_pdcch_td(...)`
+2. `REG / CCE` 恢复与 common-search 或 UE-specific 候选构造
+3. `QPSK LLR + descrambling`
+4. 速率恢复
+5. 内建尾咬卷积码译码；也可提供外部回调覆盖
+6. `CRC-RNTI` 校验与 `DCI 1A` 解析
+
+输出是命中的候选列表：通用入口返回 `PdcchCommonSearchDecodeResult::hits`，SI-RNTI 专用入口返回 `PdcchSiRntiSearchResult::hits`。
 
 ## 文档导航
 

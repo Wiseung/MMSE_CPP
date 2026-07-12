@@ -24,6 +24,7 @@ add_library(mmse_cpp
     src/mmse_equalizer_gpu.cpp
     ${MMSE_CUDA_SOURCES}
     src/mmse_avx2.cpp
+    src/pdcch_tail_biting_decoder.cpp
     src/thread_pool.cpp
 )
 
