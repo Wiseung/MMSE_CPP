@@ -261,6 +261,33 @@ struct PdcchCommonSearchDecodeResult {
     std::vector<PdcchDciFormat1ADecodeResult> hits{};
 };
 
+struct PdcchGpuCommonSearchDecodeRequest {
+    PdcchMmseInput input{};
+    PdcchCommonSearchDecodeConfig config{};
+};
+
+struct PdcchGpuCommonSearchDecodeProfile {
+    double h2d_us = 0.0;
+    double ce_mmse_gpu_us = 0.0;
+    double llr_gpu_us = 0.0;
+    double rate_recovery_gpu_us = 0.0;
+    double viterbi_gpu_us = 0.0;
+    double crc_gpu_us = 0.0;
+    double d2h_us = 0.0;
+    double host_submit_us = 0.0;
+    double host_collect_us = 0.0;
+    std::uint64_t h2d_bytes = 0U;
+    std::uint64_t d2h_bytes = 0U;
+    std::uint32_t crc_hit_count = 0U;
+    std::uint32_t crc_miss_count = 0U;
+};
+
+struct PdcchGpuCommonSearchDecodeResult {
+    std::uint32_t candidate_count = 0U;
+    std::vector<PdcchDciFormat1ADecodeResult> hits{};
+    PdcchGpuCommonSearchDecodeProfile profile{};
+};
+
 struct PdcchUeSpecificSearchConfig {
     std::vector<std::uint16_t> rntis{};
     std::uint8_t aggregation_level_mask = kPdcchAggregationLevelMaskAll;

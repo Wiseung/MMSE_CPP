@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 
 namespace mmse::detail {
 
@@ -12,6 +13,7 @@ namespace {
 
 constexpr std::uint32_t kEstimateThreadsPerBlock = 256U;
 constexpr std::uint32_t kEstimateResidualBlocks = 64U;
+constexpr double kCudaNegativeInfinity = -1.7976931348623157e308;
 
 struct CudaComplex32 {
     float re = 0.0F;
@@ -362,7 +364,11 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
         const std::uint32_t grid_idx =
             td_mode && re < grid_meta->td_pair_count ? grid_meta->td_pair_grid_indices0[re]
                                                      : grid_meta->grid_indices[re];
-        const std::uint32_t out_slot = grid_meta->output_slot_by_grid_re[grid_idx];
+        const std::uint32_t out_slot =
+            grid_meta->channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
+                    grid_meta->n_tx_ports == 1U && grid_meta->td_pair_count == 0U
+                ? re
+                : grid_meta->output_slot_by_grid_re[grid_idx];
         const std::uint32_t symbol = grid_idx / grid_meta->n_subcarriers;
         const std::uint32_t sc = grid_idx % grid_meta->n_subcarriers;
         const bool has_rx1 = grid_meta->n_rx_ant > 1U;
@@ -614,6 +620,255 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
     }
 }
 
+__device__ inline std::uint32_t pdcch_parity(std::uint32_t value) {
+    std::uint32_t result = 0U;
+    while (value != 0U) {
+        result ^= value & 1U;
+        value >>= 1U;
+    }
+    return result;
+}
+
+__device__ inline std::uint8_t pdcch_branch_output_class(std::uint32_t shift_register) {
+    constexpr std::uint32_t kGenerator0 = 0133U;
+    constexpr std::uint32_t kGenerator1 = 0171U;
+    constexpr std::uint32_t kGenerator2 = 0165U;
+    return static_cast<std::uint8_t>(pdcch_parity(shift_register & kGenerator0) |
+                                     (pdcch_parity(shift_register & kGenerator1) << 1U) |
+                                     (pdcch_parity(shift_register & kGenerator2) << 2U));
+}
+
+__device__ inline double pdcch_branch_metric(const float* llrs, std::uint8_t output_class) {
+    const double sign0 = (output_class & 0x1U) != 0U ? 1.0 : -1.0;
+    const double sign1 = (output_class & 0x2U) != 0U ? 1.0 : -1.0;
+    const double sign2 = (output_class & 0x4U) != 0U ? 1.0 : -1.0;
+    return sign0 * static_cast<double>(llrs[0]) + sign1 * static_cast<double>(llrs[1]) +
+           sign2 * static_cast<double>(llrs[2]);
+}
+
+__global__ void pdcch_llr_descramble_kernel(const float* xhat_re,
+                                             const float* xhat_im,
+                                             const float* sinr,
+                                             std::uint32_t n_re,
+                                             const std::uint32_t* gold_words,
+                                             float* llrs) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t llr_count = n_re * 2U;
+    if (index >= llr_count || xhat_re == nullptr || xhat_im == nullptr || sinr == nullptr ||
+        gold_words == nullptr || llrs == nullptr) {
+        return;
+    }
+
+    const std::uint32_t re = index >> 1U;
+    const float gamma = sinr[re] > 0.0F ? sinr[re] : 0.0F;
+    constexpr float kScale = -2.0F / 0.70710678118654752440F;
+    float value = kScale * gamma * ((index & 1U) == 0U ? xhat_re[re] : xhat_im[re]);
+    if (((gold_words[index >> 5U] >> (index & 31U)) & 1U) != 0U) {
+        value = __uint_as_float(__float_as_uint(value) ^ 0x80000000U);
+    }
+    llrs[index] = value;
+}
+
+__global__ void pdcch_rate_recovery_kernel(const float* llrs,
+                                            const CudaPdcchCandidateDescriptor* candidates,
+                                            std::uint32_t candidate_count,
+                                            float* recovered_llrs) {
+    const std::uint32_t candidate_index = blockIdx.x;
+    const std::uint32_t lane = threadIdx.x;
+    const std::uint32_t output_index = blockIdx.y * 32U + lane;
+    if (candidate_index >= candidate_count || output_index >= kCudaPdcchRecoveredLlrCount ||
+        lane >= 32U || llrs == nullptr ||
+        candidates == nullptr || recovered_llrs == nullptr) {
+        return;
+    }
+    constexpr std::uint32_t kColumns = 32U;
+    constexpr std::uint8_t kPermutation[kColumns] = {
+        1U, 17U, 9U, 25U, 5U, 21U, 13U, 29U, 3U, 19U, 11U, 27U, 7U, 23U, 15U, 31U,
+        0U, 16U, 8U, 24U, 4U, 20U, 12U, 28U, 2U, 18U, 10U, 26U, 6U, 22U, 14U, 30U,
+    };
+    constexpr std::uint32_t kRows = 2U;
+    constexpr std::uint32_t kInterleaverSize = kRows * kColumns;
+    constexpr std::uint32_t kDummyBits = kInterleaverSize - kCudaPdcchCodewordBitCount;
+    constexpr std::uint32_t kCollectionSize = 3U * kInterleaverSize;
+    const CudaPdcchCandidateDescriptor* const candidate = candidates + candidate_index;
+    const std::uint8_t output_slot = candidate->rate_recovery_collection_slots[output_index];
+    float accumulated = 0.0F;
+
+    const std::uint32_t llr_offset = static_cast<std::uint32_t>(candidate->first_cce) * 72U;
+    std::uint32_t input_index = 0U;
+    std::uint32_t collection_index = 0U;
+    while (input_index < candidate->encoded_bit_count) {
+        const std::uint32_t intra_stream_index = collection_index % kInterleaverSize;
+        const std::uint32_t permutation_column = intra_stream_index / kRows;
+        const std::uint32_t row = intra_stream_index % kRows;
+        const std::uint32_t original_bit_index = row * kColumns + kPermutation[permutation_column];
+        if (original_bit_index >= kDummyBits) {
+            const float value = llrs[llr_offset + input_index];
+            if (collection_index == output_slot) {
+                accumulated += value;
+            }
+            ++input_index;
+        }
+        collection_index = (collection_index + 1U) % kCollectionSize;
+    }
+
+    float* const output = recovered_llrs + candidate_index * kCudaPdcchRecoveredLlrCount;
+    output[output_index] = accumulated;
+}
+
+__global__ void pdcch_viterbi_kernel(const float* recovered_llrs,
+                                      std::uint32_t candidate_count,
+                                      std::uint64_t* survivors,
+                                      double* terminal_metrics) {
+    const std::uint32_t candidate_index = blockIdx.x;
+    const std::uint32_t warp_index = threadIdx.x >> 5U;
+    const std::uint32_t initial_state = blockIdx.y * 2U + warp_index;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    if (candidate_index >= candidate_count || initial_state >= 64U || lane >= 32U ||
+        recovered_llrs == nullptr || survivors == nullptr || terminal_metrics == nullptr) {
+        return;
+    }
+
+    __shared__ double metrics[2][64];
+    __shared__ double next_metrics[2][64];
+    const std::uint32_t target_state = lane * 2U;
+    metrics[warp_index][target_state] =
+        target_state == initial_state ? 0.0 : kCudaNegativeInfinity;
+    metrics[warp_index][target_state + 1U] =
+        target_state + 1U == initial_state ? 0.0 : kCudaNegativeInfinity;
+    __syncwarp();
+
+    std::uint64_t* const candidate_survivors =
+        survivors + (candidate_index * 64U + initial_state) * kCudaPdcchCodewordBitCount;
+    const float* const candidate_llrs =
+        recovered_llrs + candidate_index * kCudaPdcchRecoveredLlrCount;
+    for (std::uint32_t bit = 0U; bit < kCudaPdcchCodewordBitCount; ++bit) {
+        const std::uint32_t low_predecessor = lane;
+        const std::uint32_t high_predecessor = low_predecessor | 32U;
+        const std::uint8_t low_zero_class = pdcch_branch_output_class(low_predecessor << 1U);
+        const std::uint8_t complement_class = low_zero_class ^ 0x7U;
+        const float* const bit_llrs = candidate_llrs + bit * 3U;
+        const double direct_branch_metric = pdcch_branch_metric(bit_llrs, low_zero_class);
+        const double complement_branch_metric = pdcch_branch_metric(bit_llrs, complement_class);
+        const double low_metric = metrics[warp_index][low_predecessor];
+        const double high_metric = metrics[warp_index][high_predecessor];
+        const double low_zero_metric = low_metric + direct_branch_metric;
+        const double high_zero_metric = high_metric + complement_branch_metric;
+        const bool choose_high_zero = high_zero_metric > low_zero_metric;
+        next_metrics[warp_index][target_state] =
+            choose_high_zero ? high_zero_metric : low_zero_metric;
+        const double low_one_metric = low_metric + complement_branch_metric;
+        const double high_one_metric = high_metric + direct_branch_metric;
+        const bool choose_high_one = high_one_metric > low_one_metric;
+        next_metrics[warp_index][target_state + 1U] =
+            choose_high_one ? high_one_metric : low_one_metric;
+
+        const unsigned int zero_mask = __ballot_sync(0xFFFFFFFFU, choose_high_zero);
+        const unsigned int one_mask = __ballot_sync(0xFFFFFFFFU, choose_high_one);
+        if (lane == 0U) {
+            std::uint64_t word = 0U;
+            for (std::uint32_t state_pair = 0U; state_pair < 32U; ++state_pair) {
+                if ((zero_mask & (1U << state_pair)) != 0U) {
+                    word |= std::uint64_t{1U} << (state_pair * 2U);
+                }
+                if ((one_mask & (1U << state_pair)) != 0U) {
+                    word |= std::uint64_t{1U} << (state_pair * 2U + 1U);
+                }
+            }
+            candidate_survivors[bit] = word;
+        }
+        __syncwarp();
+        metrics[warp_index][target_state] = next_metrics[warp_index][target_state];
+        metrics[warp_index][target_state + 1U] = next_metrics[warp_index][target_state + 1U];
+        __syncwarp();
+    }
+    if (lane == 0U) {
+        terminal_metrics[candidate_index * 64U + initial_state] = metrics[warp_index][initial_state];
+    }
+}
+
+__global__ void pdcch_crc_kernel(const CudaPdcchCandidateDescriptor* candidates,
+                                  std::uint32_t candidate_count,
+                                  const std::uint64_t* survivors,
+                                  const double* terminal_metrics,
+                                  std::uint16_t expected_rnti,
+                                  CudaPdcchCandidateResult* candidate_results) {
+    const std::uint32_t candidate_index = blockIdx.x;
+    if (candidate_index >= candidate_count || threadIdx.x != 0U || candidates == nullptr ||
+        survivors == nullptr || terminal_metrics == nullptr || candidate_results == nullptr) {
+        return;
+    }
+    double best_metric = kCudaNegativeInfinity;
+    std::uint64_t decoded_bits = 0U;
+    for (std::uint32_t initial_state = 0U; initial_state < 64U; ++initial_state) {
+        const double metric = terminal_metrics[candidate_index * 64U + initial_state];
+        if (metric <= best_metric) {
+            continue;
+        }
+        std::uint32_t state = initial_state;
+        std::uint64_t candidate_bits = 0U;
+        const std::uint64_t* const candidate_survivors =
+            survivors + (candidate_index * 64U + initial_state) * kCudaPdcchCodewordBitCount;
+        for (std::uint32_t bit = kCudaPdcchCodewordBitCount; bit > 0U; --bit) {
+            candidate_bits |= static_cast<std::uint64_t>(state & 1U) << (bit - 1U);
+            const bool high_predecessor =
+                (candidate_survivors[bit - 1U] & (std::uint64_t{1U} << state)) != 0U;
+            state = (state >> 1U) | (high_predecessor ? 32U : 0U);
+        }
+        if (state == initial_state) {
+            best_metric = metric;
+            decoded_bits = candidate_bits;
+        }
+    }
+
+    std::uint16_t transmitted_crc = 0U;
+    std::uint16_t calculated_crc = 0U;
+    for (std::uint32_t bit = 0U; bit < 28U; ++bit) {
+        const std::uint16_t value = static_cast<std::uint16_t>((decoded_bits >> bit) & 1U);
+        const std::uint16_t feedback =
+            static_cast<std::uint16_t>(((calculated_crc >> 15U) ^ value) & 1U);
+        calculated_crc = static_cast<std::uint16_t>(calculated_crc << 1U);
+        if (feedback != 0U) {
+            calculated_crc = static_cast<std::uint16_t>(calculated_crc ^ 0x1021U);
+        }
+    }
+    for (std::uint32_t bit = 28U; bit < kCudaPdcchCodewordBitCount; ++bit) {
+        transmitted_crc = static_cast<std::uint16_t>(
+            (transmitted_crc << 1U) | static_cast<std::uint16_t>((decoded_bits >> bit) & 1U));
+    }
+    const std::uint16_t unmasked_rnti =
+        static_cast<std::uint16_t>(transmitted_crc ^ calculated_crc);
+    const CudaPdcchCandidateDescriptor candidate = candidates[candidate_index];
+    candidate_results[candidate_index] = {
+        .candidate_id = candidate.candidate_id,
+        .first_cce = candidate.first_cce,
+        .aggregation_level = candidate.aggregation_level,
+        .matched = static_cast<std::uint8_t>(unmasked_rnti == expected_rnti),
+        .transmitted_crc = transmitted_crc,
+        .calculated_crc = calculated_crc,
+        .unmasked_rnti = unmasked_rnti,
+        .decoded_bits = decoded_bits,
+    };
+}
+
+__global__ void pdcch_compact_hits_kernel(const CudaPdcchCandidateResult* candidate_results,
+                                          std::uint32_t candidate_count,
+                                          CudaPdcchCandidateResult* compact_results,
+                                          std::uint32_t* hit_count) {
+    if (blockIdx.x != 0U || threadIdx.x != 0U || candidate_results == nullptr ||
+        compact_results == nullptr || hit_count == nullptr) {
+        return;
+    }
+    std::uint32_t count = 0U;
+    for (std::uint32_t candidate = 0U; candidate < candidate_count; ++candidate) {
+        const CudaPdcchCandidateResult result = candidate_results[candidate];
+        if (result.matched != 0U) {
+            compact_results[count++] = result;
+        }
+    }
+    *hit_count = count;
+}
+
 }  // namespace
 
 bool cuda_backend_compiled() {
@@ -764,6 +1019,36 @@ void cuda_free_host_f32(float* ptr, bool pinned_allocation) {
     delete[] ptr;
 }
 
+MmseStatus cuda_alloc_host_bytes(void*& ptr, std::size_t bytes, bool request_pinned,
+                                 bool& pinned_allocation) {
+    ptr = nullptr;
+    pinned_allocation = false;
+    if (!request_pinned) {
+        ptr = ::operator new(bytes, std::nothrow);
+        if (ptr == nullptr) {
+            return MmseStatus::kInternalError;
+        }
+        return MmseStatus::kOk;
+    }
+    const cudaError_t status = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
+    if (status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    pinned_allocation = true;
+    return MmseStatus::kOk;
+}
+
+void cuda_free_host_bytes(void* ptr, bool pinned_allocation) {
+    if (ptr == nullptr) {
+        return;
+    }
+    if (pinned_allocation) {
+        cudaFreeHost(ptr);
+        return;
+    }
+    ::operator delete(ptr);
+}
+
 MmseStatus cuda_alloc_device_buffer(void*& ptr, std::size_t bytes) {
     ptr = nullptr;
     return map_cuda_error(cudaMalloc(&ptr, bytes));
@@ -782,7 +1067,8 @@ MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
                                     std::size_t grid_plane_bytes,
                                     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    for (std::size_t rx = 0; rx < re.size(); ++rx) {
+    const std::size_t rx_count = min_u32(grid_meta.n_rx_ant, static_cast<std::uint32_t>(re.size()));
+    for (std::size_t rx = 0; rx < rx_count; ++rx) {
         if (const cudaError_t status =
                 cudaMemcpyAsync(buffers.grid_re[rx], re[rx], grid_plane_bytes, cudaMemcpyHostToDevice, stream);
             status != cudaSuccess) {
@@ -794,12 +1080,19 @@ MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
             return map_cuda_error(status);
         }
     }
-    if (const cudaError_t status =
-            cudaMemcpyAsync(buffers.grid_meta,
-                            &grid_meta,
-                            sizeof(grid_meta),
-                            cudaMemcpyHostToDevice,
-                            stream);
+    const bool compact_pdcch_meta =
+        grid_meta.channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
+        grid_meta.n_tx_ports == 1U && grid_meta.td_pair_count == 0U;
+    if (!compact_pdcch_meta) {
+        return map_cuda_error(cudaMemcpyAsync(buffers.grid_meta, &grid_meta, sizeof(grid_meta),
+                                              cudaMemcpyHostToDevice, stream));
+    }
+
+    const std::size_t valid_re = min_u32(grid_meta.n_valid_re, kCudaMaxDataRe);
+    if (const cudaError_t status = cudaMemcpyAsync(
+            buffers.grid_meta, &grid_meta,
+            offsetof(CudaGridMeta, grid_indices) + valid_re * sizeof(grid_meta.grid_indices[0]),
+            cudaMemcpyHostToDevice, stream);
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
@@ -832,6 +1125,16 @@ MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffer
                                                  const CudaGridMeta& grid_meta,
                                                  std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const bool compact_pdcch_meta =
+        grid_meta.channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
+        grid_meta.n_tx_ports == 1U && grid_meta.td_pair_count == 0U;
+    if (compact_pdcch_meta) {
+        const std::size_t valid_re = min_u32(grid_meta.n_valid_re, kCudaMaxDataRe);
+        return map_cuda_error(cudaMemcpyAsync(
+            buffers.grid_meta, &grid_meta,
+            offsetof(CudaGridMeta, grid_indices) + valid_re * sizeof(grid_meta.grid_indices[0]),
+            cudaMemcpyHostToDevice, stream));
+    }
     const std::byte* base = reinterpret_cast<const std::byte*>(&grid_meta);
     const std::size_t header_offset = offsetof(CudaGridMeta, n_valid_re);
     const std::size_t header_bytes =
@@ -1065,6 +1368,130 @@ MmseStatus cuda_copy_completion_d2h_async(const CudaDeviceBuffers& buffers,
                                           sizeof(completion_value),
                                           cudaMemcpyDeviceToHost,
                                           stream));
+}
+
+MmseStatus cuda_copy_pdcch_candidates_h2d_async(
+    const CudaDeviceBuffers& buffers, const CudaPdcchCandidateDescriptor* candidates,
+    std::uint32_t candidate_count, std::uintptr_t stream_handle) {
+    if (buffers.pdcch_candidates == nullptr || candidates == nullptr ||
+        candidate_count == 0U || candidate_count > kCudaPdcchMaxCandidates) {
+        return MmseStatus::kInvalidArgument;
+    }
+    return map_cuda_error(cudaMemcpyAsync(
+        buffers.pdcch_candidates, candidates,
+        static_cast<std::size_t>(candidate_count) * sizeof(CudaPdcchCandidateDescriptor),
+        cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream_handle)));
+}
+
+MmseStatus cuda_copy_pdcch_gold_words_h2d_async(const CudaDeviceBuffers& buffers,
+                                                 const std::uint32_t* gold_words,
+                                                 std::uint32_t word_count,
+                                                 std::uintptr_t stream_handle) {
+    if (buffers.pdcch_gold_words == nullptr || gold_words == nullptr || word_count == 0U ||
+        word_count > kCudaPdcchGoldWordCount) {
+        return MmseStatus::kInvalidArgument;
+    }
+    return map_cuda_error(cudaMemcpyAsync(
+        buffers.pdcch_gold_words, gold_words, static_cast<std::size_t>(word_count) * sizeof(*gold_words),
+        cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream_handle)));
+}
+
+MmseStatus cuda_launch_pdcch_llr_descramble(const CudaDeviceBuffers& buffers, std::uint32_t n_re,
+                                            std::uintptr_t stream_handle) {
+    if (buffers.xhat_re == nullptr || buffers.xhat_im == nullptr || buffers.sinr == nullptr ||
+        buffers.pdcch_gold_words == nullptr || buffers.pdcch_llrs == nullptr || n_re == 0U ||
+        n_re > kCudaMaxDataRe) {
+        return MmseStatus::kInvalidArgument;
+    }
+    constexpr std::uint32_t kThreads = 256U;
+    const std::uint32_t blocks = ceil_div_u32(n_re * 2U, kThreads);
+    pdcch_llr_descramble_kernel<<<blocks, kThreads, 0,
+                                  reinterpret_cast<cudaStream_t>(stream_handle)>>>(
+        reinterpret_cast<const float*>(buffers.xhat_re), reinterpret_cast<const float*>(buffers.xhat_im),
+        reinterpret_cast<const float*>(buffers.sinr), n_re,
+        reinterpret_cast<const std::uint32_t*>(buffers.pdcch_gold_words),
+        reinterpret_cast<float*>(buffers.pdcch_llrs));
+    return map_cuda_error(cudaGetLastError());
+}
+
+MmseStatus cuda_launch_pdcch_rate_recovery(const CudaDeviceBuffers& buffers,
+                                           std::uint32_t candidate_count,
+                                           std::uintptr_t stream_handle) {
+    if (buffers.pdcch_llrs == nullptr || buffers.pdcch_candidates == nullptr ||
+        buffers.pdcch_recovered_llrs == nullptr || candidate_count == 0U ||
+        candidate_count > kCudaPdcchMaxCandidates) {
+        return MmseStatus::kInvalidArgument;
+    }
+    constexpr std::uint32_t kRateRecoveryWarps =
+        (kCudaPdcchRecoveredLlrCount + 31U) / 32U;
+    pdcch_rate_recovery_kernel<<<dim3(candidate_count, kRateRecoveryWarps), 32U, 0,
+                                  reinterpret_cast<cudaStream_t>(stream_handle)>>>(
+        reinterpret_cast<const float*>(buffers.pdcch_llrs),
+        reinterpret_cast<const CudaPdcchCandidateDescriptor*>(buffers.pdcch_candidates),
+        candidate_count, reinterpret_cast<float*>(buffers.pdcch_recovered_llrs));
+    return map_cuda_error(cudaGetLastError());
+}
+
+MmseStatus cuda_launch_pdcch_viterbi(const CudaDeviceBuffers& buffers,
+                                    std::uint32_t candidate_count,
+                                    std::uintptr_t stream_handle) {
+    if (buffers.pdcch_recovered_llrs == nullptr || buffers.pdcch_survivors == nullptr ||
+        buffers.pdcch_terminal_metrics == nullptr || candidate_count == 0U ||
+        candidate_count > kCudaPdcchMaxCandidates) {
+        return MmseStatus::kInvalidArgument;
+    }
+    pdcch_viterbi_kernel<<<dim3(candidate_count, 32U), 64U, 0,
+                              reinterpret_cast<cudaStream_t>(stream_handle)>>>(
+        reinterpret_cast<const float*>(buffers.pdcch_recovered_llrs), candidate_count,
+        reinterpret_cast<std::uint64_t*>(buffers.pdcch_survivors),
+        reinterpret_cast<double*>(buffers.pdcch_terminal_metrics));
+    return map_cuda_error(cudaGetLastError());
+}
+
+MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers& buffers,
+                                        std::uint32_t candidate_count,
+                                        std::uint16_t expected_rnti,
+                                        std::uintptr_t stream_handle) {
+    if (buffers.pdcch_candidates == nullptr || buffers.pdcch_survivors == nullptr ||
+        buffers.pdcch_terminal_metrics == nullptr || buffers.pdcch_candidate_results == nullptr ||
+        buffers.pdcch_results == nullptr || buffers.pdcch_hit_count == nullptr ||
+        candidate_count == 0U || candidate_count > kCudaPdcchMaxCandidates) {
+        return MmseStatus::kInvalidArgument;
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    pdcch_crc_kernel<<<candidate_count, 1U, 0, stream>>>(
+        reinterpret_cast<const CudaPdcchCandidateDescriptor*>(buffers.pdcch_candidates),
+        candidate_count, reinterpret_cast<const std::uint64_t*>(buffers.pdcch_survivors),
+        reinterpret_cast<const double*>(buffers.pdcch_terminal_metrics), expected_rnti,
+        reinterpret_cast<CudaPdcchCandidateResult*>(buffers.pdcch_candidate_results));
+    if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    pdcch_compact_hits_kernel<<<1U, 1U, 0, stream>>>(
+        reinterpret_cast<const CudaPdcchCandidateResult*>(buffers.pdcch_candidate_results),
+        candidate_count, reinterpret_cast<CudaPdcchCandidateResult*>(buffers.pdcch_results),
+        reinterpret_cast<std::uint32_t*>(buffers.pdcch_hit_count));
+    return map_cuda_error(cudaGetLastError());
+}
+
+MmseStatus cuda_copy_pdcch_results_d2h_async(const CudaDeviceBuffers& buffers,
+                                             CudaPdcchCandidateResult* results,
+                                             std::uint32_t& hit_count,
+                                             std::uintptr_t stream_handle) {
+    if (buffers.pdcch_results == nullptr || buffers.pdcch_hit_count == nullptr ||
+        results == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    if (const cudaError_t status = cudaMemcpyAsync(
+            &hit_count, buffers.pdcch_hit_count, sizeof(hit_count), cudaMemcpyDeviceToHost, stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    return map_cuda_error(cudaMemcpyAsync(
+        results, buffers.pdcch_results,
+        static_cast<std::size_t>(kCudaPdcchMaxCandidates) * sizeof(CudaPdcchCandidateResult),
+        cudaMemcpyDeviceToHost, stream));
 }
 
 MmseStatus cuda_stream_synchronize(std::uintptr_t stream_handle) {

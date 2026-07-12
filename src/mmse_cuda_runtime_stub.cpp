@@ -65,6 +65,21 @@ void cuda_free_host_f32(float* ptr, bool) {
     delete[] ptr;
 }
 
+MmseStatus cuda_alloc_host_bytes(void*& ptr, std::size_t bytes, bool, bool& pinned_allocation) {
+    ptr = ::operator new(bytes, std::nothrow);
+    if (ptr == nullptr) {
+        pinned_allocation = false;
+        return MmseStatus::kInternalError;
+    }
+    std::memset(ptr, 0, bytes);
+    pinned_allocation = false;
+    return MmseStatus::kOk;
+}
+
+void cuda_free_host_bytes(void* ptr, bool) {
+    ::operator delete(ptr);
+}
+
 MmseStatus cuda_alloc_device_buffer(void*&, std::size_t) {
     return MmseStatus::kUnsupportedConfig;
 }
@@ -131,6 +146,41 @@ MmseStatus cuda_copy_scratch_d2h_async(const CudaDeviceBuffers&, float*, std::si
 
 MmseStatus cuda_copy_completion_d2h_async(const CudaDeviceBuffers&, std::uint32_t&,
                                           std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_copy_pdcch_candidates_h2d_async(const CudaDeviceBuffers&,
+                                                const CudaPdcchCandidateDescriptor*, std::uint32_t,
+                                                std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_copy_pdcch_gold_words_h2d_async(const CudaDeviceBuffers&, const std::uint32_t*,
+                                                std::uint32_t, std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_launch_pdcch_llr_descramble(const CudaDeviceBuffers&, std::uint32_t,
+                                            std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_launch_pdcch_rate_recovery(const CudaDeviceBuffers&, std::uint32_t,
+                                           std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_launch_pdcch_viterbi(const CudaDeviceBuffers&, std::uint32_t, std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers&, std::uint32_t, std::uint16_t,
+                                         std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_copy_pdcch_results_d2h_async(const CudaDeviceBuffers&, CudaPdcchCandidateResult*,
+                                             std::uint32_t&, std::uintptr_t) {
     return MmseStatus::kUnsupportedConfig;
 }
 

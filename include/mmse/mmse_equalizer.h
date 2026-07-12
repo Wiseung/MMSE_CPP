@@ -1,9 +1,16 @@
 #pragma once
 
+#include <span>
+
 #include "mmse/constants.h"
 #include "mmse/types.h"
 
 namespace mmse {
+
+namespace pdcch {
+struct PdcchGpuCommonSearchDecodeRequest;
+struct PdcchGpuCommonSearchDecodeResult;
+} // namespace pdcch
 
 class MmseEqualizerCpuContext {
   public:
@@ -53,6 +60,12 @@ class MmseEqualizerGpuContext {
     MmseStatus run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out, PdcchMmseResult& meta);
     MmseStatus run_pdcch_td(const PdcchMmseInput& in, PdcchTdMmseOutputView& out,
                             PdcchTdMmseResult& meta);
+    MmseStatus
+    run_pdcch_gpu_common_search_decode(const pdcch::PdcchGpuCommonSearchDecodeRequest& request,
+                                       pdcch::PdcchGpuCommonSearchDecodeResult& result);
+    MmseStatus run_pdcch_gpu_common_search_decode_batch(
+        std::span<const pdcch::PdcchGpuCommonSearchDecodeRequest> requests,
+        std::span<pdcch::PdcchGpuCommonSearchDecodeResult> results);
     MmseGpuHostProfileSnapshot last_host_profile() const;
 
   private:

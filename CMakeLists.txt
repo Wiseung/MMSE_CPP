@@ -60,7 +60,11 @@ else()
 endif()
 
 if(MMSE_CUDA_ENABLED)
-    set_target_properties(mmse_cpp PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED YES)
+    set_target_properties(mmse_cpp PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED YES
+        CUDA_ARCHITECTURES 89
+    )
     set_source_files_properties(
         src/mmse_cuda_runtime.cu
         PROPERTIES
@@ -122,6 +126,16 @@ if(MMSE_BUILD_BENCH)
     target_link_libraries(pdcch_decode_bench PRIVATE mmse_cpp)
     target_include_directories(pdcch_decode_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     install(TARGETS pdcch_decode_bench
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+
+    add_executable(pdcch_gpu_decode_bench bench/pdcch_gpu_decode_bench.cpp)
+    target_link_libraries(pdcch_gpu_decode_bench PRIVATE mmse_cpp)
+    target_include_directories(pdcch_gpu_decode_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(MSVC)
+        target_link_options(pdcch_gpu_decode_bench PRIVATE /NODEFAULTLIB:LIBCMT)
+    endif()
+    install(TARGETS pdcch_gpu_decode_bench
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 

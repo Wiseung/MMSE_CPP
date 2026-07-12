@@ -20,6 +20,31 @@ inline constexpr std::uint32_t kCudaEqualizeTraceFloatCount = 32U;
 inline constexpr std::uint32_t kCudaScratchHeaderFloatCount = 4U;
 inline constexpr std::uint32_t kCudaScratchTraceFloatCount =
     kCudaScratchHeaderFloatCount + kCudaValidationSampleCount * kCudaEqualizeTraceFloatCount;
+inline constexpr std::uint32_t kCudaPdcchMaxCandidates = 6U;
+inline constexpr std::uint32_t kCudaPdcchCodewordBitCount = 44U;
+inline constexpr std::uint32_t kCudaPdcchRecoveredLlrCount = 3U * kCudaPdcchCodewordBitCount;
+inline constexpr std::uint32_t kCudaPdcchGoldWordCount = (2U * kCudaMaxDataRe + 31U) / 32U;
+
+struct CudaPdcchCandidateDescriptor {
+    std::uint32_t candidate_id = 0U;
+    std::uint16_t first_cce = 0U;
+    std::uint8_t aggregation_level = 0U;
+    std::uint8_t reserved = 0U;
+    std::uint32_t encoded_bit_count = 0U;
+    std::uint8_t rate_recovery_collection_slots[kCudaPdcchRecoveredLlrCount]{};
+};
+
+struct CudaPdcchCandidateResult {
+    std::uint32_t candidate_id = 0U;
+    std::uint16_t first_cce = 0U;
+    std::uint8_t aggregation_level = 0U;
+    std::uint8_t matched = 0U;
+    std::uint16_t transmitted_crc = 0U;
+    std::uint16_t calculated_crc = 0U;
+    std::uint16_t unmasked_rnti = 0U;
+    std::uint16_t reserved = 0U;
+    std::uint64_t decoded_bits = 0U;
+};
 
 struct CudaDeviceBuffers {
     std::array<void*, 2> grid_re{};
@@ -32,6 +57,15 @@ struct CudaDeviceBuffers {
     void* xhat_im = nullptr;
     void* sinr = nullptr;
     void* completion = nullptr;
+    void* pdcch_llrs = nullptr;
+    void* pdcch_gold_words = nullptr;
+    void* pdcch_candidates = nullptr;
+    void* pdcch_recovered_llrs = nullptr;
+    void* pdcch_survivors = nullptr;
+    void* pdcch_terminal_metrics = nullptr;
+    void* pdcch_candidate_results = nullptr;
+    void* pdcch_results = nullptr;
+    void* pdcch_hit_count = nullptr;
 };
 
 struct CudaGridMeta {
@@ -55,18 +89,23 @@ struct CudaGridMeta {
     float det_floor = 0.0F;
     float g_min = 0.0F;
     float gamma_max = 0.0F;
-    std::uint16_t grid_indices[kCudaMaxDataRe]{};
-    std::uint16_t td_pair_grid_indices0[kCudaMaxDataRe / 2U]{};
-    std::uint16_t td_pair_grid_indices1[kCudaMaxDataRe / 2U]{};
     std::uint16_t spot_check_re_slots[kCudaValidationSampleCount]{};
-    std::uint32_t output_slot_by_grid_re[kCudaMaxGridRe]{};
-    std::uint32_t prb_segment_offsets[kCudaMaxDataRe + 1]{};
     std::uint16_t prb_bitmap[7]{};
     std::uint8_t crs_symbols[kLteNumCrsSymbols]{};
     std::uint8_t crs_freq_offsets[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols]{};
     float crs_pilot_re[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols][kLteNumPilotTonesPerCrsSymbol]{};
     float crs_pilot_im[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols][kLteNumPilotTonesPerCrsSymbol]{};
+    std::uint16_t grid_indices[kCudaMaxDataRe]{};
+    std::uint16_t td_pair_grid_indices0[kCudaMaxDataRe / 2U]{};
+    std::uint16_t td_pair_grid_indices1[kCudaMaxDataRe / 2U]{};
+    std::uint32_t output_slot_by_grid_re[kCudaMaxGridRe]{};
+    std::uint32_t prb_segment_offsets[kCudaMaxDataRe + 1]{};
 };
+
+inline std::size_t cuda_pdcch_grid_meta_h2d_bytes(std::uint32_t n_valid_re) noexcept {
+    const std::size_t valid_re = n_valid_re > kCudaMaxDataRe ? kCudaMaxDataRe : n_valid_re;
+    return offsetof(CudaGridMeta, grid_indices) + valid_re * sizeof(std::uint16_t);
+}
 
 struct CudaDeviceInfo {
     std::array<char, 128> name{};
@@ -117,6 +156,9 @@ MmseStatus cuda_event_elapsed_us(std::uintptr_t start_event_handle, std::uintptr
 MmseStatus cuda_alloc_host_f32(float*& ptr, std::size_t count, bool request_pinned,
                                bool& pinned_allocation);
 void cuda_free_host_f32(float* ptr, bool pinned_allocation);
+MmseStatus cuda_alloc_host_bytes(void*& ptr, std::size_t bytes, bool request_pinned,
+                                 bool& pinned_allocation);
+void cuda_free_host_bytes(void* ptr, bool pinned_allocation);
 
 MmseStatus cuda_alloc_device_buffer(void*& ptr, std::size_t bytes);
 void cuda_free_device_buffer(void* ptr);
@@ -164,6 +206,29 @@ MmseStatus cuda_copy_scratch_d2h_async(const CudaDeviceBuffers& buffers, float* 
 MmseStatus cuda_copy_completion_d2h_async(const CudaDeviceBuffers& buffers,
                                           std::uint32_t& completion_value,
                                           std::uintptr_t stream_handle);
+
+MmseStatus cuda_copy_pdcch_candidates_h2d_async(const CudaDeviceBuffers& buffers,
+                                                const CudaPdcchCandidateDescriptor* candidates,
+                                                std::uint32_t candidate_count,
+                                                std::uintptr_t stream_handle);
+MmseStatus cuda_copy_pdcch_gold_words_h2d_async(const CudaDeviceBuffers& buffers,
+                                                const std::uint32_t* gold_words,
+                                                std::uint32_t word_count,
+                                                std::uintptr_t stream_handle);
+MmseStatus cuda_launch_pdcch_llr_descramble(const CudaDeviceBuffers& buffers, std::uint32_t n_re,
+                                            std::uintptr_t stream_handle);
+MmseStatus cuda_launch_pdcch_rate_recovery(const CudaDeviceBuffers& buffers,
+                                           std::uint32_t candidate_count,
+                                           std::uintptr_t stream_handle);
+MmseStatus cuda_launch_pdcch_viterbi(const CudaDeviceBuffers& buffers,
+                                     std::uint32_t candidate_count, std::uintptr_t stream_handle);
+MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers& buffers,
+                                         std::uint32_t candidate_count, std::uint16_t expected_rnti,
+                                         std::uintptr_t stream_handle);
+MmseStatus cuda_copy_pdcch_results_d2h_async(const CudaDeviceBuffers& buffers,
+                                             CudaPdcchCandidateResult* results,
+                                             std::uint32_t& hit_count,
+                                             std::uintptr_t stream_handle);
 
 MmseStatus cuda_stream_synchronize(std::uintptr_t stream_handle);
 
