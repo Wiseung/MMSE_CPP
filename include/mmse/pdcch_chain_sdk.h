@@ -1,10 +1,20 @@
 #pragma once
 
+#include <span>
+
 #include "mmse/mmse_equalizer.h"
 #include "mmse/pdcch_chain_dto.h"
 #include "mmse/pdcch_module_api.h"
 
 namespace mmse::pdcch {
+
+MmseStatus run_pdcch_gpu_common_search_decode(MmseEqualizerGpuContext& context,
+                                              const PdcchGpuCommonSearchDecodeRequest& request,
+                                              PdcchGpuCommonSearchDecodeResult& result);
+
+MmseStatus run_pdcch_gpu_common_search_decode_batch(
+    MmseEqualizerGpuContext& context, std::span<const PdcchGpuCommonSearchDecodeRequest> requests,
+    std::span<PdcchGpuCommonSearchDecodeResult> results);
 
 namespace detail {
 
@@ -59,6 +69,22 @@ inline MmseStatus build_pdcch_cpu_backend(MmseEqualizerCpuContext& context,
 }
 
 } // namespace detail
+
+inline MmseStatus
+run_pdcch_gpu_common_search_decode(MmseEqualizerGpuContext& context,
+                                   const PdcchGpuCommonSearchDecodeRequest& request,
+                                   PdcchGpuCommonSearchDecodeResult& result) {
+    return context.run_pdcch_gpu_common_search_decode(request, result);
+}
+
+inline MmseStatus run_pdcch_gpu_common_search_decode_batch(
+    MmseEqualizerGpuContext& context, std::span<const PdcchGpuCommonSearchDecodeRequest> requests,
+    std::span<PdcchGpuCommonSearchDecodeResult> results) {
+    if (requests.size() != results.size()) {
+        return MmseStatus::kInvalidArgument;
+    }
+    return context.run_pdcch_gpu_common_search_decode_batch(requests, results);
+}
 
 inline MmseStatus run_pdcch_cpu_common_search_decode(MmseEqualizerCpuContext& context,
                                                      const PdcchMmseInput& input,
