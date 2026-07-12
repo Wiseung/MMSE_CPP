@@ -203,14 +203,14 @@ inline void build_pdcch_si_rnti_geometry_candidates(std::uint16_t n_prb,
     const std::uint32_t max_control_symbols = lte_max_pdcch_control_symbols_normal_cp(n_prb);
     geometries.reserve(max_control_symbols * kPdcchGeometryPhichResources.size() *
                        kPdcchGeometryPhichDurations.size());
-    for (std::uint8_t cfi = 1U; cfi <= max_control_symbols; ++cfi) {
+    for (std::uint32_t cfi = 1U; cfi <= max_control_symbols; ++cfi) {
         for (const PhichResource resource : kPdcchGeometryPhichResources) {
             for (const PhichDuration duration : kPdcchGeometryPhichDurations) {
                 if (duration == PhichDuration::kExtended && cfi < kLteMaxControlSymbolsNormalCp) {
                     continue;
                 }
                 geometries.push_back({
-                    .control_symbol_count = cfi,
+                    .control_symbol_count = static_cast<std::uint8_t>(cfi),
                     .phich_resource = resource,
                     .phich_duration = duration,
                     .standard_reg_order = true,
