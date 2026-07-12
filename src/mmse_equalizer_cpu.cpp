@@ -61,12 +61,12 @@ inline bool bitmap_has_prb(const ExtractDescriptor& desc, std::uint32_t prb) {
 
 inline bool control_re_excluded(const ExtractDescriptor& desc, std::uint32_t symbol,
                                 std::uint32_t prb, std::uint32_t tone) {
-    if (symbol >= desc.control_symbol_count || prb >= kLteNumPrb20MHz ||
+    if (symbol >= desc.control_symbol_count || prb >= desc.n_prb ||
         tone >= kLteNumSubcarriersPerPrb) {
         return false;
     }
     const std::size_t mask_idx =
-        static_cast<std::size_t>(symbol) * kLteNumPrb20MHz + static_cast<std::size_t>(prb);
+        static_cast<std::size_t>(symbol) * desc.n_prb + static_cast<std::size_t>(prb);
     return (desc.control_re_exclusion_masks[mask_idx] & (static_cast<std::uint16_t>(1U) << tone)) !=
            0U;
 }
@@ -96,7 +96,7 @@ inline std::uint32_t pbch_prb_end() {
 
 inline Complex32 grid_at(const PlanarGridViewF32& grid, std::uint32_t rx, std::uint32_t symbol,
                          std::uint32_t sc) {
-    const std::size_t idx = static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz + sc;
+    const std::size_t idx = static_cast<std::size_t>(symbol) * grid.n_subcarriers + sc;
     return {finite_or_zero(grid.re[rx][idx]), finite_or_zero(grid.im[rx][idx])};
 }
 
@@ -198,8 +198,8 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
         }
         break;
     case MmseChannelType::kPdcch:
-        if (desc.control_symbol_count == 0U ||
-            desc.control_symbol_count > kLteMaxControlSymbolsNormalCp) {
+        if (desc.control_symbol_count == 0U || !is_supported_lte_downlink_bandwidth(desc.n_prb) ||
+            desc.control_symbol_count > lte_max_pdcch_control_symbols_normal_cp(desc.n_prb)) {
             return false;
         }
         if (desc.start_symbol != 0U) {
@@ -213,6 +213,11 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
         }
         if (desc.n_tx_ports != 1U || desc.tx_mode != 1U) {
             return false;
+        }
+        for (std::uint32_t prb = 0U; prb < kLteNumPrb20MHz; ++prb) {
+            if (bitmap_has_prb(desc, prb) != (prb < desc.n_prb)) {
+                return false;
+            }
         }
         break;
     case MmseChannelType::kPbch:
@@ -273,9 +278,14 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
     return true;
 }
 
-MmseStatus validate_grid(const PlanarGridViewF32& grid) {
+MmseStatus validate_grid(const PlanarGridViewF32& grid, const ExtractDescriptor* desc) {
+    std::uint32_t expected_subcarriers = kLteNumSubcarriers20MHz;
+    if (desc != nullptr && desc->channel_type == MmseChannelType::kPdcch &&
+        is_supported_lte_downlink_bandwidth(desc->n_prb)) {
+        expected_subcarriers = lte_downlink_subcarrier_count(desc->n_prb);
+    }
     if (grid.n_rx_ant == 0U || grid.n_rx_ant > kMmseV1MaxNumRxAntennas ||
-        grid.n_symbols != kLteNumSymbolsNormalCp || grid.n_subcarriers != kLteNumSubcarriers20MHz) {
+        grid.n_symbols != kLteNumSymbolsNormalCp || grid.n_subcarriers != expected_subcarriers) {
         return MmseStatus::kInvalidArgument;
     }
     for (std::uint32_t rx = 0; rx < grid.n_rx_ant; ++rx) {
@@ -468,6 +478,7 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
     std::array<PdcchRegIndices, kMaxDataRe / mmse::pdcch::kPdcchRePerReg> physical_regs{};
     std::array<std::uint32_t, kMaxDataRe / mmse::pdcch::kPdcchRePerReg> interleaved_reg_indices{};
     std::uint32_t n_physical_regs = 0U;
+    const std::uint32_t n_subcarriers = lte_downlink_subcarrier_count(desc.n_prb);
 
     const auto append_reg = [&](std::uint32_t symbol, std::uint32_t prb,
                                 const PdcchRegIndices& tones) {
@@ -478,7 +489,7 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
                 return;
             }
             grid_indices[re_in_reg] = static_cast<std::uint16_t>(
-                symbol * kLteNumSubcarriers20MHz + prb * kLteNumSubcarriersPerPrb + tone);
+                symbol * n_subcarriers + prb * kLteNumSubcarriersPerPrb + tone);
         }
         physical_regs[n_physical_regs++] = grid_indices;
     };
@@ -499,29 +510,16 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
         PdcchRegIndices{8U, 9U, 10U, 11U},
     };
 
-    for (std::uint32_t prb = 0U; prb < kLteNumPrb20MHz; ++prb) {
-        if (!bitmap_has_prb(desc, prb)) {
-            continue;
-        }
+    for (std::uint32_t prb = 0U; prb < desc.n_prb; ++prb) {
         append_reg(0U, prb, symbol0_reg0);
-        if (desc.control_symbol_count >= 2U) {
-            append_reg(1U, prb, kLaterSymbolRegs[0]);
-        }
-        if (desc.control_symbol_count >= 3U) {
-            append_reg(2U, prb, kLaterSymbolRegs[0]);
-        }
-        if (desc.control_symbol_count >= 2U) {
-            append_reg(1U, prb, kLaterSymbolRegs[1]);
-        }
-        if (desc.control_symbol_count >= 3U) {
-            append_reg(2U, prb, kLaterSymbolRegs[1]);
+        for (std::uint32_t reg = 0U; reg < 2U; ++reg) {
+            for (std::uint32_t symbol = 1U; symbol < desc.control_symbol_count; ++symbol) {
+                append_reg(symbol, prb, kLaterSymbolRegs[reg]);
+            }
         }
         append_reg(0U, prb, symbol0_reg1);
-        if (desc.control_symbol_count >= 2U) {
-            append_reg(1U, prb, kLaterSymbolRegs[2]);
-        }
-        if (desc.control_symbol_count >= 3U) {
-            append_reg(2U, prb, kLaterSymbolRegs[2]);
+        for (std::uint32_t symbol = 1U; symbol < desc.control_symbol_count; ++symbol) {
+            append_reg(symbol, prb, kLaterSymbolRegs[2]);
         }
     }
 
@@ -695,6 +693,8 @@ void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& de
     sigma2_estimate = 0.0F;
     std::uint32_t residual_count = 0U;
     const std::uint32_t subframe = subframe_from_descriptor(desc);
+    const std::uint32_t n_subcarriers = grid.n_subcarriers;
+    const std::uint32_t n_pilot_tones = n_subcarriers / 6U;
 
     for (std::uint32_t tx = 0; tx < desc.n_tx_ports; ++tx) {
         for (std::uint32_t rx = 0; rx < desc.n_rx_ant; ++rx) {
@@ -711,41 +711,35 @@ void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& de
                     .crs_symbol_index = static_cast<std::uint8_t>(cs),
                 };
 
-                for (std::uint32_t pilot = 0; pilot < kLteNumPilotTonesPerCrsSymbol; ++pilot) {
+                for (std::uint32_t pilot = 0; pilot < n_pilot_tones; ++pilot) {
                     const std::uint32_t sc =
                         crs_subcarrier(desc.cell_id, static_cast<std::uint8_t>(tx), symbol, pilot);
                     ls[cs][pilot] =
                         cmul(grid_at(grid, rx, symbol, sc), cconj(crs_value(key, pilot)));
                 }
 
-                for (std::uint32_t pilot = 1U; pilot + 1U < kLteNumPilotTonesPerCrsSymbol;
-                     ++pilot) {
+                for (std::uint32_t pilot = 1U; pilot + 1U < n_pilot_tones; ++pilot) {
                     const Complex32 smooth =
                         cscale(cadd(ls[cs][pilot - 1U], ls[cs][pilot + 1U]), 0.5F);
                     sigma2_estimate += (2.0F / 3.0F) * cnorm2(csub(ls[cs][pilot], smooth));
                     ++residual_count;
                 }
 
-                for (std::uint32_t sc = 0; sc < kLteNumSubcarriers20MHz; ++sc) {
+                for (std::uint32_t sc = 0; sc < n_subcarriers; ++sc) {
                     const std::uint32_t offset =
                         crs_frequency_offset(desc.cell_id, static_cast<std::uint8_t>(tx), symbol);
                     const std::uint32_t lower_pilot =
-                        sc < offset
-                            ? 0U
-                            : std::min((sc - offset) / 6U, kLteNumPilotTonesPerCrsSymbol - 1U);
+                        sc < offset ? 0U : std::min((sc - offset) / 6U, n_pilot_tones - 1U);
                     const bool below_first = sc < offset;
                     const bool above_last =
                         sc > crs_subcarrier(desc.cell_id, static_cast<std::uint8_t>(tx), symbol,
-                                            kLteNumPilotTonesPerCrsSymbol - 1U);
+                                            n_pilot_tones - 1U);
                     const std::uint32_t left_pilot =
-                        below_first
-                            ? 0U
-                            : (above_last ? kLteNumPilotTonesPerCrsSymbol - 2U : lower_pilot);
+                        below_first ? 0U : (above_last ? n_pilot_tones - 2U : lower_pilot);
                     const std::uint32_t right_pilot =
                         below_first ? 1U
-                                    : (above_last ? kLteNumPilotTonesPerCrsSymbol - 1U
-                                                  : std::min(lower_pilot + 1U,
-                                                             kLteNumPilotTonesPerCrsSymbol - 1U));
+                                    : (above_last ? n_pilot_tones - 1U
+                                                  : std::min(lower_pilot + 1U, n_pilot_tones - 1U));
                     const std::uint32_t left_sc = crs_subcarrier(
                         desc.cell_id, static_cast<std::uint8_t>(tx), symbol, left_pilot);
                     const std::uint32_t right_sc = crs_subcarrier(
@@ -771,7 +765,7 @@ void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& de
                     lower = kLteNumCrsSymbols - 2U;
                     upper = kLteNumCrsSymbols - 1U;
                 }
-                for (std::uint32_t sc = 0; sc < kLteNumSubcarriers20MHz; ++sc) {
+                for (std::uint32_t sc = 0; sc < n_subcarriers; ++sc) {
                     h_full[h_index(tx, rx, symbol, sc)] =
                         lerp_symbol(symbol, kCrsSymbols[lower], freq[lower][sc], kCrsSymbols[upper],
                                     freq[upper][sc]);
@@ -825,8 +819,8 @@ void pack_equalizer_inputs(const PlanarGridViewF32& grid, const HGridStorage& h_
                            const ReLayout& layout, PackedEqualizerInputs& packed) {
     for (std::uint32_t re = 0; re < layout.n_re; ++re) {
         const std::uint32_t grid_idx = layout.grid_indices[re];
-        const std::uint32_t symbol = grid_idx / kLteNumSubcarriers20MHz;
-        const std::uint32_t sc = grid_idx % kLteNumSubcarriers20MHz;
+        const std::uint32_t symbol = grid_idx / grid.n_subcarriers;
+        const std::uint32_t sc = grid_idx % grid.n_subcarriers;
 
         const Complex32 h00 = h_full[h_index(0U, 0U, symbol, sc)];
         const Complex32 h01 = h_full[h_index(1U, 0U, symbol, sc)];
@@ -1011,7 +1005,7 @@ inline std::size_t td_h_index(std::uint32_t tx, std::uint32_t rx, std::uint32_t 
 
 inline Complex32 td_grid_at(const PlanarGridViewF32& grid, std::uint32_t rx, std::uint32_t symbol,
                             std::uint32_t sc) {
-    const std::size_t idx = static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz + sc;
+    const std::size_t idx = static_cast<std::size_t>(symbol) * grid.n_subcarriers + sc;
     return {grid.re[rx][idx], grid.im[rx][idx]};
 }
 
@@ -1099,10 +1093,10 @@ detail::TransmitDiversityEqualizePair
 demap_transmit_diversity_from_grid(const HGridStorage& h_full, const PlanarGridViewF32& grid,
                                    std::uint16_t grid_index0, std::uint16_t grid_index1,
                                    float sigma2, float det_floor, float g_min, float gamma_max) {
-    const std::uint32_t symbol0 = grid_index0 / kLteNumSubcarriers20MHz;
-    const std::uint32_t sc0 = grid_index0 % kLteNumSubcarriers20MHz;
-    const std::uint32_t symbol1 = grid_index1 / kLteNumSubcarriers20MHz;
-    const std::uint32_t sc1 = grid_index1 % kLteNumSubcarriers20MHz;
+    const std::uint32_t symbol0 = grid_index0 / grid.n_subcarriers;
+    const std::uint32_t sc0 = grid_index0 % grid.n_subcarriers;
+    const std::uint32_t symbol1 = grid_index1 / grid.n_subcarriers;
+    const std::uint32_t sc1 = grid_index1 % grid.n_subcarriers;
     return detail::demap_transmit_diversity_mmse_scalar(
         h_full[td_h_index(0U, 0U, symbol0, sc0)], h_full[td_h_index(1U, 0U, symbol0, sc0)],
         grid.n_rx_ant > 1U ? h_full[td_h_index(0U, 1U, symbol0, sc0)] : Complex32{},
@@ -1310,7 +1304,7 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
     if (!impl_->initialized) {
         return MmseStatus::kNotInitialized;
     }
-    if (const MmseStatus status = detail::validate_grid(grid); status != MmseStatus::kOk) {
+    if (const MmseStatus status = detail::validate_grid(grid, &desc); status != MmseStatus::kOk) {
         return status;
     }
     if (const MmseStatus status = detail::validate_output(out); status != MmseStatus::kOk) {
@@ -1692,7 +1686,8 @@ MmseStatus MmseEqualizerCpuContext::run_pdcch_td(const PdcchMmseInput& in,
     desc.control_re_exclusion_masks = in.control_re_exclusion_masks;
     desc.pmi = -1;
 
-    if (const MmseStatus status = detail::validate_grid(in.grid); status != MmseStatus::kOk) {
+    if (const MmseStatus status = detail::validate_grid(in.grid, &desc);
+        status != MmseStatus::kOk) {
         return status;
     }
 

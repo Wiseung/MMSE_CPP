@@ -1,0 +1,9 @@
+{
+  "cmake.useCMakePresets": "never",
+  "cmake.enableAutomaticKitScan": false,
+  "cmake.useVsDeveloperEnvironment": "always",
+  "cmake.generator": "Visual Studio 17 2022",
+  "cmake.configureArgs": ["-A", "x64"],
+  "cmake.buildDirectory": "${workspaceFolder}/out/build/cmake-tools",
+  "cmake.configureOnOpen": true
+}

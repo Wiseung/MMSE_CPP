@@ -1951,7 +1951,8 @@ MmseStatus MmseEqualizerGpuContext::run_pdcch(const PdcchMmseInput& in, PdcchMms
         status != MmseStatus::kOk) {
         return status;
     }
-    if (in.n_tx_ports != 1U) {
+    if (in.n_prb != kLteNumPrb20MHz || in.control_symbol_count > kLteMaxControlSymbolsNormalCp ||
+        in.n_tx_ports != 1U) {
         return MmseStatus::kUnsupportedConfig;
     }
 
@@ -2019,7 +2020,8 @@ MmseStatus MmseEqualizerGpuContext::run_pdcch_td(const PdcchMmseInput& in,
         status != MmseStatus::kOk) {
         return status;
     }
-    if (in.n_tx_ports != 2U) {
+    if (in.n_prb != kLteNumPrb20MHz || in.control_symbol_count > kLteMaxControlSymbolsNormalCp ||
+        in.n_tx_ports != 2U) {
         return MmseStatus::kUnsupportedConfig;
     }
     if (impl_->config.backend == MmseGpuBackend::kAuto) {

@@ -58,7 +58,7 @@ struct FrontendPdcchIndication {
 struct BackendPdcchEqualizedIndication {
     std::uint32_t sfn_subframe = 0;
     std::uint16_t cell_id = 0;
-    std::uint16_t n_prb = 0;
+    std::uint16_t n_prb = kLteNumPrb20MHz;
     std::uint8_t n_tx_ports = 0;
     std::uint8_t n_rx_ant = 0;
     std::uint8_t n_layers = 0;
@@ -76,7 +76,7 @@ struct BackendPdcchEqualizedIndication {
 struct BackendPdcchDescrambledLlrIndication {
     std::uint32_t sfn_subframe = 0;
     std::uint16_t cell_id = 0;
-    std::uint16_t n_prb = 0;
+    std::uint16_t n_prb = kLteNumPrb20MHz;
     std::uint8_t n_tx_ports = 0;
     std::uint8_t n_rx_ant = 0;
     std::uint8_t n_layers = 0;
@@ -92,7 +92,7 @@ struct BackendPdcchDescrambledLlrIndication {
 struct BackendPdcchTdEqualizedIndication {
     std::uint32_t sfn_subframe = 0;
     std::uint16_t cell_id = 0;
-    std::uint16_t n_prb = 0;
+    std::uint16_t n_prb = kLteNumPrb20MHz;
     std::uint8_t n_tx_ports = 0;
     std::uint8_t n_rx_ant = 0;
     std::uint8_t n_layers = 0;
@@ -111,7 +111,7 @@ struct BackendPdcchTdEqualizedIndication {
 struct BackendPdcchTdDescrambledLlrIndication {
     std::uint32_t sfn_subframe = 0;
     std::uint16_t cell_id = 0;
-    std::uint16_t n_prb = 0;
+    std::uint16_t n_prb = kLteNumPrb20MHz;
     std::uint8_t n_tx_ports = 0;
     std::uint8_t n_rx_ant = 0;
     std::uint8_t n_layers = 0;
@@ -346,6 +346,7 @@ struct PdcchSiRntiGeometrySearchRequest {
     std::uint16_t cell_id = 0;
     std::uint8_t n_tx_ports = 1;
     std::uint8_t tx_mode = 1;
+    std::uint16_t n_prb = kLteNumPrb20MHz;
     LteControlSubframeContext control_subframe{};
     PdcchChainMetadata chain{};
 };
@@ -359,6 +360,7 @@ struct PdcchSiRntiGeometrySearchCache {
     std::uint16_t cell_id = 0;
     std::uint8_t n_tx_ports = 0;
     std::uint8_t tx_mode = 0;
+    std::uint16_t n_prb = 0;
     LteControlSubframeKind subframe_kind = LteControlSubframeKind::kRegular;
     PdcchControlGeometry geometry{};
     std::uint8_t consecutive_miss_count = 0;

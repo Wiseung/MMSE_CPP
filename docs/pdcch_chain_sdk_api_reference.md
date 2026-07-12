@@ -476,7 +476,7 @@ helper 打包得到的正式下游 owning DTO。
 | `PdcchCandidateLlr`                   | 表示单个候选的 descrambled `LLR` 切片      | `encoded_bit_count == 72 * aggregation_level`                |
 | `PdcchRateRecoveredLlr`               | 表示候选速率恢复后的卷积码输入软比特       | 支持 `L=1/2/4/8`；输出顺序固定为 `kLteRateRecoveredTriplets` |
 | `PdcchTailBitingConvolutionalDecoder` | 可选外部尾咬卷积码覆盖器                   | 未设置时使用内建 `64-state` 尾咬 Viterbi                     |
-| `PdcchDciFormat1AConfig`              | `DCI 1A` 解析配置                          | 当前 payload 位宽仅文档化 `20 MHz`                           |
+| `PdcchDciFormat1AConfig`              | `DCI 1A` 解析配置                          | FDD/no-CIF支持 6/15/25/50/75/100 RB；其它组合仍限 100 RB     |
 | `PdcchDciFormat1ADecodeResult`        | `CRC-RNTI + DCI 1A` 校验与解析结果         | 只有 `matched == true` 才表示命中                            |
 | `PdcchCommonSearchDecodeConfig`       | 正式 CPU `common search DCI 1A` 入口配置   | `decoder.decode` 可选；默认内建 Viterbi                      |
 | `PdcchSiRntiSearchConfig`             | 固定 SI-RNTI 搜索入口配置                  | 仅允许外部 decoder 覆盖                                      |
@@ -485,8 +485,8 @@ helper 打包得到的正式下游 owning DTO。
 | `PdcchUeSpecificSearchConfig`         | UE-specific DCI 1A 搜索配置                | `rntis` 必须非空、唯一且不含 `0` 或 `kSiRnti`                |
 | `PdcchUeSpecificSearchResult`         | UE-specific 搜索输出                       | 报告候选、译码、CRC miss、语义拒绝和命中统计                 |
 | `PdcchControlGeometry`                | 可搜索或锁定的控制区几何                   | 包含 CFI、PHICH resource/duration 与标准 REG 顺序标记        |
-| `PdcchSiRntiGeometrySearchRequest`    | 未知几何 SI-RNTI 搜索输入                  | 当前仅 `20 MHz / FDD / normal CP`                            |
-| `PdcchSiRntiGeometrySearchCache`      | 调用方持有的几何锁定 cache                 | PCI、端口、发射模式或子帧类型变化时失效                      |
+| `PdcchSiRntiGeometrySearchRequest`    | 未知几何 SI-RNTI 搜索输入                  | CPU 支持 6/15/25/50/75/100 RB、FDD、normal CP                |
+| `PdcchSiRntiGeometrySearchCache`      | 调用方持有的几何锁定 cache                 | PCI、端口、发射模式、带宽或子帧类型变化时失效                |
 | `PdcchSiRntiGeometrySearchResult`     | 未知几何搜索诊断和命中                     | 状态为 `kAcquired/kLocked/kMiss/kAmbiguous`                  |
 
 ## 3. 基础网格类型
@@ -503,8 +503,11 @@ helper 打包得到的正式下游 owning DTO。
 
 内存布局：
 
-- 一个平面的索引方式是 `symbol * 1200 + subcarrier`
+- 一个 CPU PDCCH 平面的索引方式是 `symbol * n_subcarriers + subcarrier`
 - 所有值都以线性 float32 复数平面存储
+
+CPU PDCCH 的 `n_subcarriers` 为 `12 * n_prb`，其中 `n_prb` 只能是
+`6/15/25/50/75/100`；GPU PDCCH 仍要求 `1200` 子载波和 `100 RB`。
 
 ## 4. Helper 语义
 
