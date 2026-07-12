@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -134,6 +135,16 @@ PlanarGridViewF32 make_grid_view(const GridBuffers& buffers) {
     return grid;
 }
 
+PlanarGridViewF32 make_single_rx_grid_view(const GridBuffers& buffers) {
+    PlanarGridViewF32 grid{};
+    grid.re = {buffers.re[0].data(), nullptr};
+    grid.im = {buffers.im[0].data(), nullptr};
+    grid.n_rx_ant = 1U;
+    grid.n_symbols = kLteNumSymbolsNormalCp;
+    grid.n_subcarriers = kLteNumSubcarriers20MHz;
+    return grid;
+}
+
 ExtractDescriptor make_fullband_desc() {
     ExtractDescriptor desc{};
     desc.cell_id = 0;
@@ -245,6 +256,19 @@ std::vector<std::uint8_t> reference_gold_sequence(std::uint32_t c_init, std::uin
     }
 
     return seq;
+}
+
+Complex32 reference_crs_value(std::uint16_t cell_id, std::uint8_t subframe, std::uint8_t port,
+                              std::uint8_t symbol, std::uint32_t pilot_index) {
+    const std::uint32_t slot = 2U * subframe + (symbol >= 7U ? 1U : 0U);
+    const std::uint32_t slot_symbol = symbol % 7U;
+    const std::uint32_t c_init =
+        (1U << 10U) * (7U * (slot + 1U) + slot_symbol + 1U) * (2U * cell_id + 1U) + 2U * cell_id +
+        1U;
+    const std::vector<std::uint8_t> bits = reference_gold_sequence(c_init, 2U * (pilot_index + 1U));
+    constexpr float scale = 0.7071067811865475F;
+    return {scale * (bits[2U * pilot_index] == 0U ? 1.0F : -1.0F),
+            scale * (bits[2U * pilot_index + 1U] == 0U ? 1.0F : -1.0F)};
 }
 
 void expect_bits_match_binary_string(const std::vector<std::uint8_t>& bits, const char* expected,
@@ -399,6 +423,45 @@ std::vector<float> reference_pdcch_convolutional_rate_match(const std::vector<fl
     return output;
 }
 
+std::uint8_t reference_parity(std::uint32_t value) {
+    return static_cast<std::uint8_t>(std::popcount(value) & 1U);
+}
+
+std::vector<std::uint8_t>
+reference_pdcch_tail_biting_convolutional_encode(const std::vector<std::uint8_t>& bits) {
+    constexpr std::array<std::uint8_t, 3> kGenerators = {0133U, 0171U, 0165U};
+    expect_true(bits.size() >= 6U, "reference tail-biting encoder input length");
+    std::uint32_t state = 0U;
+    for (std::uint32_t delay = 0U; delay < 6U; ++delay) {
+        expect_true(bits[bits.size() - 1U - delay] <= 1U,
+                    "reference tail-biting encoder binary input");
+        state |= static_cast<std::uint32_t>(bits[bits.size() - 1U - delay]) << delay;
+    }
+
+    std::vector<std::uint8_t> encoded{};
+    encoded.reserve(bits.size() * kGenerators.size());
+    for (const std::uint8_t bit : bits) {
+        expect_true(bit <= 1U, "reference tail-biting encoder binary bit");
+        const std::uint32_t shift_register = (state << 1U) | bit;
+        for (const std::uint8_t generator : kGenerators) {
+            encoded.push_back(reference_parity(shift_register & generator));
+        }
+        state = shift_register & 0x3FU;
+    }
+    return encoded;
+}
+
+std::vector<float> reference_llrs_from_encoded_bits(const std::vector<std::uint8_t>& encoded,
+                                                    float magnitude) {
+    std::vector<float> llrs{};
+    llrs.reserve(encoded.size());
+    for (const std::uint8_t bit : encoded) {
+        expect_true(bit <= 1U, "reference encoded bit must be binary");
+        llrs.push_back(bit != 0U ? magnitude : -magnitude);
+    }
+    return llrs;
+}
+
 void append_bits(std::vector<std::uint8_t>& bits, std::uint32_t value, std::uint8_t width) {
     for (std::uint8_t bit = 0U; bit < width; ++bit) {
         const std::uint8_t shift = static_cast<std::uint8_t>(width - 1U - bit);
@@ -494,6 +557,36 @@ fixed_tail_biting_decoder(void* context,
     return MmseStatus::kOk;
 }
 
+struct SelectiveTailBitingDecoder {
+    std::vector<float> expected_llrs{};
+    std::vector<std::uint8_t> matched_bits{};
+    std::vector<std::uint8_t> miss_bits{};
+    std::uint32_t call_count = 0U;
+};
+
+MmseStatus selective_tail_biting_decoder(
+    void* context, const mmse::pdcch::PdcchTailBitingConvolutionalDecodeRequest& request) {
+    auto* decoder = static_cast<SelectiveTailBitingDecoder*>(context);
+    if (decoder == nullptr || request.convolutional_llrs == nullptr ||
+        request.decoded_bits == nullptr || !request.tail_biting ||
+        request.convolutional_llr_count != decoder->expected_llrs.size() ||
+        request.decoded_bit_count != decoder->matched_bits.size() ||
+        decoder->miss_bits.size() != decoder->matched_bits.size()) {
+        return MmseStatus::kInternalError;
+    }
+    bool matches = true;
+    for (std::uint32_t llr = 0U; llr < request.convolutional_llr_count; ++llr) {
+        if (std::fabs(request.convolutional_llrs[llr] - decoder->expected_llrs[llr]) > 1.0e-4F) {
+            matches = false;
+            break;
+        }
+    }
+    const std::vector<std::uint8_t>& output = matches ? decoder->matched_bits : decoder->miss_bits;
+    std::copy(output.begin(), output.end(), request.decoded_bits);
+    ++decoder->call_count;
+    return MmseStatus::kOk;
+}
+
 void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor& desc, float data0,
                            float data1) {
     mmse::detail::ensure_crs_tables();
@@ -507,6 +600,7 @@ void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor& desc, 
                 sc % 6U == mmse::detail::crs_frequency_offset(desc.cell_id, 0U,
                                                               static_cast<std::uint8_t>(symbol));
             const bool is_port1_crs =
+                desc.n_tx_ports > 1U &&
                 mmse::detail::is_crs_re(desc.cell_id, static_cast<std::uint8_t>(symbol), sc) &&
                 sc % 6U == mmse::detail::crs_frequency_offset(desc.cell_id, 1U,
                                                               static_cast<std::uint8_t>(symbol));
@@ -620,16 +714,12 @@ void fill_constant_mimo_channel(GridBuffers& buffers, const ExtractDescriptor& d
     }
 }
 
-void fill_pdcch_td_pair(GridBuffers& buffers, const ExtractDescriptor& desc, std::uint16_t grid0,
-                        std::uint16_t grid1, Complex32 h00, Complex32 h01, Complex32 h10,
-                        Complex32 h11, Complex32 s0, Complex32 s1) {
+void fill_td_pair(GridBuffers& buffers, std::uint16_t grid0, std::uint16_t grid1, Complex32 h00,
+                  Complex32 h01, Complex32 h10, Complex32 h11, Complex32 s0, Complex32 s1) {
     const std::uint32_t symbol0 = grid0 / kLteNumSubcarriers20MHz;
     const std::uint32_t sc0 = grid0 % kLteNumSubcarriers20MHz;
     const std::uint32_t symbol1 = grid1 / kLteNumSubcarriers20MHz;
     const std::uint32_t sc1 = grid1 % kLteNumSubcarriers20MHz;
-    expect_true(symbol0 == symbol1, "td pair must stay in one symbol");
-    expect_true(sc1 == sc0 + 1U, "td pair must be adjacent");
-
     const Complex32 y0_k0 =
         mmse::detail::cadd(mmse::detail::cmul(h00, s0), mmse::detail::cmul(h01, s1));
     const Complex32 y1_k0 =
@@ -648,6 +738,28 @@ void fill_pdcch_td_pair(GridBuffers& buffers, const ExtractDescriptor& desc, std
     buffers.im[0][grid1] = y0_k1.im;
     buffers.re[1][grid1] = y1_k1.re;
     buffers.im[1][grid1] = y1_k1.im;
+}
+
+void fill_pdcch_td_pair(GridBuffers& buffers, const ExtractDescriptor& desc, std::uint16_t grid0,
+                        std::uint16_t grid1, Complex32 h00, Complex32 h01, Complex32 h10,
+                        Complex32 h11, Complex32 s0, Complex32 s1) {
+    (void)desc;
+    const std::uint32_t symbol0 = grid0 / kLteNumSubcarriers20MHz;
+    const std::uint32_t symbol1 = grid1 / kLteNumSubcarriers20MHz;
+    const std::uint32_t sc0 = grid0 % kLteNumSubcarriers20MHz;
+    const std::uint32_t sc1 = grid1 % kLteNumSubcarriers20MHz;
+    expect_true(symbol0 == symbol1, "td pair must stay in one symbol");
+    expect_true(sc1 == sc0 + 1U, "td pair must be adjacent");
+    fill_td_pair(buffers, grid0, grid1, h00, h01, h10, h11, s0, s1);
+}
+
+void fill_td_layout(GridBuffers& buffers, const mmse::detail::ReLayout& layout, Complex32 h00,
+                    Complex32 h01, Complex32 h10, Complex32 h11, Complex32 s0, Complex32 s1) {
+    expect_true((layout.n_re & 1U) == 0U, "td layout must have even RE count");
+    for (std::uint32_t i = 0U; i < layout.n_re; i += 2U) {
+        fill_td_pair(buffers, layout.grid_indices[i], layout.grid_indices[i + 1U], h00, h01, h10,
+                     h11, s0, s1);
+    }
 }
 
 void fill_pdcch_td_layout(GridBuffers& buffers, const ExtractDescriptor& desc,
@@ -722,6 +834,142 @@ void test_single_layer_identity_channel_equalization() {
     if (!(out.sinr[0] > 10.0F)) {
         throw TestFailure{"high SINR expected actual=" + std::to_string(out.sinr[0])};
     }
+}
+
+void test_single_rx_single_layer_equalization_and_pdcch() {
+    GridBuffers buffers = make_zero_grid();
+    auto desc = make_fullband_desc();
+    desc.n_tx_ports = 1U;
+    desc.n_rx_ant = 1U;
+    desc.n_layers = 1U;
+    desc.tx_mode = 1U;
+    fill_identity_channel(buffers, desc, 0.75F, 0.0F);
+    const PlanarGridViewF32 single_rx_grid = make_single_rx_grid_view(buffers);
+
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.backend = MmseCpuBackend::kScalar;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "single-rx cpu init");
+
+    constexpr std::uint32_t kCapacity = 20000U;
+    std::vector<float> cpu_re(kCapacity), cpu_im(kCapacity), cpu_sinr(kCapacity);
+    EqualizerOutputView cpu_out{cpu_re.data(), cpu_im.data(), cpu_sinr.data(), kCapacity};
+    expect_true(cpu.run(single_rx_grid, desc, cpu_out) == MmseStatus::kOk,
+                "single-rx single-layer cpu run");
+    expect_near(cpu_re[0], 0.75F, 1.0e-3F, "single-rx cpu xhat real");
+    expect_near(cpu_im[0], 0.0F, 1.0e-5F, "single-rx cpu xhat imag");
+    expect_true(cpu_sinr[0] > 10.0F, "single-rx cpu sinr");
+
+    auto unsupported_desc = desc;
+    unsupported_desc.n_tx_ports = 2U;
+    unsupported_desc.n_layers = 2U;
+    expect_true(cpu.run(single_rx_grid, unsupported_desc, cpu_out) ==
+                    MmseStatus::kUnsupportedConfig,
+                "single-rx must reject two-layer spatial multiplexing");
+
+    auto pdcch_desc = make_pdcch_desc();
+    pdcch_desc.n_rx_ant = 1U;
+    PdcchMmseInput pdcch_in{};
+    pdcch_in.grid = single_rx_grid;
+    pdcch_in.sfn_subframe = pdcch_desc.sfn_subframe;
+    pdcch_in.cell_id = pdcch_desc.cell_id;
+    pdcch_in.n_tx_ports = pdcch_desc.n_tx_ports;
+    pdcch_in.tx_mode = pdcch_desc.tx_mode;
+    pdcch_in.control_symbol_count = pdcch_desc.control_symbol_count;
+    pdcch_in.n_prb = pdcch_desc.n_prb;
+    pdcch_in.prb_bitmap = pdcch_desc.prb_bitmap;
+    pdcch_in.control_re_exclusion_masks = pdcch_desc.control_re_exclusion_masks;
+    pdcch_in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                                 .subframe =
+                                     static_cast<std::uint8_t>(pdcch_desc.sfn_subframe % 10U),
+                                 .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    std::vector<float> pdcch_re(3168U), pdcch_im(3168U), pdcch_sinr(3168U);
+    std::vector<std::uint16_t> pdcch_indices(3168U);
+    PdcchMmseOutputView pdcch_out{pdcch_re.data(),      pdcch_im.data(), pdcch_sinr.data(),
+                                  pdcch_indices.data(), 3168U,           3168U};
+    PdcchMmseResult pdcch_meta{};
+    expect_true(cpu.run_pdcch(pdcch_in, pdcch_out, pdcch_meta) == MmseStatus::kOk,
+                "single-rx pdcch run");
+    expect_true(pdcch_meta.n_rx_ant == 1U && pdcch_meta.n_re == 3168U, "single-rx pdcch metadata");
+
+    GridBuffers pbch_buffers = make_zero_grid();
+    const auto pbch_desc = make_pbch_desc();
+    fill_identity_channel(pbch_buffers, pbch_desc, 0.5F, 0.0F);
+    PbchMmseInput pbch_in{};
+    pbch_in.grid = make_single_rx_grid_view(pbch_buffers);
+    pbch_in.sfn_subframe = pbch_desc.sfn_subframe;
+    pbch_in.cell_id = pbch_desc.cell_id;
+    pbch_in.n_tx_ports = pbch_desc.n_tx_ports;
+    pbch_in.tx_mode = pbch_desc.tx_mode;
+    std::vector<float> pbch_re(240U), pbch_im(240U), pbch_sinr(240U);
+    std::vector<std::uint16_t> pbch_indices(240U);
+    PbchMmseOutputView pbch_out{pbch_re.data(),      pbch_im.data(), pbch_sinr.data(),
+                                pbch_indices.data(), 240U,           240U};
+    PbchMmseResult pbch_meta{};
+    expect_true(cpu.run_pbch(pbch_in, pbch_out, pbch_meta) == MmseStatus::kOk,
+                "single-rx pbch run");
+    expect_true(pbch_meta.n_rx_ant == 1U && pbch_meta.n_re == 240U, "single-rx pbch metadata");
+
+    GridBuffers pcfich_buffers = make_zero_grid();
+    const auto pcfich_desc = make_pcfich_desc();
+    fill_identity_channel(pcfich_buffers, pcfich_desc, 0.5F, 0.0F);
+    PcfichMmseInput pcfich_in{};
+    pcfich_in.grid = make_single_rx_grid_view(pcfich_buffers);
+    pcfich_in.sfn_subframe = pcfich_desc.sfn_subframe;
+    pcfich_in.cell_id = pcfich_desc.cell_id;
+    pcfich_in.n_tx_ports = pcfich_desc.n_tx_ports;
+    pcfich_in.tx_mode = pcfich_desc.tx_mode;
+    std::vector<float> pcfich_re(16U), pcfich_im(16U), pcfich_sinr(16U);
+    std::vector<std::uint16_t> pcfich_indices(16U);
+    PcfichMmseOutputView pcfich_out{
+        pcfich_re.data(), pcfich_im.data(), pcfich_sinr.data(), pcfich_indices.data(), 16U, 16U};
+    PcfichMmseResult pcfich_meta{};
+    expect_true(cpu.run_pcfich(pcfich_in, pcfich_out, pcfich_meta) == MmseStatus::kOk,
+                "single-rx pcfich run");
+    expect_true(pcfich_meta.n_rx_ant == 1U && pcfich_meta.n_re == 16U, "single-rx pcfich metadata");
+
+    GridBuffers td_buffers = make_zero_grid();
+    auto td_desc = make_pdcch_desc();
+    td_desc.n_rx_ant = 1U;
+    td_desc.n_tx_ports = 2U;
+    td_desc.tx_mode = 2U;
+    fill_identity_channel(td_buffers, td_desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout td_layout{};
+    const std::uint32_t td_re_count = mmse::detail::build_pdcch_re_layout(td_desc, td_layout);
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+    fill_pdcch_td_layout(td_buffers, td_desc, td_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                         {0.0F, 0.0F}, s0, s1);
+    PdcchMmseInput td_in = pdcch_in;
+    td_in.grid = make_single_rx_grid_view(td_buffers);
+    td_in.n_tx_ports = td_desc.n_tx_ports;
+    td_in.tx_mode = td_desc.tx_mode;
+    std::vector<float> td_re(td_re_count), td_im(td_re_count), td_sinr(td_re_count);
+    std::vector<std::uint16_t> td_grid0(td_re_count), td_grid1(td_re_count);
+    PdcchTdMmseOutputView td_out{td_re.data(),    td_im.data(),    td_sinr.data(),
+                                 td_grid0.data(), td_grid1.data(), td_re_count};
+    PdcchTdMmseResult td_meta{};
+    expect_true(cpu.run_pdcch_td(td_in, td_out, td_meta) == MmseStatus::kOk,
+                "single-rx pdcch transmit-diversity run");
+    expect_near(td_re[0], s0.re, 1.0e-3F, "single-rx td symbol0 real");
+    expect_near(td_im[0], s0.im, 1.0e-3F, "single-rx td symbol0 imag");
+    expect_near(td_re[1], s1.re, 1.0e-3F, "single-rx td symbol1 real");
+    expect_near(td_im[1], s1.im, 1.0e-3F, "single-rx td symbol1 imag");
+
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kAuto;
+    gpu_config.sigma2_min = cpu_config.sigma2_min;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "single-rx gpu auto init");
+    std::vector<float> gpu_re(kCapacity), gpu_im(kCapacity), gpu_sinr(kCapacity);
+    EqualizerOutputView gpu_out{gpu_re.data(), gpu_im.data(), gpu_sinr.data(), kCapacity};
+    expect_true(gpu.run(single_rx_grid, desc, gpu_out) == MmseStatus::kOk,
+                "single-rx gpu auto run");
+    expect_near(gpu_re[0], cpu_re[0], 1.0e-3F, "single-rx gpu xhat real");
+    expect_near(gpu_im[0], cpu_im[0], 1.0e-5F, "single-rx gpu xhat imag");
+    expect_near(gpu_sinr[0], cpu_sinr[0], 1.0e-2F, "single-rx gpu sinr");
 }
 
 void test_two_layer_constant_channel_matches_golden() {
@@ -1074,6 +1322,89 @@ void test_pcfich_layout_matches_four_regs_without_crs() {
     }
 }
 
+void test_single_port_lte_control_reference_vector() {
+    const auto pdcch_desc = make_pdcch_desc();
+    mmse::detail::ReLayout pdcch_layout{};
+    expect_true(mmse::detail::build_pdcch_re_layout(pdcch_desc, pdcch_layout) == 3168U,
+                "single-port pdcch reference RE count");
+    constexpr std::array<std::uint16_t, 36> kFirstCceGridIndices = {
+        601U,  602U,  604U,  605U,  1U,    2U,    4U,    5U,    901U,  902U,  904U,  905U,
+        301U,  302U,  304U,  305U,  3148U, 3149U, 3150U, 3151U, 2548U, 2549U, 2550U, 2551U,
+        3448U, 3449U, 3450U, 3451U, 2848U, 2849U, 2850U, 2851U, 3072U, 3073U, 3074U, 3075U,
+    };
+    for (std::uint32_t i = 0U; i < kFirstCceGridIndices.size(); ++i) {
+        expect_true(pdcch_layout.grid_indices[i] == kFirstCceGridIndices[i],
+                    "single-port pdcch first CCE REG order");
+    }
+
+    const auto pbch_desc = make_pbch_desc();
+    mmse::detail::ReLayout pbch_layout{};
+    expect_true(mmse::detail::build_pbch_re_layout(pbch_desc, pbch_layout) == 240U,
+                "single-port pbch reference RE count");
+    constexpr std::array<std::uint16_t, 8> kPbchPrefixGridIndices = {
+        8965U, 8966U, 8968U, 8969U, 8971U, 8972U, 8974U, 8975U,
+    };
+    for (std::uint32_t i = 0U; i < kPbchPrefixGridIndices.size(); ++i) {
+        expect_true(pbch_layout.grid_indices[i] == kPbchPrefixGridIndices[i],
+                    "single-port pbch CRS holes");
+    }
+
+    const auto pcfich_desc = make_pcfich_desc();
+    mmse::detail::ReLayout pcfich_layout{};
+    expect_true(mmse::detail::build_pcfich_re_layout(pcfich_desc, pcfich_layout) == 16U,
+                "single-port pcfich reference RE count");
+    constexpr std::array<std::uint16_t, 16> kPcfichGridIndices = {
+        1U, 2U, 4U, 5U, 301U, 302U, 304U, 305U, 601U, 602U, 604U, 605U, 901U, 902U, 904U, 905U,
+    };
+    for (std::uint32_t i = 0U; i < kPcfichGridIndices.size(); ++i) {
+        expect_true(pcfich_layout.grid_indices[i] == kPcfichGridIndices[i],
+                    "single-port pcfich REG CRS holes");
+    }
+
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, pdcch_desc, 0.75F, 0.0F);
+    const PlanarGridViewF32 grid = make_grid_view(buffers);
+    static mmse::detail::HGridStorage h_full{};
+    float sigma2_estimate = 0.0F;
+    mmse::detail::estimate_channel(grid, pdcch_desc, h_full, sigma2_estimate);
+    expect_near(sigma2_estimate, 0.0F, 1.0e-7F,
+                "single-port noise estimate must ignore absent port-one CRS");
+
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1U;
+    config.backend = MmseCpuBackend::kScalar;
+    config.sigma2_min = 1.0e-5F;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "single-port reference cpu init");
+
+    std::vector<float> xre(3168U), xim(3168U), sinr(3168U);
+    std::vector<std::uint16_t> indices(3168U);
+    PdcchMmseOutputView out{xre.data(), xim.data(), sinr.data(), indices.data(), 3168U, 3168U};
+    PdcchMmseInput input{};
+    input.grid = grid;
+    input.sfn_subframe = pdcch_desc.sfn_subframe;
+    input.cell_id = pdcch_desc.cell_id;
+    input.n_tx_ports = pdcch_desc.n_tx_ports;
+    input.tx_mode = pdcch_desc.tx_mode;
+    input.control_symbol_count = pdcch_desc.control_symbol_count;
+    input.n_prb = pdcch_desc.n_prb;
+    input.prb_bitmap = pdcch_desc.prb_bitmap;
+    input.control_re_exclusion_masks = pdcch_desc.control_re_exclusion_masks;
+    input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                              .subframe = static_cast<std::uint8_t>(pdcch_desc.sfn_subframe % 10U),
+                              .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    PdcchMmseResult meta{};
+    expect_true(ctx.run_pdcch(input, out, meta) == MmseStatus::kOk,
+                "single-port reference pdcch run");
+    expect_near(meta.sigma2, config.sigma2_min, 1.0e-7F, "single-port sigma2 floor");
+    expect_near(xre[0], 0.75F, 1.0e-3F, "single-port equalized symbol");
+    expect_near(xim[0], 0.0F, 1.0e-5F, "single-port equalized symbol imaginary part");
+    expect_true(sinr[0] > 0.99F * config.gamma_max, "single-port equalized SINR");
+    for (std::uint32_t i = 0U; i < kFirstCceGridIndices.size(); ++i) {
+        expect_true(indices[i] == kFirstCceGridIndices[i], "single-port pdcch output CCE order");
+    }
+}
+
 void test_pdcch_cpu_run_supports_single_port_and_generic_two_port_layout() {
     MmseEqualizerCpuContext ctx;
     MmseEqualizerCpuConfig config{};
@@ -1098,9 +1429,8 @@ void test_pdcch_cpu_run_supports_single_port_and_generic_two_port_layout() {
     auto two_port = desc;
     two_port.n_tx_ports = 2U;
     two_port.tx_mode = 2U;
-    expect_true(ctx.run(grid, two_port, out) == MmseStatus::kOk,
-                "generic run should allow two-port pdcch backend path");
-    expect_true(out.n_re_per_layer == 3168U, "two-port generic pdcch RE count");
+    expect_true(ctx.run(grid, two_port, out) == MmseStatus::kUnsupportedConfig,
+                "generic run must reject two-port pdcch transmit diversity");
 }
 
 void test_pbch_frontend_dto_builds_mmse_input() {
@@ -1279,6 +1609,319 @@ void test_pcfich_cpu_run_returns_equalized_pcfich_surface() {
     expect_true(meta.chain.request_id == in.chain.request_id, "pcfich cpu chain");
 }
 
+void test_crs_values_match_independent_reference() {
+    mmse::detail::ensure_crs_tables();
+    struct CrsCase {
+        std::uint16_t cell_id;
+        std::uint8_t subframe;
+        std::uint8_t port;
+        std::uint8_t symbol_index;
+        std::uint32_t pilot;
+    };
+    const std::array cases = {
+        CrsCase{0U, 0U, 0U, 0U, 0U},
+        CrsCase{1U, 3U, 1U, 1U, 17U},
+        CrsCase{42U, 7U, 0U, 2U, 86U},
+        CrsCase{503U, 9U, 1U, 3U, 199U},
+    };
+    for (const CrsCase& item : cases) {
+        const std::uint8_t symbol = mmse::detail::kCrsSymbols[item.symbol_index];
+        const Complex32 expected =
+            reference_crs_value(item.cell_id, item.subframe, item.port, symbol, item.pilot);
+        const Complex32 actual = mmse::detail::crs_value({.cell_id = item.cell_id,
+                                                          .subframe = item.subframe,
+                                                          .port = item.port,
+                                                          .crs_symbol_index = item.symbol_index},
+                                                         item.pilot);
+        expect_near(actual.re, expected.re, 1.0e-6F, "independent CRS real");
+        expect_near(actual.im, expected.im, 1.0e-6F, "independent CRS imag");
+    }
+}
+
+void test_channel_interpolation_extrapolates_linearly() {
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 1U;
+    desc.n_rx_ant = 1U;
+    desc.tx_mode = 1U;
+    desc.sfn_subframe = 6U;
+    GridBuffers buffers = make_zero_grid();
+    const auto channel_at = [](std::uint32_t symbol, std::uint32_t sc) {
+        return Complex32{
+            0.25F + 0.02F * static_cast<float>(symbol) + 0.001F * static_cast<float>(sc),
+            -0.15F + 0.01F * static_cast<float>(symbol) - 0.0005F * static_cast<float>(sc)};
+    };
+    for (std::uint32_t cs = 0U; cs < mmse::detail::kCrsSymbols.size(); ++cs) {
+        const std::uint8_t symbol = mmse::detail::kCrsSymbols[cs];
+        for (std::uint32_t pilot = 0U; pilot < kLteNumPilotTonesPerCrsSymbol; ++pilot) {
+            const std::uint32_t sc = mmse::detail::crs_subcarrier(desc.cell_id, 0U, symbol, pilot);
+            const Complex32 sample = mmse::detail::cmul(
+                channel_at(symbol, sc),
+                mmse::detail::crs_value(
+                    {.cell_id = desc.cell_id,
+                     .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                     .port = 0U,
+                     .crs_symbol_index = static_cast<std::uint8_t>(cs)},
+                    pilot));
+            const std::size_t index =
+                static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz + sc;
+            buffers.re[0][index] = sample.re;
+            buffers.im[0][index] = sample.im;
+        }
+    }
+    static mmse::detail::HGridStorage h_full{};
+    float sigma2 = 0.0F;
+    mmse::detail::estimate_channel(make_single_rx_grid_view(buffers), desc, h_full, sigma2);
+    for (const auto [symbol, sc] : std::array<std::pair<std::uint32_t, std::uint32_t>, 4>{
+             {{0U, 0U}, {4U, 1199U}, {12U, 17U}, {13U, 1199U}}}) {
+        const Complex32 expected = channel_at(symbol, sc);
+        const Complex32 actual =
+            h_full[(static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz) + sc];
+        expect_near(actual.re, expected.re, 2.0e-5F, "linear interpolation real");
+        expect_near(actual.im, expected.im, 2.0e-5F, "linear interpolation imag");
+    }
+    expect_near(sigma2, 0.0F, 1.0e-6F, "linear channel noise estimate");
+}
+
+void test_noise_estimate_has_two_thirds_calibration() {
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 1U;
+    desc.n_rx_ant = 1U;
+    desc.tx_mode = 1U;
+    GridBuffers buffers = make_zero_grid();
+    constexpr float kSigma2 = 0.04F;
+    constexpr float kAxis = 0.1414213562373095F;
+    std::uint32_t state = 0x13579BDFU;
+    for (std::uint32_t cs = 0U; cs < mmse::detail::kCrsSymbols.size(); ++cs) {
+        const std::uint8_t symbol = mmse::detail::kCrsSymbols[cs];
+        for (std::uint32_t pilot = 0U; pilot < kLteNumPilotTonesPerCrsSymbol; ++pilot) {
+            state = state * 1664525U + 1013904223U;
+            const float noise_re = (state & 1U) == 0U ? kAxis : -kAxis;
+            const float noise_im = (state & 2U) == 0U ? kAxis : -kAxis;
+            const std::uint32_t sc = mmse::detail::crs_subcarrier(desc.cell_id, 0U, symbol, pilot);
+            const Complex32 ls{1.0F + noise_re, noise_im};
+            const Complex32 sample = mmse::detail::cmul(
+                ls, mmse::detail::crs_value(
+                        {.cell_id = desc.cell_id,
+                         .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                         .port = 0U,
+                         .crs_symbol_index = static_cast<std::uint8_t>(cs)},
+                        pilot));
+            const std::size_t index =
+                static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz + sc;
+            buffers.re[0][index] = sample.re;
+            buffers.im[0][index] = sample.im;
+        }
+    }
+    static mmse::detail::HGridStorage h_full{};
+    float sigma2 = 0.0F;
+    mmse::detail::estimate_channel(make_single_rx_grid_view(buffers), desc, h_full, sigma2);
+    expect_relative_near(sigma2, kSigma2, 0.12F, 1.0e-4F, "two-thirds calibrated AWGN estimate");
+}
+
+void test_generation_invalidates_cpu_subframe_cache() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1U;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "generation cache cpu init");
+    auto desc = make_fullband_desc();
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 1.0F, 0.0F);
+    PlanarGridViewF32 grid = make_grid_view(buffers);
+    grid.generation = 100U;
+    std::vector<float> xre(40000U), xim(40000U), sinr(40000U);
+    EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), 20000U};
+    mmse::detail::debug_reset_estimate_channel_call_count();
+    expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "generation cache first run");
+    expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "generation cache reuse run");
+    expect_true(mmse::detail::debug_get_estimate_channel_call_count() == 1U,
+                "unchanged generation must reuse estimate");
+    ++grid.generation;
+    buffers.re[0][0] += 0.125F;
+    expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "generation cache invalidation run");
+    expect_true(mmse::detail::debug_get_estimate_channel_call_count() == 2U,
+                "new generation must refresh estimate");
+}
+
+void test_pbch_and_pcfich_td_cpu_golden_and_dto() {
+    MmseEqualizerCpuContext ctx;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1U;
+    config.sigma2_min = 1.0e-5F;
+    expect_true(ctx.init(config) == MmseStatus::kOk, "td special-channel cpu init");
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+
+    auto pbch_desc = make_pbch_desc();
+    pbch_desc.n_tx_ports = 2U;
+    pbch_desc.n_rx_ant = 1U;
+    pbch_desc.tx_mode = 2U;
+    GridBuffers pbch_buffers = make_zero_grid();
+    fill_identity_channel(pbch_buffers, pbch_desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout pbch_layout{};
+    const std::uint32_t pbch_re = mmse::detail::build_pbch_re_layout(pbch_desc, pbch_layout);
+    fill_td_layout(pbch_buffers, pbch_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                   {0.0F, 0.0F}, s0, s1);
+    PbchMmseInput pbch_in{.grid = make_single_rx_grid_view(pbch_buffers),
+                          .sfn_subframe = pbch_desc.sfn_subframe,
+                          .cell_id = pbch_desc.cell_id,
+                          .n_tx_ports = 2U,
+                          .tx_mode = 2U};
+    std::vector<float> pbch_xre(pbch_re), pbch_xim(pbch_re), pbch_sinr(pbch_re);
+    std::vector<std::uint16_t> pbch_re0(pbch_re), pbch_re1(pbch_re);
+    PbchTdMmseOutputView pbch_out{pbch_xre.data(), pbch_xim.data(), pbch_sinr.data(),
+                                  pbch_re0.data(), pbch_re1.data(), pbch_re};
+    PbchTdMmseResult pbch_meta{};
+    expect_true(ctx.run_pbch_td(pbch_in, pbch_out, pbch_meta) == MmseStatus::kOk,
+                "pbch td cpu run");
+    expect_true(pbch_meta.n_symbols == pbch_re && pbch_meta.n_source_re == pbch_re,
+                "pbch td metadata count");
+    expect_near(pbch_xre[0], s0.re, 1.0e-3F, "pbch td symbol zero real");
+    expect_near(pbch_xim[1], s1.im, 1.0e-3F, "pbch td symbol one imag");
+    expect_true(pbch_re0[0] == pbch_layout.grid_indices[0] &&
+                    pbch_re1[1] == pbch_layout.grid_indices[1],
+                "pbch td source pair metadata");
+    const auto pbch_backend =
+        mmse::pbch::make_backend_pbch_td_equalized_indication(pbch_meta, pbch_out);
+    const auto pbch_llr = mmse::pbch::make_backend_pbch_td_descrambled_llr_indication(pbch_backend);
+    expect_true(pbch_llr.llrs.size() == pbch_re * 2U &&
+                    pbch_llr.re_grid_indices0 == pbch_backend.re_grid_indices0,
+                "pbch td LLR DTO");
+
+    auto pcfich_desc = make_pcfich_desc();
+    pcfich_desc.n_tx_ports = 2U;
+    pcfich_desc.tx_mode = 2U;
+    GridBuffers pcfich_buffers = make_zero_grid();
+    fill_identity_channel(pcfich_buffers, pcfich_desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout pcfich_layout{};
+    const std::uint32_t pcfich_re =
+        mmse::detail::build_pcfich_re_layout(pcfich_desc, pcfich_layout);
+    fill_td_layout(pcfich_buffers, pcfich_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                   {1.0F, 0.0F}, s0, s1);
+    PcfichMmseInput pcfich_in{.grid = make_grid_view(pcfich_buffers),
+                              .sfn_subframe = pcfich_desc.sfn_subframe,
+                              .cell_id = pcfich_desc.cell_id,
+                              .n_tx_ports = 2U,
+                              .tx_mode = 2U};
+    std::vector<float> pcfich_xre(pcfich_re), pcfich_xim(pcfich_re), pcfich_sinr(pcfich_re);
+    std::vector<std::uint16_t> pcfich_re0(pcfich_re), pcfich_re1(pcfich_re);
+    PcfichTdMmseOutputView pcfich_out{pcfich_xre.data(), pcfich_xim.data(), pcfich_sinr.data(),
+                                      pcfich_re0.data(), pcfich_re1.data(), pcfich_re};
+    PcfichTdMmseResult pcfich_meta{};
+    expect_true(ctx.run_pcfich_td(pcfich_in, pcfich_out, pcfich_meta) == MmseStatus::kOk,
+                "pcfich td cpu run");
+    expect_true(pcfich_meta.n_symbols == pcfich_re && pcfich_meta.n_source_re == pcfich_re,
+                "pcfich td metadata count");
+    expect_near(pcfich_xre[0], s0.re, 1.0e-3F, "pcfich td symbol zero real");
+    expect_near(pcfich_xim[1], s1.im, 1.0e-3F, "pcfich td symbol one imag");
+    expect_true(pcfich_re0[0] == pcfich_layout.grid_indices[0] &&
+                    pcfich_re1[1] == pcfich_layout.grid_indices[1],
+                "pcfich td source pair metadata");
+    const auto pcfich_backend =
+        mmse::pcfich::make_backend_pcfich_td_equalized_indication(pcfich_meta, pcfich_out);
+    const auto pcfich_llr =
+        mmse::pcfich::make_backend_pcfich_td_descrambled_llr_indication(pcfich_backend);
+    expect_true(pcfich_llr.llrs.size() == pcfich_re * 2U &&
+                    pcfich_llr.re_grid_indices1 == pcfich_backend.re_grid_indices1,
+                "pcfich td LLR DTO");
+}
+
+void test_gpu_cuda_pbch_and_pcfich_td_match_cpu() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "td special-channel cpu parity init");
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kCuda;
+    gpu_config.sigma2_min = cpu_config.sigma2_min;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "td special-channel gpu parity init");
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+
+    auto pbch_desc = make_pbch_desc();
+    pbch_desc.n_tx_ports = 2U;
+    pbch_desc.n_rx_ant = 1U;
+    pbch_desc.tx_mode = 2U;
+    GridBuffers pbch_buffers = make_zero_grid();
+    fill_identity_channel(pbch_buffers, pbch_desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout pbch_layout{};
+    const std::uint32_t pbch_count = mmse::detail::build_pbch_re_layout(pbch_desc, pbch_layout);
+    fill_td_layout(pbch_buffers, pbch_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                   {0.0F, 0.0F}, s0, s1);
+    PbchMmseInput pbch_in{.grid = make_single_rx_grid_view(pbch_buffers),
+                          .sfn_subframe = pbch_desc.sfn_subframe,
+                          .cell_id = pbch_desc.cell_id,
+                          .n_tx_ports = 2U,
+                          .tx_mode = 2U};
+    std::vector<float> pbch_cpu_re(pbch_count), pbch_cpu_im(pbch_count), pbch_cpu_sinr(pbch_count);
+    std::vector<float> pbch_gpu_re(pbch_count), pbch_gpu_im(pbch_count), pbch_gpu_sinr(pbch_count);
+    std::vector<std::uint16_t> pbch_cpu_re0(pbch_count), pbch_cpu_re1(pbch_count);
+    std::vector<std::uint16_t> pbch_gpu_re0(pbch_count), pbch_gpu_re1(pbch_count);
+    PbchTdMmseOutputView pbch_cpu_out{pbch_cpu_re.data(),   pbch_cpu_im.data(),
+                                      pbch_cpu_sinr.data(), pbch_cpu_re0.data(),
+                                      pbch_cpu_re1.data(),  pbch_count};
+    PbchTdMmseOutputView pbch_gpu_out{pbch_gpu_re.data(),   pbch_gpu_im.data(),
+                                      pbch_gpu_sinr.data(), pbch_gpu_re0.data(),
+                                      pbch_gpu_re1.data(),  pbch_count};
+    PbchTdMmseResult pbch_cpu_meta{}, pbch_gpu_meta{};
+    expect_true(cpu.run_pbch_td(pbch_in, pbch_cpu_out, pbch_cpu_meta) == MmseStatus::kOk,
+                "pbch td cpu parity run");
+    expect_true(gpu.run_pbch_td(pbch_in, pbch_gpu_out, pbch_gpu_meta) == MmseStatus::kOk,
+                "pbch td gpu parity run");
+    expect_near(pbch_gpu_meta.sigma2, pbch_cpu_meta.sigma2, 1.0e-5F, "pbch td sigma2 parity");
+    for (std::uint32_t i = 0U; i < pbch_count; ++i) {
+        expect_near(pbch_gpu_re[i], pbch_cpu_re[i], 1.0e-4F, "pbch td gpu xhat real");
+        expect_near(pbch_gpu_im[i], pbch_cpu_im[i], 1.0e-4F, "pbch td gpu xhat imag");
+        expect_near(pbch_gpu_sinr[i], pbch_cpu_sinr[i], 1.0e-3F, "pbch td gpu sinr");
+        expect_true(pbch_gpu_re0[i] == pbch_cpu_re0[i] && pbch_gpu_re1[i] == pbch_cpu_re1[i],
+                    "pbch td gpu source pair");
+    }
+
+    auto pcfich_desc = make_pcfich_desc();
+    pcfich_desc.n_tx_ports = 2U;
+    pcfich_desc.tx_mode = 2U;
+    GridBuffers pcfich_buffers = make_zero_grid();
+    fill_identity_channel(pcfich_buffers, pcfich_desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout pcfich_layout{};
+    const std::uint32_t pcfich_count =
+        mmse::detail::build_pcfich_re_layout(pcfich_desc, pcfich_layout);
+    fill_td_layout(pcfich_buffers, pcfich_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                   {1.0F, 0.0F}, s0, s1);
+    PcfichMmseInput pcfich_in{.grid = make_grid_view(pcfich_buffers),
+                              .sfn_subframe = pcfich_desc.sfn_subframe,
+                              .cell_id = pcfich_desc.cell_id,
+                              .n_tx_ports = 2U,
+                              .tx_mode = 2U};
+    std::vector<float> pcfich_cpu_re(pcfich_count), pcfich_cpu_im(pcfich_count),
+        pcfich_cpu_sinr(pcfich_count), pcfich_gpu_re(pcfich_count), pcfich_gpu_im(pcfich_count),
+        pcfich_gpu_sinr(pcfich_count);
+    std::vector<std::uint16_t> pcfich_cpu_re0(pcfich_count), pcfich_cpu_re1(pcfich_count),
+        pcfich_gpu_re0(pcfich_count), pcfich_gpu_re1(pcfich_count);
+    PcfichTdMmseOutputView pcfich_cpu_out{pcfich_cpu_re.data(),   pcfich_cpu_im.data(),
+                                          pcfich_cpu_sinr.data(), pcfich_cpu_re0.data(),
+                                          pcfich_cpu_re1.data(),  pcfich_count};
+    PcfichTdMmseOutputView pcfich_gpu_out{pcfich_gpu_re.data(),   pcfich_gpu_im.data(),
+                                          pcfich_gpu_sinr.data(), pcfich_gpu_re0.data(),
+                                          pcfich_gpu_re1.data(),  pcfich_count};
+    PcfichTdMmseResult pcfich_cpu_meta{}, pcfich_gpu_meta{};
+    expect_true(cpu.run_pcfich_td(pcfich_in, pcfich_cpu_out, pcfich_cpu_meta) == MmseStatus::kOk,
+                "pcfich td cpu parity run");
+    expect_true(gpu.run_pcfich_td(pcfich_in, pcfich_gpu_out, pcfich_gpu_meta) == MmseStatus::kOk,
+                "pcfich td gpu parity run");
+    expect_near(pcfich_gpu_meta.sigma2, pcfich_cpu_meta.sigma2, 1.0e-5F, "pcfich td sigma2 parity");
+    for (std::uint32_t i = 0U; i < pcfich_count; ++i) {
+        expect_near(pcfich_gpu_re[i], pcfich_cpu_re[i], 1.0e-4F, "pcfich td gpu xhat real");
+        expect_near(pcfich_gpu_im[i], pcfich_cpu_im[i], 1.0e-4F, "pcfich td gpu xhat imag");
+        expect_near(pcfich_gpu_sinr[i], pcfich_cpu_sinr[i], 1.0e-3F, "pcfich td gpu sinr");
+        expect_true(pcfich_gpu_re0[i] == pcfich_cpu_re0[i] &&
+                        pcfich_gpu_re1[i] == pcfich_cpu_re1[i],
+                    "pcfich td gpu source pair");
+    }
+#endif
+}
+
 void test_cpu_shared_estimate_reuses_once_per_subframe() {
     MmseEqualizerCpuContext ctx;
     MmseEqualizerCpuConfig config{};
@@ -1344,8 +1987,8 @@ void test_cpu_shared_estimate_reuses_once_per_subframe() {
     expect_true(ctx.run_pdcch(pdcch_in, pdcch_out, pdcch_meta) == MmseStatus::kOk, "pdcch run");
     expect_true(ctx.run(make_grid_view(buffers), pdsch_desc, pdsch_out) == MmseStatus::kOk,
                 "pdsch run");
-    expect_true(mmse::detail::debug_get_estimate_channel_call_count() == 1U,
-                "estimate should be reused across same-subframe channel wrappers");
+    expect_true(mmse::detail::debug_get_estimate_channel_call_count() == 2U,
+                "estimate should be reused only for matching channel-estimation contracts");
 }
 
 void test_gpu_shared_estimate_skips_second_estimate_path() {
@@ -1799,6 +2442,105 @@ void test_pdcch_common_search_candidates_follow_lte_levels() {
                 "pdcch common search last aggregation-eight candidate");
 }
 
+void test_pdcch_ue_specific_search_candidates_follow_lte_levels() {
+    constexpr std::uint32_t kRegCount = 810U;
+    std::array<std::uint16_t, kRegCount * mmse::pdcch::kPdcchRePerReg> grid_indices{};
+    for (std::uint32_t re = 0U; re < grid_indices.size(); ++re) {
+        grid_indices[re] = static_cast<std::uint16_t>(re);
+    }
+
+    mmse::pdcch::PdcchControlRegion control_region{};
+    expect_true(mmse::pdcch::build_pdcch_control_region(
+                    0U, 3U, grid_indices.data(), static_cast<std::uint32_t>(grid_indices.size()),
+                    control_region) == MmseStatus::kOk &&
+                    control_region.cces.size() == 90U,
+                "pdcch UE-specific search control-region build");
+
+    mmse::pdcch::PdcchUeSpecificSearchConfig config{};
+    config.rntis = {0x1234U};
+    std::vector<mmse::pdcch::PdcchUeSpecificSearchCandidate> candidates{};
+    expect_true(mmse::pdcch::build_pdcch_ue_specific_search_candidates(
+                    control_region, 0U, config, candidates) == MmseStatus::kOk &&
+                    candidates.size() == 16U,
+                "pdcch UE-specific search should build all LTE levels");
+    constexpr std::array<std::uint16_t, 16> kExpectedFirstCceAtSf0 = {
+        73U, 74U, 75U, 76U, 77U, 78U, 56U, 58U, 60U, 62U, 64U, 66U, 36U, 40U, 72U, 80U,
+    };
+    constexpr std::array<std::uint8_t, 16> kExpectedLevels = {
+        1U, 1U, 1U, 1U, 1U, 1U, 2U, 2U, 2U, 2U, 2U, 2U, 4U, 4U, 8U, 8U,
+    };
+    for (std::uint32_t candidate = 0U; candidate < candidates.size(); ++candidate) {
+        expect_true(candidates[candidate].rnti == 0x1234U &&
+                        candidates[candidate].search_candidate.candidate_id == candidate &&
+                        candidates[candidate].search_candidate.first_cce ==
+                            kExpectedFirstCceAtSf0[candidate] &&
+                        candidates[candidate].search_candidate.aggregation_level ==
+                            kExpectedLevels[candidate] &&
+                        candidates[candidate].search_candidate.encoded_bit_count ==
+                            72U * kExpectedLevels[candidate],
+                    "pdcch UE-specific candidate ordering and metadata");
+    }
+
+    expect_true(mmse::pdcch::build_pdcch_ue_specific_search_candidates(
+                    control_region, 5U, config, candidates) == MmseStatus::kOk &&
+                    candidates[0].search_candidate.first_cce == 27U &&
+                    candidates[6].search_candidate.first_cce == 54U &&
+                    candidates[12].search_candidate.first_cce == 28U &&
+                    candidates[14].search_candidate.first_cce == 56U,
+                "pdcch UE-specific search must use the subframe-specific Yk");
+    std::vector<mmse::pdcch::PdcchUeSpecificSearchCandidate> next_frame_candidates{};
+    expect_true(mmse::pdcch::build_pdcch_ue_specific_search_candidates(
+                    control_region, 15U, config, next_frame_candidates) == MmseStatus::kOk &&
+                    next_frame_candidates.size() == candidates.size() &&
+                    std::equal(candidates.begin(), candidates.end(), next_frame_candidates.begin(),
+                               [](const auto& lhs, const auto& rhs) {
+                                   return lhs.rnti == rhs.rnti &&
+                                          lhs.search_candidate.first_cce ==
+                                              rhs.search_candidate.first_cce &&
+                                          lhs.search_candidate.aggregation_level ==
+                                              rhs.search_candidate.aggregation_level;
+                               }),
+                "pdcch UE-specific search must repeat candidate positions each radio frame");
+
+    constexpr std::uint32_t kSmallRegCount = 72U;
+    std::array<std::uint16_t, kSmallRegCount * mmse::pdcch::kPdcchRePerReg> small_grid_indices{};
+    for (std::uint32_t re = 0U; re < small_grid_indices.size(); ++re) {
+        small_grid_indices[re] = static_cast<std::uint16_t>(re);
+    }
+    mmse::pdcch::PdcchControlRegion small_control_region{};
+    expect_true(mmse::pdcch::build_pdcch_control_region(
+                    0U, 1U, small_grid_indices.data(),
+                    static_cast<std::uint32_t>(small_grid_indices.size()),
+                    small_control_region) == MmseStatus::kOk &&
+                    small_control_region.cces.size() == 8U,
+                "pdcch small UE-specific search control-region build");
+    expect_true(mmse::pdcch::build_pdcch_ue_specific_search_candidates(
+                    small_control_region, 0U, config, candidates) == MmseStatus::kOk &&
+                    candidates.size() == 13U,
+                "pdcch UE-specific search must truncate candidate levels by available CCEs");
+    constexpr std::array<std::uint16_t, 13> kExpectedFirstCceAtSmallRegion = {
+        5U, 6U, 7U, 0U, 1U, 2U, 2U, 4U, 6U, 0U, 4U, 0U, 0U,
+    };
+    for (std::uint32_t candidate = 0U; candidate < candidates.size(); ++candidate) {
+        expect_true(candidates[candidate].search_candidate.first_cce ==
+                        kExpectedFirstCceAtSmallRegion[candidate],
+                    "pdcch UE-specific search must retain standard small-region placement");
+    }
+
+    config.rntis = {};
+    expect_true(mmse::pdcch::build_pdcch_ue_specific_search_candidates(
+                    control_region, 0U, config, candidates) == MmseStatus::kInvalidArgument,
+                "pdcch UE-specific search must reject an empty RNTI list");
+    config.rntis = {0x1234U, 0x1234U};
+    expect_true(mmse::pdcch::build_pdcch_ue_specific_search_candidates(
+                    control_region, 0U, config, candidates) == MmseStatus::kInvalidArgument,
+                "pdcch UE-specific search must reject duplicate RNTIs");
+    config.rntis = {mmse::pdcch::kSiRnti};
+    expect_true(mmse::pdcch::build_pdcch_ue_specific_search_candidates(
+                    control_region, 0U, config, candidates) == MmseStatus::kInvalidArgument,
+                "pdcch UE-specific search must reserve SI-RNTI for common search");
+}
+
 void test_pdcch_common_search_candidate_llrs_follow_cce_offsets() {
     constexpr std::uint32_t kCceCount = 8U;
     constexpr std::uint32_t kReCount =
@@ -1971,6 +2713,202 @@ void test_pdcch_tail_biting_decoder_adapter_contract() {
     expect_true(decoded_bits.empty(), "pdcch tail-biting adapter should clear failed output");
 }
 
+void test_pdcch_native_tail_biting_decoder_all_initial_states() {
+    constexpr std::uint32_t kBitCount = 44U;
+    for (std::uint32_t initial_state = 0U; initial_state < 64U; ++initial_state) {
+        std::vector<std::uint8_t> bits(kBitCount, 0U);
+        for (std::uint32_t bit = 0U; bit + 6U < kBitCount; ++bit) {
+            bits[bit] = static_cast<std::uint8_t>(((bit * 13U + initial_state * 7U) >> 1U) & 1U);
+        }
+        for (std::uint32_t delay = 0U; delay < 6U; ++delay) {
+            bits[kBitCount - 1U - delay] = static_cast<std::uint8_t>((initial_state >> delay) & 1U);
+        }
+
+        mmse::pdcch::PdcchRateRecoveredLlr recovered{};
+        recovered.codeword_bit_count = kBitCount;
+        recovered.convolutional_llrs = reference_llrs_from_encoded_bits(
+            reference_pdcch_tail_biting_convolutional_encode(bits), 6.0F);
+        std::vector<std::uint8_t> decoded{};
+        expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(recovered, decoded) ==
+                            MmseStatus::kOk &&
+                        decoded == bits,
+                    "native tail-biting decoder must close every initial state");
+    }
+}
+
+void test_pdcch_native_tail_biting_decoder_length_boundaries() {
+    constexpr std::array<std::uint32_t, 16> kBitCounts = {
+        6U,   7U,   8U,   15U,
+        31U,  32U,  33U,  43U,
+        44U,  63U,  64U,  65U,
+        127U, 128U, 143U, mmse::pdcch::kPdcchMaxDciPayloadBits + mmse::pdcch::kPdcchCrcBitCount,
+    };
+    for (const std::uint32_t bit_count : kBitCounts) {
+        for (const std::uint32_t pattern : {0U, 1U}) {
+            std::vector<std::uint8_t> bits(bit_count, 0U);
+            for (std::uint32_t bit = 0U; bit < bit_count; ++bit) {
+                bits[bit] = static_cast<std::uint8_t>(
+                    ((bit * 29U + bit_count * 13U + pattern * 17U) ^ (bit >> 1U)) & 1U);
+            }
+            mmse::pdcch::PdcchRateRecoveredLlr recovered{};
+            recovered.codeword_bit_count = bit_count;
+            recovered.convolutional_llrs = reference_llrs_from_encoded_bits(
+                reference_pdcch_tail_biting_convolutional_encode(bits), 12.0F);
+            std::vector<std::uint8_t> decoded(bit_count, 1U);
+            expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(recovered, decoded) ==
+                                MmseStatus::kOk &&
+                            decoded == bits,
+                        "native tail-biting decoder must preserve length-boundary codewords");
+        }
+    }
+}
+
+void test_pdcch_native_tail_biting_decoder_llr_and_invalid_inputs() {
+    std::vector<std::uint8_t> bits(44U, 0U);
+    for (std::uint32_t bit = 0U; bit < bits.size(); ++bit) {
+        bits[bit] = static_cast<std::uint8_t>((bit * 5U + 1U) & 1U);
+    }
+    const std::vector<std::uint8_t> encoded =
+        reference_pdcch_tail_biting_convolutional_encode(bits);
+    mmse::pdcch::PdcchRateRecoveredLlr recovered{};
+    recovered.codeword_bit_count = static_cast<std::uint32_t>(bits.size());
+    recovered.convolutional_llrs = reference_llrs_from_encoded_bits(encoded, 8.0F);
+    for (std::uint32_t i = 0U; i < recovered.convolutional_llrs.size(); i += 17U) {
+        recovered.convolutional_llrs[i] *= 0.25F;
+    }
+    std::vector<std::uint8_t> decoded{};
+    expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(recovered, decoded) ==
+                        MmseStatus::kOk &&
+                    decoded == bits,
+                "native tail-biting decoder must tolerate finite LLR perturbations");
+
+    recovered.soft_bit_polarity = static_cast<mmse::pdcch::PdcchSoftBitPolarity>(1U);
+    expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(recovered, decoded) ==
+                    MmseStatus::kInvalidArgument,
+                "native tail-biting decoder must validate LLR polarity");
+    expect_true(decoded.empty(), "native tail-biting decoder must clear failed polarity output");
+    recovered.soft_bit_polarity = mmse::pdcch::PdcchSoftBitPolarity::kNegativeFavorsZero;
+    recovered.convolutional_llrs.pop_back();
+    expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(recovered, decoded) ==
+                    MmseStatus::kInvalidArgument,
+                "native tail-biting decoder must validate LLR length");
+    expect_true(decoded.empty(), "native tail-biting decoder must clear failed length output");
+    recovered.convolutional_llrs = reference_llrs_from_encoded_bits(encoded, 8.0F);
+    recovered.convolutional_llrs[0] = std::numeric_limits<float>::quiet_NaN();
+    expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(recovered, decoded) ==
+                    MmseStatus::kInvalidArgument,
+                "native tail-biting decoder must reject non-finite LLRs");
+    expect_true(decoded.empty(), "native tail-biting decoder must clear failed non-finite output");
+}
+
+void test_pdcch_native_tail_biting_decoder_boundaries_tie_break_and_failures() {
+    const auto expect_invalid_and_cleared = [](const mmse::pdcch::PdcchRateRecoveredLlr& invalid,
+                                               const std::string& label) {
+        std::vector<std::uint8_t> decoded = {1U, 1U};
+        expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(invalid, decoded) ==
+                        MmseStatus::kInvalidArgument,
+                    label + " status");
+        expect_true(decoded.empty(), label + " output clear");
+    };
+
+    mmse::pdcch::PdcchRateRecoveredLlr fixed_vector{};
+    fixed_vector.codeword_bit_count = 6U;
+    fixed_vector.convolutional_llrs = {
+        7.0F, -6.0F, 8.0F, -8.0F, -7.0F, 6.0F, 6.0F, -8.0F, -7.0F,
+        8.0F, -6.0F, 7.0F, -7.0F, -8.0F, 6.0F, 6.0F, -7.0F, -8.0F,
+    };
+    const std::vector<std::uint8_t> fixed_bits = {1U, 0U, 1U, 1U, 0U, 1U};
+    std::vector<std::uint8_t> decoded{};
+    expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(fixed_vector, decoded) ==
+                        MmseStatus::kOk &&
+                    decoded == fixed_bits,
+                "native tail-biting decoder must match fixed soft vector");
+
+    mmse::pdcch::PdcchRateRecoveredLlr minimum_length{};
+    minimum_length.codeword_bit_count = 1U;
+    minimum_length.convolutional_llrs = {0.0F, 0.0F, 0.0F};
+    decoded.assign(1U, 1U);
+    expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(minimum_length, decoded) ==
+                        MmseStatus::kOk &&
+                    decoded == std::vector<std::uint8_t>{0U},
+                "native tail-biting decoder must support minimum codeword length");
+
+    for (const float tied_llr : {0.0F, -0.0F}) {
+        for (std::uint32_t bit_count = 1U;
+             bit_count <= mmse::pdcch::kPdcchMaxDciPayloadBits + mmse::pdcch::kPdcchCrcBitCount;
+             ++bit_count) {
+            mmse::pdcch::PdcchRateRecoveredLlr tied_llrs{};
+            tied_llrs.codeword_bit_count = bit_count;
+            tied_llrs.convolutional_llrs.assign(
+                bit_count * mmse::pdcch::kPdcchConvolutionalCodeRate, tied_llr);
+            decoded.assign(bit_count, 1U);
+            expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(tied_llrs, decoded) ==
+                                MmseStatus::kOk &&
+                            decoded == std::vector<std::uint8_t>(bit_count, 0U),
+                        "native tail-biting decoder must retain lower-predecessor tie break");
+        }
+    }
+
+    mmse::pdcch::PdcchRateRecoveredLlr finite_extremes{};
+    finite_extremes.codeword_bit_count =
+        mmse::pdcch::kPdcchMaxDciPayloadBits + mmse::pdcch::kPdcchCrcBitCount;
+    constexpr std::array<float, 6> kFiniteExtremes = {
+        std::numeric_limits<float>::denorm_min(), -std::numeric_limits<float>::denorm_min(),
+        std::numeric_limits<float>::min(),        -std::numeric_limits<float>::min(),
+        std::numeric_limits<float>::max(),        std::numeric_limits<float>::lowest(),
+    };
+    finite_extremes.convolutional_llrs.resize(finite_extremes.codeword_bit_count *
+                                              mmse::pdcch::kPdcchConvolutionalCodeRate);
+    for (std::uint32_t llr = 0U; llr < finite_extremes.convolutional_llrs.size(); ++llr) {
+        finite_extremes.convolutional_llrs[llr] = kFiniteExtremes[llr % kFiniteExtremes.size()];
+    }
+    std::vector<std::uint8_t> first_extreme_decode{};
+    expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(
+                    finite_extremes, first_extreme_decode) == MmseStatus::kOk &&
+                    first_extreme_decode.size() == finite_extremes.codeword_bit_count &&
+                    std::all_of(first_extreme_decode.begin(), first_extreme_decode.end(),
+                                [](std::uint8_t bit) { return bit <= 1U; }),
+                "native tail-biting decoder must accept finite subnormal and extreme LLRs");
+    expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(finite_extremes, decoded) ==
+                        MmseStatus::kOk &&
+                    decoded == first_extreme_decode,
+                "native tail-biting decoder must be deterministic for finite extreme LLRs");
+
+    std::vector<std::uint8_t> maximum_bits(
+        mmse::pdcch::kPdcchMaxDciPayloadBits + mmse::pdcch::kPdcchCrcBitCount, 0U);
+    for (std::uint32_t bit = 0U; bit < maximum_bits.size(); ++bit) {
+        maximum_bits[bit] = static_cast<std::uint8_t>(((bit * 37U + 11U) >> 2U) & 1U);
+    }
+    mmse::pdcch::PdcchRateRecoveredLlr maximum_length{};
+    maximum_length.codeword_bit_count = static_cast<std::uint32_t>(maximum_bits.size());
+    maximum_length.convolutional_llrs = reference_llrs_from_encoded_bits(
+        reference_pdcch_tail_biting_convolutional_encode(maximum_bits), 8.0F);
+    expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(maximum_length, decoded) ==
+                        MmseStatus::kOk &&
+                    decoded == maximum_bits,
+                "native tail-biting decoder must support maximum codeword length");
+
+    mmse::pdcch::PdcchRateRecoveredLlr empty{};
+    expect_invalid_and_cleared(empty, "native tail-biting zero length");
+
+    auto oversized = fixed_vector;
+    oversized.codeword_bit_count =
+        mmse::pdcch::kPdcchMaxDciPayloadBits + mmse::pdcch::kPdcchCrcBitCount + 1U;
+    expect_invalid_and_cleared(oversized, "native tail-biting oversized length");
+
+    auto invalid_order = fixed_vector;
+    invalid_order.llr_order = static_cast<mmse::pdcch::PdcchConvolutionalLlrOrder>(1U);
+    expect_invalid_and_cleared(invalid_order, "native tail-biting LLR order");
+
+    auto infinite_llr = fixed_vector;
+    infinite_llr.convolutional_llrs[0] = std::numeric_limits<float>::infinity();
+    expect_invalid_and_cleared(infinite_llr, "native tail-biting infinite LLR");
+
+    auto negative_infinite_llr = fixed_vector;
+    negative_infinite_llr.convolutional_llrs[0] = -std::numeric_limits<float>::infinity();
+    expect_invalid_and_cleared(negative_infinite_llr, "native tail-biting negative infinite LLR");
+}
+
 void test_pdcch_crc16_and_rnti_mask_check() {
     std::vector<std::uint8_t> check_bits{};
     for (const char character : std::string{"123456789"}) {
@@ -2028,7 +2966,8 @@ void test_pdcch_dci_format1a_fdd_si_rnti_parse() {
                     result.dci.resource_indication_value == riv && result.dci.start_prb == 10U &&
                     result.dci.n_prb == 20U && result.dci.mcs_tbs_index == 7U &&
                     result.dci.harq_process == 5U && result.dci.redundancy_version == 2U &&
-                    result.dci.n_prb_1a_is_three && result.dci.chain.request_id == chain.request_id,
+                    result.dci.n_prb_1a_is_three && result.dci.n_prb_1a == 3U &&
+                    result.dci.chain.request_id == chain.request_id,
                 "FDD SI-RNTI DCI 1A parsed grant fields");
 }
 
@@ -2584,6 +3523,605 @@ std::vector<std::uint8_t> make_si_rnti_dci_format1a_bits() {
     return append_pdcch_crc_rnti_mask(payload, mmse::pdcch::kSiRnti);
 }
 
+void rewrite_pdcch_crc_rnti_mask(std::vector<std::uint8_t>& decoded_bits, std::uint16_t rnti) {
+    expect_true(decoded_bits.size() > mmse::pdcch::kPdcchCrcBitCount,
+                "rewrite CRC requires a DCI payload");
+    decoded_bits.resize(decoded_bits.size() - mmse::pdcch::kPdcchCrcBitCount);
+    const std::uint16_t masked_crc = static_cast<std::uint16_t>(
+        mmse::pdcch::calculate_pdcch_crc16(decoded_bits.data(),
+                                           static_cast<std::uint32_t>(decoded_bits.size())) ^
+        rnti);
+    append_bits(decoded_bits, masked_crc, mmse::pdcch::kPdcchCrcBitCount);
+}
+
+mmse::pdcch::BackendPdcchEqualizedIndication
+make_native_si_rnti_backend(std::uint16_t first_cce, std::uint8_t aggregation_level,
+                            const std::vector<std::uint8_t>& decoded_bits,
+                            std::uint32_t cce_count = 8U);
+
+void test_pdcch_si_rnti_semantics_reject_invalid_grants() {
+    std::vector<std::uint8_t> wrong_rnti_bits = make_si_rnti_dci_format1a_bits();
+    rewrite_pdcch_crc_rnti_mask(wrong_rnti_bits, 0x1234U);
+    auto backend = make_native_si_rnti_backend(4U, 4U, wrong_rnti_bits);
+    mmse::pdcch::PdcchSiRntiSearchResult result{};
+    expect_true(mmse::pdcch::decode_pdcch_si_rnti_dci_format1a(backend, {}, result) ==
+                        MmseStatus::kOk &&
+                    result.hits.empty(),
+                "SI-RNTI search must treat another RNTI as a normal miss");
+
+    std::vector<std::uint8_t> crc_flip_bits = make_si_rnti_dci_format1a_bits();
+    crc_flip_bits.back() ^= 1U;
+    backend = make_native_si_rnti_backend(4U, 4U, crc_flip_bits);
+    expect_true(mmse::pdcch::decode_pdcch_si_rnti_dci_format1a(backend, {}, result) ==
+                        MmseStatus::kOk &&
+                    result.hits.empty(),
+                "SI-RNTI search must treat CRC flips as normal misses");
+
+    const mmse::pdcch::PdcchDciFormat1AConfig config{};
+    std::vector<std::uint8_t> pdcch_order_payload{};
+    append_bits(pdcch_order_payload, 1U, 1U);
+    append_bits(pdcch_order_payload, 0U, 1U);
+    append_bits(pdcch_order_payload,
+                (1U << mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb)) - 1U,
+                mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
+    append_bits(pdcch_order_payload, 42U, 6U);
+    append_bits(pdcch_order_payload, 9U, 4U);
+    while (pdcch_order_payload.size() < mmse::pdcch::pdcch_dci_format1a_payload_bit_count(config)) {
+        pdcch_order_payload.push_back(0U);
+    }
+    backend = make_native_si_rnti_backend(
+        4U, 4U, append_pdcch_crc_rnti_mask(pdcch_order_payload, mmse::pdcch::kSiRnti));
+    expect_true(mmse::pdcch::decode_pdcch_si_rnti_dci_format1a(backend, {}, result) ==
+                        MmseStatus::kOk &&
+                    result.hits.empty(),
+                "SI-RNTI search must not accept PDCCH order as a SIB authorization");
+}
+
+void test_pdcch_dci_format1a_si_numeric_boundaries() {
+    std::vector<std::uint8_t> decoded_bits = make_si_rnti_dci_format1a_bits();
+    constexpr std::uint32_t kPayloadBitCount = 28U;
+    decoded_bits[15U] = 1U;
+    decoded_bits[16U] = 1U;
+    decoded_bits[17U] = 1U;
+    decoded_bits[18U] = 1U;
+    decoded_bits[19U] = 1U;
+    decoded_bits[24U] = 1U;
+    decoded_bits[25U] = 1U;
+    decoded_bits[kPayloadBitCount - 1U] = 0U;
+    rewrite_pdcch_crc_rnti_mask(decoded_bits, mmse::pdcch::kSiRnti);
+
+    mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+    expect_true(mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
+                    decoded_bits.data(), static_cast<std::uint32_t>(decoded_bits.size()),
+                    mmse::pdcch::kSiRnti, 0U, 0U, {}, {}, result) == MmseStatus::kOk &&
+                    result.matched && result.dci.mcs_tbs_index == 31U &&
+                    result.dci.redundancy_version == 3U && result.dci.n_prb_1a == 2U &&
+                    !result.dci.n_prb_1a_is_three,
+                "SI DCI 1A parser must expose MCS/RV and N_PRB^1A numeric boundaries");
+}
+
+void test_pdcch_native_tail_biting_rate_recovery_l4_l8() {
+    const std::vector<std::uint8_t> decoded_bits = make_si_rnti_dci_format1a_bits();
+    const std::vector<float> convolutional_llrs = reference_llrs_from_encoded_bits(
+        reference_pdcch_tail_biting_convolutional_encode(decoded_bits), 5.0F);
+    for (const std::uint8_t aggregation_level : {1U, 2U, 4U, 8U}) {
+        mmse::pdcch::PdcchCandidateLlr candidate{};
+        candidate.chain.aggregation_level = aggregation_level;
+        candidate.encoded_bit_count = 72U * aggregation_level;
+        candidate.llrs = reference_pdcch_convolutional_rate_match(convolutional_llrs,
+                                                                  candidate.encoded_bit_count);
+        mmse::pdcch::PdcchRateRecoveredLlr recovered{};
+        expect_true(mmse::pdcch::recover_pdcch_convolutional_rate_matched_llrs(
+                        candidate,
+                        mmse::pdcch::pdcch_dci_format1a_payload_bit_count(
+                            mmse::pdcch::PdcchDciFormat1AConfig{}),
+                        recovered) == MmseStatus::kOk,
+                    "native tail-biting rate recovery must accept L4/L8 candidates");
+        std::vector<std::uint8_t> decoded{};
+        expect_true(mmse::pdcch::decode_pdcch_tail_biting_convolutional(recovered, decoded) ==
+                            MmseStatus::kOk &&
+                        decoded == decoded_bits,
+                    "native tail-biting decoder must close rate recovery with repeats and dummies");
+    }
+}
+
+mmse::pdcch::BackendPdcchEqualizedIndication
+make_native_si_rnti_backend(std::uint16_t first_cce, std::uint8_t aggregation_level,
+                            const std::vector<std::uint8_t>& decoded_bits,
+                            std::uint32_t cce_count) {
+    constexpr std::uint32_t kReCount = mmse::pdcch::kPdcchRegsPerCce * mmse::pdcch::kPdcchRePerReg;
+    const std::uint32_t encoded_offset = static_cast<std::uint32_t>(first_cce) * 72U;
+    const std::uint32_t encoded_count = 72U * aggregation_level;
+    const std::vector<float> target_llrs = reference_pdcch_convolutional_rate_match(
+        reference_llrs_from_encoded_bits(
+            reference_pdcch_tail_biting_convolutional_encode(decoded_bits), 5.0F),
+        encoded_count);
+    expect_true(cce_count != 0U && encoded_offset + encoded_count <= cce_count * kReCount * 2U,
+                "native SI test candidate must fit in control region");
+
+    std::vector<float> descrambled_llrs(cce_count * kReCount * 2U, -1.0F);
+    std::copy(target_llrs.begin(), target_llrs.end(), descrambled_llrs.begin() + encoded_offset);
+    mmse::lte::descramble_llrs_inplace(descrambled_llrs.data(),
+                                       static_cast<std::uint32_t>(descrambled_llrs.size()),
+                                       mmse::lte::pdcch_c_init(19U, 7U));
+
+    mmse::pdcch::BackendPdcchEqualizedIndication backend{};
+    backend.sfn_subframe = 7U;
+    backend.cell_id = 19U;
+    backend.n_prb = kLteNumPrb20MHz;
+    backend.n_tx_ports = 1U;
+    backend.n_rx_ant = 2U;
+    backend.n_layers = 1U;
+    backend.tx_mode = 1U;
+    backend.control_symbol_count = 1U;
+    backend.mod_order = 2U;
+    backend.chain.request_id = 451U;
+    backend.x_hat_re.resize(cce_count * kReCount);
+    backend.x_hat_im.resize(cce_count * kReCount);
+    backend.sinr.assign(cce_count * kReCount, 1.0F);
+    backend.re_grid_indices.resize(cce_count * kReCount);
+    constexpr float kQpskAxis = 0.7071067811865475F;
+    for (std::uint32_t re = 0U; re < backend.x_hat_re.size(); ++re) {
+        backend.x_hat_re[re] = -descrambled_llrs[2U * re] * kQpskAxis / 2.0F;
+        backend.x_hat_im[re] = -descrambled_llrs[2U * re + 1U] * kQpskAxis / 2.0F;
+        backend.re_grid_indices[re] = static_cast<std::uint16_t>(re);
+    }
+    return backend;
+}
+
+std::vector<Complex32>
+make_native_si_rnti_qpsk_symbols(std::uint32_t n_re, std::uint16_t first_cce,
+                                 std::uint8_t aggregation_level,
+                                 const std::vector<std::uint8_t>& decoded_bits,
+                                 std::uint16_t cell_id, std::uint32_t sfn_subframe) {
+    const std::uint32_t encoded_offset = static_cast<std::uint32_t>(first_cce) * 72U;
+    const std::uint32_t encoded_count = 72U * aggregation_level;
+    const std::vector<float> target_llrs = reference_pdcch_convolutional_rate_match(
+        reference_llrs_from_encoded_bits(
+            reference_pdcch_tail_biting_convolutional_encode(decoded_bits), 5.0F),
+        encoded_count);
+    expect_true(encoded_offset + encoded_count <= n_re * 2U,
+                "native SI symbols must fit in PDCCH control region");
+
+    std::vector<float> transmitted_llrs(n_re * 2U, -1.0F);
+    std::copy(target_llrs.begin(), target_llrs.end(), transmitted_llrs.begin() + encoded_offset);
+    mmse::lte::descramble_llrs_inplace(transmitted_llrs.data(),
+                                       static_cast<std::uint32_t>(transmitted_llrs.size()),
+                                       mmse::lte::pdcch_c_init(cell_id, sfn_subframe));
+
+    constexpr float kQpskAxis = 0.7071067811865475F;
+    std::vector<Complex32> symbols(n_re);
+    for (std::uint32_t re = 0U; re < n_re; ++re) {
+        symbols[re] = {
+            .re = -transmitted_llrs[2U * re] * kQpskAxis / 2.0F,
+            .im = -transmitted_llrs[2U * re + 1U] * kQpskAxis / 2.0F,
+        };
+    }
+    return symbols;
+}
+
+void test_pdcch_native_si_rnti_search_returns_only_target_candidate() {
+    const auto backend = make_native_si_rnti_backend(4U, 4U, make_si_rnti_dci_format1a_bits());
+    mmse::pdcch::PdcchSiRntiSearchResult result{};
+    expect_true(mmse::pdcch::decode_pdcch_si_rnti_dci_format1a(backend, {}, result) ==
+                    MmseStatus::kOk,
+                "native SI-RNTI search should complete");
+    expect_true(result.candidate_count == 3U && result.hits.size() == 1U &&
+                    result.hits[0].first_cce == 4U && result.hits[0].aggregation_level == 4U &&
+                    result.hits[0].decoded.dci.start_prb == 10U &&
+                    result.hits[0].decoded.dci.n_prb == 20U &&
+                    result.hits[0].decoded.dci.mcs_tbs_index == 7U &&
+                    result.hits[0].decoded.dci.redundancy_version == 2U &&
+                    result.hits[0].decoded.dci.n_prb_1a == 3U,
+                "native SI-RNTI search must expose target CCE and DCI grant fields");
+}
+
+void test_pdcch_ue_specific_search_decodes_l1_l2_candidates() {
+    constexpr std::uint16_t kRnti = 0x1234U;
+    std::vector<std::uint8_t> decoded_bits = make_si_rnti_dci_format1a_bits();
+    rewrite_pdcch_crc_rnti_mask(decoded_bits, kRnti);
+    for (const std::uint8_t aggregation_level : {1U, 2U}) {
+        const auto backend =
+            make_native_si_rnti_backend(0U, aggregation_level, decoded_bits, aggregation_level);
+        mmse::pdcch::PdcchUeSpecificSearchConfig config{};
+        config.rntis = {kRnti};
+        config.aggregation_level_mask = aggregation_level == 1U
+                                            ? mmse::pdcch::kPdcchAggregationLevelMaskL1
+                                            : mmse::pdcch::kPdcchAggregationLevelMaskL2;
+        mmse::pdcch::PdcchUeSpecificSearchResult result{};
+        expect_true(mmse::pdcch::decode_pdcch_ue_specific_search_dci_format1a(
+                        backend, config, result) == MmseStatus::kOk &&
+                        result.candidate_count == 1U && result.decoded_candidate_count == 1U &&
+                        result.crc_rnti_miss_count == 0U && result.semantic_reject_count == 0U &&
+                        result.hits.size() == 1U && result.hits[0].rnti == kRnti &&
+                        result.hits[0].first_cce == 0U &&
+                        result.hits[0].aggregation_level == aggregation_level &&
+                        result.hits[0].decoded.dci.start_prb == 10U &&
+                        result.hits[0].decoded.dci.n_prb == 20U,
+                    "pdcch UE-specific search must decode low aggregation candidates");
+
+        FixedTailBitingDecoder fixed_decoder{.decoded_bits = decoded_bits};
+        config.decoder = {.context = &fixed_decoder, .decode = fixed_tail_biting_decoder};
+        result = {};
+        expect_true(mmse::pdcch::decode_pdcch_ue_specific_search_dci_format1a(
+                        backend, config, result) == MmseStatus::kOk &&
+                        fixed_decoder.call_count == 1U && result.hits.size() == 1U &&
+                        result.hits[0].aggregation_level == aggregation_level,
+                    "pdcch UE-specific search must retain external decoder coverage");
+    }
+}
+
+void test_pdcch_si_rnti_geometry_search_acquires_and_reprobes() {
+    MmseEqualizerCpuContext context;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(context.init(cpu_config) == MmseStatus::kOk,
+                "PDCCH geometry search CPU context init");
+
+    mmse::pdcch::PdcchSiRntiGeometrySearchRequest request{};
+    request.sfn_subframe = 3U;
+    request.cell_id = 0U;
+    request.n_tx_ports = 1U;
+    request.tx_mode = 1U;
+    request.control_subframe = {
+        .duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+        .subframe = 3U,
+        .kind = mmse::pdcch::LteControlSubframeKind::kRegular,
+    };
+    const mmse::pdcch::PdcchControlGeometry target_geometry{
+        .control_symbol_count = 1U,
+        .phich_resource = mmse::pdcch::PhichResource::kOneSixth,
+        .phich_duration = mmse::pdcch::PhichDuration::kNormal,
+        .standard_reg_order = true,
+    };
+
+    auto desc = make_pdcch_desc();
+    desc.sfn_subframe = request.sfn_subframe;
+    desc.cell_id = request.cell_id;
+    desc.n_tx_ports = request.n_tx_ports;
+    desc.tx_mode = request.tx_mode;
+    desc.control_symbol_count = target_geometry.control_symbol_count;
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    request.grid = make_grid_view(buffers);
+    mmse::PdcchMmseInput target_input{};
+    expect_true(mmse::pdcch::detail::build_pdcch_si_rnti_geometry_input(
+                    request, target_geometry, target_input) == MmseStatus::kOk,
+                "PDCCH geometry search target input build");
+    desc.control_re_exclusion_masks = target_input.control_re_exclusion_masks;
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    expect_true(n_source_re >= 144U, "PDCCH geometry search target must contain L4");
+    for (std::uint32_t re = 0U; re < n_source_re; ++re) {
+        buffers.re[0][layout.grid_indices[re]] = 0.125F + static_cast<float>(re) * 0.001F;
+        buffers.im[0][layout.grid_indices[re]] = -0.375F + static_cast<float>(re) * 0.0005F;
+    }
+    request.grid = make_grid_view(buffers);
+
+    constexpr std::uint32_t kMaxPdcchRe = kLteMaxControlSymbolsNormalCp * kLteNumSubcarriers20MHz;
+    std::vector<float> x_hat_re(kMaxPdcchRe);
+    std::vector<float> x_hat_im(kMaxPdcchRe);
+    std::vector<float> sinr(kMaxPdcchRe);
+    std::vector<std::uint16_t> re_grid_indices(kMaxPdcchRe);
+    mmse::PdcchMmseOutputView output{
+        .x_hat_re = x_hat_re.data(),
+        .x_hat_im = x_hat_im.data(),
+        .sinr = sinr.data(),
+        .re_grid_indices = re_grid_indices.data(),
+        .capacity_re_per_layer = kMaxPdcchRe,
+        .capacity_re_metadata = kMaxPdcchRe,
+    };
+    mmse::PdcchMmseResult metadata{};
+    expect_true(context.run_pdcch(target_input, output, metadata) == MmseStatus::kOk,
+                "PDCCH geometry search target equalization");
+    const auto target_backend =
+        mmse::pdcch::make_backend_pdcch_equalized_indication(metadata, output);
+    std::vector<mmse::pdcch::PdcchCandidateLlr> target_candidates{};
+    expect_true(mmse::pdcch::build_pdcch_common_search_candidate_llrs(
+                    target_backend, target_candidates) == MmseStatus::kOk,
+                "PDCCH geometry search target candidates");
+    const auto target_candidate =
+        std::find_if(target_candidates.begin(), target_candidates.end(), [](const auto& candidate) {
+            return candidate.chain.first_cce == 0U && candidate.chain.aggregation_level == 4U;
+        });
+    expect_true(target_candidate != target_candidates.end(),
+                "PDCCH geometry search target L4 candidate");
+    mmse::pdcch::PdcchRateRecoveredLlr target_recovered{};
+    expect_true(mmse::pdcch::recover_pdcch_convolutional_rate_matched_llrs(
+                    *target_candidate,
+                    mmse::pdcch::pdcch_dci_format1a_payload_bit_count(
+                        mmse::pdcch::PdcchDciFormat1AConfig{}),
+                    target_recovered) == MmseStatus::kOk,
+                "PDCCH geometry search target rate recovery");
+    SelectiveTailBitingDecoder selective_decoder{
+        .expected_llrs = target_recovered.convolutional_llrs,
+        .matched_bits = make_si_rnti_dci_format1a_bits(),
+        .miss_bits =
+            [] {
+                auto bits = make_si_rnti_dci_format1a_bits();
+                bits.back() ^= 1U;
+                return bits;
+            }(),
+    };
+    const mmse::pdcch::PdcchSiRntiGeometrySearchConfig search_config{
+        .decoder = {.context = &selective_decoder, .decode = selective_tail_biting_decoder},
+    };
+
+    mmse::pdcch::PdcchSiRntiGeometrySearchCache cache{};
+    mmse::pdcch::PdcchSiRntiGeometrySearchResult result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(
+                    context, request, search_config, cache, result) == MmseStatus::kOk,
+                "PDCCH geometry search acquire status");
+    expect_true(result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kAcquired,
+                "PDCCH geometry search must acquire a unique SI-RNTI control geometry status=" +
+                    std::to_string(static_cast<std::uint32_t>(result.status)) +
+                    " attempts=" + std::to_string(result.geometry_attempt_count) +
+                    " hits=" + std::to_string(result.decoded.hits.size()));
+    expect_true(result.geometry_attempt_count == 16U && cache.locked &&
+                    cache.geometry.control_symbol_count == target_geometry.control_symbol_count &&
+                    cache.geometry.phich_resource == target_geometry.phich_resource &&
+                    cache.geometry.phich_duration == target_geometry.phich_duration &&
+                    result.decoded.hits.size() == 1U,
+                "PDCCH geometry search acquisition metadata");
+
+    auto changed_cell_request = request;
+    changed_cell_request.cell_id = static_cast<std::uint16_t>(request.cell_id + 1U);
+    expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(context, changed_cell_request,
+                                                                   search_config, cache,
+                                                                   result) == MmseStatus::kOk &&
+                    result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kMiss &&
+                    result.geometry_attempt_count == 16U && !cache.locked,
+                "PDCCH geometry search must invalidate the cache when PCI changes");
+    expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(
+                    context, request, search_config, cache, result) == MmseStatus::kOk &&
+                    result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kAcquired &&
+                    cache.locked,
+                "PDCCH geometry search must reacquire after PCI cache invalidation");
+
+    buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    request.grid = make_grid_view(buffers);
+    for (std::uint32_t miss = 1U; miss <= 4U; ++miss) {
+        expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(
+                        context, request, search_config, cache, result) == MmseStatus::kOk &&
+                        result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kMiss &&
+                        result.geometry_attempt_count == 1U && cache.locked &&
+                        cache.consecutive_miss_count == miss,
+                    "PDCCH geometry search must retain a locked geometry through four misses");
+    }
+    expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(
+                    context, request, search_config, cache, result) == MmseStatus::kOk &&
+                    result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kMiss &&
+                    result.geometry_attempt_count == 16U && !cache.locked,
+                "PDCCH geometry search must re-enumerate after the fifth miss");
+}
+
+void test_pdcch_si_rnti_geometry_search_rejects_ambiguous_locks() {
+    MmseEqualizerCpuContext context;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    expect_true(context.init(cpu_config) == MmseStatus::kOk,
+                "PDCCH ambiguous geometry CPU context init");
+
+    auto desc = make_pdcch_desc();
+    desc.control_symbol_count = 3U;
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    mmse::pdcch::PdcchSiRntiGeometrySearchRequest request{};
+    request.grid = make_grid_view(buffers);
+    request.sfn_subframe = desc.sfn_subframe;
+    request.cell_id = desc.cell_id;
+    request.n_tx_ports = desc.n_tx_ports;
+    request.tx_mode = desc.tx_mode;
+    request.control_subframe = {
+        .duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+        .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+        .kind = mmse::pdcch::LteControlSubframeKind::kRegular,
+    };
+    FixedTailBitingDecoder fixed_decoder{.decoded_bits = make_si_rnti_dci_format1a_bits()};
+    mmse::pdcch::PdcchSiRntiGeometrySearchConfig config{
+        .decoder = {.context = &fixed_decoder, .decode = fixed_tail_biting_decoder},
+    };
+    mmse::pdcch::PdcchSiRntiGeometrySearchCache cache{};
+    mmse::pdcch::PdcchSiRntiGeometrySearchResult result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(context, request, config, cache,
+                                                                   result) == MmseStatus::kOk &&
+                    result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kAmbiguous &&
+                    result.geometry_attempt_count == 16U && !cache.locked &&
+                    result.decoded.hits.empty() && fixed_decoder.call_count > 1U,
+                "PDCCH geometry search must not lock an ambiguous SI-RNTI geometry");
+}
+
+void test_pdcch_cpu_si_rnti_search_runs_full_one_tx_chain() {
+    MmseEqualizerCpuContext context;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(context.init(cpu_config) == MmseStatus::kOk, "native SI one-tx cpu init");
+
+    const auto desc = make_pdcch_desc();
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    const auto symbols = make_native_si_rnti_qpsk_symbols(
+        n_source_re, 4U, 4U, make_si_rnti_dci_format1a_bits(), desc.cell_id, desc.sfn_subframe);
+    for (std::uint32_t re = 0U; re < n_source_re; ++re) {
+        buffers.re[0][layout.grid_indices[re]] = symbols[re].re;
+        buffers.im[0][layout.grid_indices[re]] = symbols[re].im;
+    }
+
+    PdcchMmseInput input{};
+    input.grid = make_grid_view(buffers);
+    input.sfn_subframe = desc.sfn_subframe;
+    input.cell_id = desc.cell_id;
+    input.n_tx_ports = desc.n_tx_ports;
+    input.tx_mode = desc.tx_mode;
+    input.control_symbol_count = desc.control_symbol_count;
+    input.n_prb = desc.n_prb;
+    input.prb_bitmap = desc.prb_bitmap;
+    input.control_re_exclusion_masks = desc.control_re_exclusion_masks;
+    input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                              .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                              .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    input.chain.request_id = 90301U;
+
+    mmse::pdcch::PdcchSiRntiSearchResult result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_search(context, input, {}, result) ==
+                    MmseStatus::kOk,
+                "native SI one-tx CPU entry should run full chain");
+    expect_true(result.hits.size() == 1U && result.hits[0].first_cce == 4U &&
+                    result.hits[0].decoded.dci.chain.request_id == input.chain.request_id &&
+                    result.hits[0].decoded.dci.start_prb == 10U &&
+                    result.hits[0].decoded.dci.n_prb == 20U &&
+                    result.hits[0].decoded.dci.mcs_tbs_index == 7U &&
+                    result.hits[0].decoded.dci.redundancy_version == 2U &&
+                    result.hits[0].decoded.dci.n_prb_1a == 3U,
+                "native SI one-tx entry must retain target CCE and DCI fields");
+
+    mmse::pdcch::PdcchCommonSearchDecodeResult common_result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_common_search_decode(context, input, {},
+                                                                common_result) == MmseStatus::kOk &&
+                    common_result.hits.size() == 1U &&
+                    common_result.hits[0].dci.chain.first_cce == 4U,
+                "common-search CPU entry must default to native tail-biting Viterbi");
+}
+
+void test_pdcch_cpu_si_rnti_search_runs_full_two_tx_chain() {
+    MmseEqualizerCpuContext context;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(context.init(cpu_config) == MmseStatus::kOk, "native SI two-tx cpu init");
+
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 2U;
+    desc.tx_mode = 2U;
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    const auto symbols = make_native_si_rnti_qpsk_symbols(
+        n_source_re, 4U, 4U, make_si_rnti_dci_format1a_bits(), desc.cell_id, desc.sfn_subframe);
+    expect_true((n_source_re & 1U) == 0U, "native SI two-tx source RE count must be even");
+    for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
+        fill_pdcch_td_pair(buffers, desc, layout.grid_indices[re], layout.grid_indices[re + 1U],
+                           {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F}, {1.0F, 0.0F}, symbols[re],
+                           symbols[re + 1U]);
+    }
+
+    PdcchMmseInput input{};
+    input.grid = make_grid_view(buffers);
+    input.sfn_subframe = desc.sfn_subframe;
+    input.cell_id = desc.cell_id;
+    input.n_tx_ports = desc.n_tx_ports;
+    input.tx_mode = desc.tx_mode;
+    input.control_symbol_count = desc.control_symbol_count;
+    input.n_prb = desc.n_prb;
+    input.prb_bitmap = desc.prb_bitmap;
+    input.control_re_exclusion_masks = desc.control_re_exclusion_masks;
+    input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                              .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                              .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    input.chain.request_id = 90302U;
+
+    mmse::pdcch::PdcchSiRntiSearchResult result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_search(context, input, {}, result) ==
+                    MmseStatus::kOk,
+                "native SI two-tx CPU entry should run full chain");
+    expect_true(result.hits.size() == 1U && result.hits[0].first_cce == 4U &&
+                    result.hits[0].decoded.dci.chain.request_id == input.chain.request_id &&
+                    result.hits[0].decoded.dci.start_prb == 10U &&
+                    result.hits[0].decoded.dci.n_prb == 20U &&
+                    result.hits[0].decoded.dci.mcs_tbs_index == 7U &&
+                    result.hits[0].decoded.dci.redundancy_version == 2U &&
+                    result.hits[0].decoded.dci.n_prb_1a == 3U,
+                "native SI two-tx entry must normalize CCE order and retain DCI fields");
+}
+
+void test_pdcch_cpu_ue_specific_search_runs_full_one_and_two_tx_chains() {
+    constexpr std::uint16_t kRnti = 0x1234U;
+    for (const std::uint8_t n_tx_ports : {1U, 2U}) {
+        MmseEqualizerCpuContext context;
+        MmseEqualizerCpuConfig cpu_config{};
+        cpu_config.worker_count = 1U;
+        cpu_config.sigma2_min = 1.0e-5F;
+        expect_true(context.init(cpu_config) == MmseStatus::kOk, "UE-specific full-chain CPU init");
+
+        auto desc = make_pdcch_desc();
+        desc.n_tx_ports = n_tx_ports;
+        desc.tx_mode = n_tx_ports == 1U ? 1U : 2U;
+        GridBuffers buffers = make_zero_grid();
+        fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+        mmse::detail::ReLayout layout{};
+        const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+        mmse::pdcch::PdcchControlRegion control_region{};
+        expect_true(mmse::pdcch::build_pdcch_control_region(desc.cell_id, desc.control_symbol_count,
+                                                            layout.grid_indices.data(), n_source_re,
+                                                            control_region) == MmseStatus::kOk,
+                    "UE-specific full-chain control-region build");
+
+        const std::uint8_t aggregation_level = n_tx_ports == 1U ? 1U : 2U;
+        mmse::pdcch::PdcchUeSpecificSearchConfig config{};
+        config.rntis = {kRnti};
+        config.aggregation_level_mask = aggregation_level == 1U
+                                            ? mmse::pdcch::kPdcchAggregationLevelMaskL1
+                                            : mmse::pdcch::kPdcchAggregationLevelMaskL2;
+        std::vector<mmse::pdcch::PdcchUeSpecificSearchCandidate> candidates{};
+        expect_true(mmse::pdcch::build_pdcch_ue_specific_search_candidates(
+                        control_region, desc.sfn_subframe, config, candidates) == MmseStatus::kOk &&
+                        !candidates.empty(),
+                    "UE-specific full-chain candidate build");
+        const std::uint16_t first_cce = candidates.front().search_candidate.first_cce;
+        std::vector<std::uint8_t> decoded_bits = make_si_rnti_dci_format1a_bits();
+        rewrite_pdcch_crc_rnti_mask(decoded_bits, kRnti);
+        const auto symbols =
+            make_native_si_rnti_qpsk_symbols(n_source_re, first_cce, aggregation_level,
+                                             decoded_bits, desc.cell_id, desc.sfn_subframe);
+        if (n_tx_ports == 1U) {
+            for (std::uint32_t re = 0U; re < n_source_re; ++re) {
+                buffers.re[0][layout.grid_indices[re]] = symbols[re].re;
+                buffers.im[0][layout.grid_indices[re]] = symbols[re].im;
+            }
+        } else {
+            expect_true((n_source_re & 1U) == 0U,
+                        "UE-specific two-tx source RE count must be even");
+            for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
+                fill_pdcch_td_pair(buffers, desc, layout.grid_indices[re],
+                                   layout.grid_indices[re + 1U], {1.0F, 0.0F}, {0.0F, 0.0F},
+                                   {0.0F, 0.0F}, {1.0F, 0.0F}, symbols[re], symbols[re + 1U]);
+            }
+        }
+
+        PdcchMmseInput input{};
+        input.grid = make_grid_view(buffers);
+        input.sfn_subframe = desc.sfn_subframe;
+        input.cell_id = desc.cell_id;
+        input.n_tx_ports = desc.n_tx_ports;
+        input.tx_mode = desc.tx_mode;
+        input.control_symbol_count = desc.control_symbol_count;
+        input.n_prb = desc.n_prb;
+        input.prb_bitmap = desc.prb_bitmap;
+        input.control_re_exclusion_masks = desc.control_re_exclusion_masks;
+        input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                                  .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                                  .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+        input.chain.request_id = 90400U + n_tx_ports;
+
+        mmse::pdcch::PdcchUeSpecificSearchResult result{};
+        expect_true(mmse::pdcch::run_pdcch_cpu_ue_specific_search(context, input, config, result) ==
+                            MmseStatus::kOk &&
+                        result.hits.size() == 1U && result.hits[0].rnti == kRnti &&
+                        result.hits[0].first_cce == first_cce &&
+                        result.hits[0].aggregation_level == aggregation_level &&
+                        result.hits[0].decoded.dci.chain.request_id == input.chain.request_id &&
+                        result.hits[0].decoded.dci.start_prb == 10U &&
+                        result.hits[0].decoded.dci.n_prb == 20U,
+                    "UE-specific CPU entry must decode the target CCE for both transmit modes");
+    }
+}
+
 void test_pdcch_common_search_decode_returns_all_hits() {
     constexpr std::uint32_t kCceCount = 4U;
     constexpr std::uint32_t kReCount =
@@ -2817,6 +4355,7 @@ void test_gpu_context_cuda_td_matches_cpu_td() {
     MmseEqualizerGpuContext gpu;
     MmseEqualizerGpuConfig gpu_config{};
     gpu_config.backend = MmseGpuBackend::kCuda;
+    gpu_config.validation_policy = MmseGpuValidationPolicy::kTestDeepTrace;
     gpu_config.sigma2_min = 1.0e-5F;
     gpu_config.det_floor = 1.0e-6F;
     gpu_config.g_min = 1.0e-4F;
@@ -2873,7 +4412,7 @@ void test_gpu_context_cuda_td_matches_cpu_td() {
     for (std::uint32_t i = 0; i < cpu_meta.n_symbols; ++i) {
         expect_near(gpu_re[i], cpu_re[i], 1.0e-4F, "gpu cuda td xhat real");
         expect_near(gpu_im[i], cpu_im[i], 1.0e-4F, "gpu cuda td xhat imag");
-        expect_near(gpu_sinr[i], cpu_sinr[i], 1.0e-4F, "gpu cuda td sinr");
+        expect_near(gpu_sinr[i], cpu_sinr[i], 1.0e-4F, "gpu cuda td sinr i=" + std::to_string(i));
         expect_true(gpu_g0[i] == cpu_g0[i] && gpu_g1[i] == cpu_g1[i], "gpu cuda td re pairs");
     }
 #endif
@@ -2917,14 +4456,10 @@ void test_gpu_context_cuda_td_backend_run_matches_cpu_run() {
     EqualizerOutputView cpu_out{cpu_re.data(), cpu_im.data(), cpu_sinr.data(), n_re};
     EqualizerOutputView gpu_out{gpu_re.data(), gpu_im.data(), gpu_sinr.data(), n_re};
 
-    expect_true(cpu.run(grid, desc, cpu_out) == MmseStatus::kOk, "cpu td backend run");
-    expect_true(gpu.run(grid, desc, gpu_out) == MmseStatus::kOk, "gpu td backend run");
-    expect_true(cpu_out.n_re_per_layer == gpu_out.n_re_per_layer, "td backend re count");
-    for (std::uint32_t i = 0; i < cpu_out.n_re_per_layer; ++i) {
-        expect_near(gpu_re[i], cpu_re[i], 1.0e-4F, "gpu td backend xhat real");
-        expect_near(gpu_im[i], cpu_im[i], 1.0e-4F, "gpu td backend xhat imag");
-        expect_near(gpu_sinr[i], cpu_sinr[i], 1.0e-4F, "gpu td backend sinr");
-    }
+    expect_true(cpu.run(grid, desc, cpu_out) == MmseStatus::kUnsupportedConfig,
+                "cpu generic run must reject two-port pdcch transmit diversity");
+    expect_true(gpu.run(grid, desc, gpu_out) == MmseStatus::kUnsupportedConfig,
+                "gpu generic run must reject two-port pdcch transmit diversity");
 #endif
 }
 
@@ -3861,6 +5396,8 @@ int main() {
         std::pair{"buffer_too_small", &test_buffer_too_small},
         std::pair{"single_layer_identity_channel_equalization",
                   &test_single_layer_identity_channel_equalization},
+        std::pair{"single_rx_single_layer_equalization_and_pdcch",
+                  &test_single_rx_single_layer_equalization_and_pdcch},
         std::pair{"sigma2_state_persists", &test_sigma2_state_persists},
         std::pair{"single_layer_path", &test_single_layer_path},
         std::pair{"pdcch_layout_excludes_crs_and_reserved_res",
@@ -3869,6 +5406,8 @@ int main() {
                   &test_pbch_layout_matches_lte_center_72_subcarriers},
         std::pair{"pcfich_layout_matches_four_regs_without_crs",
                   &test_pcfich_layout_matches_four_regs_without_crs},
+        std::pair{"single_port_lte_control_reference_vector",
+                  &test_single_port_lte_control_reference_vector},
         std::pair{"pbch_frontend_dto_builds_mmse_input", &test_pbch_frontend_dto_builds_mmse_input},
         std::pair{"pcfich_frontend_dto_builds_mmse_input",
                   &test_pcfich_frontend_dto_builds_mmse_input},
@@ -3880,6 +5419,18 @@ int main() {
                   &test_pbch_cpu_run_returns_equalized_pbch_surface},
         std::pair{"pcfich_cpu_run_returns_equalized_pcfich_surface",
                   &test_pcfich_cpu_run_returns_equalized_pcfich_surface},
+        std::pair{"crs_values_match_independent_reference",
+                  &test_crs_values_match_independent_reference},
+        std::pair{"channel_interpolation_extrapolates_linearly",
+                  &test_channel_interpolation_extrapolates_linearly},
+        std::pair{"noise_estimate_has_two_thirds_calibration",
+                  &test_noise_estimate_has_two_thirds_calibration},
+        std::pair{"generation_invalidates_cpu_subframe_cache",
+                  &test_generation_invalidates_cpu_subframe_cache},
+        std::pair{"pbch_and_pcfich_td_cpu_golden_and_dto",
+                  &test_pbch_and_pcfich_td_cpu_golden_and_dto},
+        std::pair{"gpu_cuda_pbch_and_pcfich_td_match_cpu",
+                  &test_gpu_cuda_pbch_and_pcfich_td_match_cpu},
         std::pair{"cpu_shared_estimate_reuses_once_per_subframe",
                   &test_cpu_shared_estimate_reuses_once_per_subframe},
         std::pair{"gpu_shared_estimate_skips_second_estimate_path",
@@ -3905,12 +5456,32 @@ int main() {
                   &test_pdcch_control_region_rejects_invalid_re_indices},
         std::pair{"pdcch_common_search_candidates_follow_lte_levels",
                   &test_pdcch_common_search_candidates_follow_lte_levels},
+        std::pair{"pdcch_ue_specific_search_candidates_follow_lte_levels",
+                  &test_pdcch_ue_specific_search_candidates_follow_lte_levels},
         std::pair{"pdcch_common_search_candidate_llrs_follow_cce_offsets",
                   &test_pdcch_common_search_candidate_llrs_follow_cce_offsets},
         std::pair{"pdcch_common_search_candidate_llrs_reject_invalid_backend",
                   &test_pdcch_common_search_candidate_llrs_reject_invalid_backend},
         std::pair{"pdcch_common_search_decode_returns_all_hits",
                   &test_pdcch_common_search_decode_returns_all_hits},
+        std::pair{"pdcch_native_si_rnti_search_returns_only_target_candidate",
+                  &test_pdcch_native_si_rnti_search_returns_only_target_candidate},
+        std::pair{"pdcch_ue_specific_search_decodes_l1_l2_candidates",
+                  &test_pdcch_ue_specific_search_decodes_l1_l2_candidates},
+        std::pair{"pdcch_si_rnti_geometry_search_acquires_and_reprobes",
+                  &test_pdcch_si_rnti_geometry_search_acquires_and_reprobes},
+        std::pair{"pdcch_si_rnti_geometry_search_rejects_ambiguous_locks",
+                  &test_pdcch_si_rnti_geometry_search_rejects_ambiguous_locks},
+        std::pair{"pdcch_si_rnti_semantics_reject_invalid_grants",
+                  &test_pdcch_si_rnti_semantics_reject_invalid_grants},
+        std::pair{"pdcch_dci_format1a_si_numeric_boundaries",
+                  &test_pdcch_dci_format1a_si_numeric_boundaries},
+        std::pair{"pdcch_cpu_si_rnti_search_runs_full_one_tx_chain",
+                  &test_pdcch_cpu_si_rnti_search_runs_full_one_tx_chain},
+        std::pair{"pdcch_cpu_si_rnti_search_runs_full_two_tx_chain",
+                  &test_pdcch_cpu_si_rnti_search_runs_full_two_tx_chain},
+        std::pair{"pdcch_cpu_ue_specific_search_runs_full_one_and_two_tx_chains",
+                  &test_pdcch_cpu_ue_specific_search_runs_full_one_and_two_tx_chains},
         std::pair{"pdcch_convolutional_rate_recovery_combines_repetitions",
                   &test_pdcch_convolutional_rate_recovery_combines_repetitions},
         std::pair{"pdcch_convolutional_rate_recovery_handles_dummy_bits",
@@ -3919,6 +5490,16 @@ int main() {
                   &test_pdcch_convolutional_rate_recovery_rejects_invalid_candidate},
         std::pair{"pdcch_tail_biting_decoder_adapter_contract",
                   &test_pdcch_tail_biting_decoder_adapter_contract},
+        std::pair{"pdcch_native_tail_biting_decoder_all_initial_states",
+                  &test_pdcch_native_tail_biting_decoder_all_initial_states},
+        std::pair{"pdcch_native_tail_biting_decoder_length_boundaries",
+                  &test_pdcch_native_tail_biting_decoder_length_boundaries},
+        std::pair{"pdcch_native_tail_biting_decoder_llr_and_invalid_inputs",
+                  &test_pdcch_native_tail_biting_decoder_llr_and_invalid_inputs},
+        std::pair{"pdcch_native_tail_biting_decoder_boundaries_tie_break_and_failures",
+                  &test_pdcch_native_tail_biting_decoder_boundaries_tie_break_and_failures},
+        std::pair{"pdcch_native_tail_biting_rate_recovery_l4_l8",
+                  &test_pdcch_native_tail_biting_rate_recovery_l4_l8},
         std::pair{"pdcch_crc16_and_rnti_mask_check", &test_pdcch_crc16_and_rnti_mask_check},
         std::pair{"pdcch_dci_format1a_fdd_si_rnti_parse",
                   &test_pdcch_dci_format1a_fdd_si_rnti_parse},

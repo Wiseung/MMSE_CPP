@@ -183,7 +183,7 @@ mmse::pcfich::BackendPcfichEqualizedIndication backend =
 - 仅 LTE
 - 仅 20 MHz
 - 仅 normal CP
-- `n_rx_ant == 2`
+- `n_rx_ant == 1 or 2`
 - `n_symbols == 14`
 - `n_subcarriers == 1200`
 - `n_layers == 1`

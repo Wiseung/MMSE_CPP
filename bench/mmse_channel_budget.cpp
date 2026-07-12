@@ -89,7 +89,7 @@ GridBuffers make_random_grid(std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> dist(0.0F, 1.0F);
     GridBuffers grid;
-    for (std::uint32_t rx = 0; rx < kLteNumRxAntV1; ++rx) {
+    for (std::uint32_t rx = 0; rx < kMmseV1MaxNumRxAntennas; ++rx) {
         grid.re[rx].resize(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz);
         grid.im[rx].resize(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz);
         for (std::size_t i = 0; i < grid.re[rx].size(); ++i) {
@@ -104,7 +104,7 @@ PlanarGridViewF32 make_view(const GridBuffers& buffers) {
     PlanarGridViewF32 view{};
     view.re = {buffers.re[0].data(), buffers.re[1].data()};
     view.im = {buffers.im[0].data(), buffers.im[1].data()};
-    view.n_rx_ant = kLteNumRxAntV1;
+    view.n_rx_ant = kMmseV1MaxNumRxAntennas;
     view.n_symbols = kLteNumSymbolsNormalCp;
     view.n_subcarriers = kLteNumSubcarriers20MHz;
     return view;

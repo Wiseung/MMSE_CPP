@@ -141,6 +141,10 @@
   - caller-owned `LLR` 输出面
 - `PDCCH` 场景下对 `PCFICH / PHICH` 占用资源的排除
 - `PDCCH 2Tx` 发射分集去映射
+- `PDCCH` 的 `REG / CCE` 恢复 helper
+- `PDCCH common search` 与 UE-specific 候选构造、`L=1/2/4/8` 速率恢复、`CRC-RNTI` 与 `DCI 1A` 解析 helper
+- 默认内建尾咬卷积码译码的正式 CPU common-search 与 UE-specific `DCI 1A` 链路，可由外部回调覆盖
+- 当前 `20 MHz / FDD` 边界内的 SI-RNTI 未知控制区几何搜索与缓存锁定
 
 ### 2. 未覆盖的能力
 
@@ -150,8 +154,7 @@
 - `MIB` 解析
 - `PCFICH` 译码
 - `PHICH` 译码
-- `PDCCH` 盲检索
-- `DCI` 解码 / CRC-RNTI 验证
+- 非 `DCI 1A` 的通用 `DCI` 解码
 - 仓库内真实存在的 `PDSCH` 下游 context / grant context / decode context
 - `PDSCH` 速率恢复 / `HARQ` 软合并 / `Turbo` 译码
 - `MAC PDU` 解码
@@ -159,7 +162,7 @@
 
 也就是说，本工程当前主要处于：
 
-**资源网格 -> 有效 RE 提取 -> 信道估计 -> 均衡 -> 软符号 / SINR 输出**
+本工程当前主要处于：`资源网格 -> 有效 RE 提取 -> 信道估计 -> 均衡 -> LLR -> PDCCH common-search / UE-specific DCI 1A 输出`。
 
 这一段。
 
@@ -243,6 +246,30 @@ downstream context。
 - `re_grid_indices1`
 
 这个输出面中，每个软符号都带有一对来源 `RE` 索引，用来表示发射分集去映射后的来源关系。
+
+### 4. PDCCH `DCI 1A` CPU 输出面
+
+输入：
+
+- `PdcchMmseInput`
+- `PdcchCommonSearchDecodeConfig` 或 `PdcchSiRntiSearchConfig`
+- `PdcchUeSpecificSearchConfig`
+- 或 `PdcchSiRntiGeometrySearchRequest + PdcchSiRntiGeometrySearchCache`
+
+输出：
+
+- `PdcchCommonSearchDecodeResult`
+- `PdcchSiRntiSearchResult`
+- `PdcchUeSpecificSearchResult`
+- `PdcchSiRntiGeometrySearchResult`
+- `hits`
+
+这个输出面当前只覆盖：
+
+- `common search` 与 UE-specific search
+- `DCI 1A`
+- 默认内建尾咬卷积码译码（可选外部回调覆盖）
+- 当前 `20 MHz / FDD` 的 SI-RNTI CFI/PHICH 几何枚举与锁定
 
 ---
 
@@ -354,12 +381,12 @@ downstream context。
 - 做 `CRS` 信道估计
 - 做 `MMSE` 均衡
 - 对 `PDCCH 2Tx` 做发射分集去映射
-- 把软符号、`SINR`、以及 `RE` 来源信息交给外部下游
+- 把软符号、`SINR`、`RE` 来源信息，以及当前文档化边界内的 PDCCH common-search、UE-specific 和 SI-RNTI `DCI 1A` 命中列表交给外部下游
 
 而完整的：
 
 - `PBCH -> MIB`
-- `PDCCH -> DCI`
+- `PDCCH -> 通用 DCI`
 - `PDSCH -> TB / MAC PDU`
 
 这些业务级译码链路，目前还不在仓库内部。

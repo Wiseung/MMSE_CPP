@@ -46,21 +46,19 @@ struct StageTimes {
     double llr_us = 0.0;
     double candidate_gather_us = 0.0;
     double rate_recovery_us = 0.0;
-    double convolutional_adapter_us = 0.0;
+    double tail_biting_viterbi_us = 0.0;
     double crc_dci_us = 0.0;
     double total_us = 0.0;
-};
-
-struct BenchmarkTailBitingDecoder {
-    std::vector<std::uint8_t> decoded_bits{};
-    std::uint64_t call_count = 0U;
+    std::uint32_t candidate_count = 0U;
+    std::uint32_t crc_hit_count = 0U;
+    std::uint32_t crc_miss_count = 0U;
 };
 
 GridBuffers make_random_grid(std::uint32_t seed) {
     std::mt19937 generator(seed);
     std::normal_distribution<float> distribution(0.0F, 1.0F);
     GridBuffers buffers{};
-    for (std::uint32_t rx = 0U; rx < kLteNumRxAntV1; ++rx) {
+    for (std::uint32_t rx = 0U; rx < kMmseV1MaxNumRxAntennas; ++rx) {
         buffers.re[rx].resize(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz);
         buffers.im[rx].resize(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz);
         for (std::size_t sample = 0U; sample < buffers.re[rx].size(); ++sample) {
@@ -75,7 +73,7 @@ PlanarGridViewF32 make_grid_view(const GridBuffers& buffers) {
     return {
         .re = {buffers.re[0].data(), buffers.re[1].data()},
         .im = {buffers.im[0].data(), buffers.im[1].data()},
-        .n_rx_ant = kLteNumRxAntV1,
+        .n_rx_ant = kMmseV1MaxNumRxAntennas,
         .n_symbols = kLteNumSymbolsNormalCp,
         .n_subcarriers = kLteNumSubcarriers20MHz,
     };
@@ -101,53 +99,6 @@ PdcchMmseInput make_pdcch_input(const PlanarGridViewF32& grid) {
                                                         .mi = 1U,
                                                         .subframe_ctx = frontend.control_subframe});
     return pdcch::make_pdcch_mmse_input(grid, frontend);
-}
-
-void append_bits(std::vector<std::uint8_t>& bits, std::uint32_t value, std::uint8_t width) {
-    for (std::uint8_t bit = 0U; bit < width; ++bit) {
-        const std::uint8_t shift = static_cast<std::uint8_t>(width - 1U - bit);
-        bits.push_back(static_cast<std::uint8_t>((value >> shift) & 1U));
-    }
-}
-
-std::vector<std::uint8_t> make_benchmark_dci_bits() {
-    const pdcch::PdcchDciFormat1AConfig config{};
-    constexpr std::uint16_t kStartPrb = 10U;
-    constexpr std::uint16_t kAllocatedPrbCount = 20U;
-    const std::uint16_t riv =
-        static_cast<std::uint16_t>(config.n_prb * (kAllocatedPrbCount - 1U) + kStartPrb);
-    std::vector<std::uint8_t> payload{};
-    append_bits(payload, 1U, 1U);
-    append_bits(payload, 0U, 1U);
-    append_bits(payload, riv, pdcch::pdcch_dci_riv_bit_count(config.n_prb));
-    append_bits(payload, 7U, 5U);
-    append_bits(payload, 5U, 3U);
-    append_bits(payload, 0U, 1U);
-    append_bits(payload, 2U, 2U);
-    append_bits(payload, 0U, 1U);
-    append_bits(payload, 1U, 1U);
-
-    const std::uint16_t masked_crc = static_cast<std::uint16_t>(
-        pdcch::calculate_pdcch_crc16(payload.data(), static_cast<std::uint32_t>(payload.size())) ^
-        pdcch::kSiRnti);
-    append_bits(payload, masked_crc, pdcch::kPdcchCrcBitCount);
-    return payload;
-}
-
-MmseStatus
-benchmark_tail_biting_decoder(void* context,
-                              const pdcch::PdcchTailBitingConvolutionalDecodeRequest& request) {
-    auto* decoder = static_cast<BenchmarkTailBitingDecoder*>(context);
-    if (decoder == nullptr || request.convolutional_llrs == nullptr ||
-        request.decoded_bits == nullptr || !request.tail_biting ||
-        request.decoded_bit_count != decoder->decoded_bits.size() ||
-        request.convolutional_llr_count !=
-            request.decoded_bit_count * pdcch::kPdcchConvolutionalCodeRate) {
-        return MmseStatus::kInternalError;
-    }
-    std::copy(decoder->decoded_bits.begin(), decoder->decoded_bits.end(), request.decoded_bits);
-    ++decoder->call_count;
-    return MmseStatus::kOk;
 }
 
 bool gather_common_search_candidates(const pdcch::BackendPdcchEqualizedIndication& backend,
@@ -181,8 +132,7 @@ bool gather_common_search_candidates(const pdcch::BackendPdcchEqualizedIndicatio
 }
 
 bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchBuffers& buffers,
-                  BenchmarkTailBitingDecoder& decoder, StageTimes& times,
-                  std::uint32_t subframe_index) {
+                  StageTimes& times, std::uint32_t subframe_index) {
     using Clock = std::chrono::steady_clock;
     input.sfn_subframe = subframe_index;
     input.control_subframe.subframe = static_cast<std::uint8_t>(subframe_index % 10U);
@@ -244,19 +194,15 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
     times.rate_recovery_us = std::chrono::duration<double, std::micro>(end - start).count();
 
     std::vector<std::vector<std::uint8_t>> decoded_bits(recovered.size());
-    const pdcch::PdcchTailBitingConvolutionalDecoder adapter{
-        .context = &decoder,
-        .decode = benchmark_tail_biting_decoder,
-    };
     start = Clock::now();
     for (std::size_t candidate = 0U; candidate < recovered.size(); ++candidate) {
-        if (pdcch::invoke_pdcch_tail_biting_convolutional_decoder(
-                recovered[candidate], adapter, decoded_bits[candidate]) != MmseStatus::kOk) {
+        if (pdcch::decode_pdcch_tail_biting_convolutional(
+                recovered[candidate], decoded_bits[candidate]) != MmseStatus::kOk) {
             return false;
         }
     }
     end = Clock::now();
-    times.convolutional_adapter_us = std::chrono::duration<double, std::micro>(end - start).count();
+    times.tail_biting_viterbi_us = std::chrono::duration<double, std::micro>(end - start).count();
 
     start = Clock::now();
     std::uint32_t hit_count = 0U;
@@ -274,9 +220,9 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
     }
     end = Clock::now();
     times.crc_dci_us = std::chrono::duration<double, std::micro>(end - start).count();
-    if (hit_count != candidates.size()) {
-        return false;
-    }
+    times.candidate_count = static_cast<std::uint32_t>(candidates.size());
+    times.crc_hit_count = hit_count;
+    times.crc_miss_count = times.candidate_count - hit_count;
     times.total_us = std::chrono::duration<double, std::micro>(Clock::now() - total_start).count();
     return true;
 }
@@ -289,9 +235,12 @@ StageTimes sum_window(const std::vector<StageTimes>& values, std::size_t first, 
         sum.llr_us += values[index].llr_us;
         sum.candidate_gather_us += values[index].candidate_gather_us;
         sum.rate_recovery_us += values[index].rate_recovery_us;
-        sum.convolutional_adapter_us += values[index].convolutional_adapter_us;
+        sum.tail_biting_viterbi_us += values[index].tail_biting_viterbi_us;
         sum.crc_dci_us += values[index].crc_dci_us;
         sum.total_us += values[index].total_us;
+        sum.candidate_count += values[index].candidate_count;
+        sum.crc_hit_count += values[index].crc_hit_count;
+        sum.crc_miss_count += values[index].crc_miss_count;
     }
     return sum;
 }
@@ -327,10 +276,18 @@ void print_summaries(std::string_view scope, const std::vector<StageTimes>& valu
                   [](const StageTimes& times) { return times.candidate_gather_us; });
     print_summary(scope, "rate_recovery", values,
                   [](const StageTimes& times) { return times.rate_recovery_us; });
-    print_summary(scope, "convolutional_adapter", values,
-                  [](const StageTimes& times) { return times.convolutional_adapter_us; });
+    print_summary(scope, "tail_biting_viterbi", values,
+                  [](const StageTimes& times) { return times.tail_biting_viterbi_us; });
     print_summary(scope, "crc_dci", values,
                   [](const StageTimes& times) { return times.crc_dci_us; });
+    print_summary(scope, "candidate_count", values, [](const StageTimes& times) {
+        return static_cast<double>(times.candidate_count);
+    });
+    print_summary(scope, "crc_hit", values,
+                  [](const StageTimes& times) { return static_cast<double>(times.crc_hit_count); });
+    print_summary(scope, "crc_miss", values, [](const StageTimes& times) {
+        return static_cast<double>(times.crc_miss_count);
+    });
     print_summary(scope, "total", values, [](const StageTimes& times) { return times.total_us; });
 }
 
@@ -349,11 +306,10 @@ int main() {
         return 1;
     }
 
-    BenchmarkTailBitingDecoder decoder{.decoded_bits = make_benchmark_dci_bits()};
     PdcchBuffers buffers{};
     StageTimes ignored{};
     for (std::uint32_t subframe = 0U; subframe < kWarmupSubframes; ++subframe) {
-        if (!run_subframe(context, input, buffers, decoder, ignored, subframe)) {
+        if (!run_subframe(context, input, buffers, ignored, subframe)) {
             std::cerr << "warmup failed\n";
             return 1;
         }
@@ -363,7 +319,7 @@ int main() {
     per_subframe.reserve(kMeasuredSubframes);
     for (std::uint32_t subframe = 0U; subframe < kMeasuredSubframes; ++subframe) {
         StageTimes times{};
-        if (!run_subframe(context, input, buffers, decoder, times, kWarmupSubframes + subframe)) {
+        if (!run_subframe(context, input, buffers, times, kWarmupSubframes + subframe)) {
             std::cerr << "measurement failed\n";
             return 1;
         }
@@ -379,9 +335,65 @@ int main() {
 
     std::cout << "pdcch_decode_bench.subframe_count=" << per_subframe.size() << '\n';
     std::cout << "pdcch_decode_bench.window_count=" << per_window.size() << '\n';
-    std::cout << "pdcch_decode_bench.decoder=benchmark_adapter\n";
-    std::cout << "pdcch_decode_bench.decoder_calls=" << decoder.call_count << '\n';
+    std::cout << "pdcch_decode_bench.decoder=native_tail_biting_viterbi\n";
     print_summaries("subframe_1ms", per_subframe);
     print_summaries("window_10ms", per_window);
+
+    pdcch::PdcchSiRntiGeometrySearchRequest geometry_request{};
+    geometry_request.grid = grid;
+    geometry_request.sfn_subframe = input.sfn_subframe;
+    geometry_request.cell_id = input.cell_id;
+    geometry_request.n_tx_ports = input.n_tx_ports;
+    geometry_request.tx_mode = input.tx_mode;
+    geometry_request.control_subframe = input.control_subframe;
+    geometry_request.chain = input.chain;
+    const auto measure_geometry_search = [&](pdcch::PdcchSiRntiGeometrySearchCache& cache,
+                                             pdcch::PdcchSiRntiGeometrySearchResult& result) {
+        const auto start = std::chrono::steady_clock::now();
+        const MmseStatus status = pdcch::run_pdcch_cpu_si_rnti_geometry_search(
+            context, geometry_request, {}, cache, result);
+        const auto end = std::chrono::steady_clock::now();
+        if (status != MmseStatus::kOk) {
+            return -1.0;
+        }
+        return std::chrono::duration<double, std::micro>(end - start).count();
+    };
+
+    pdcch::PdcchSiRntiGeometrySearchCache cold_cache{};
+    pdcch::PdcchSiRntiGeometrySearchResult cold_result{};
+    const double cold_geometry_us = measure_geometry_search(cold_cache, cold_result);
+
+    pdcch::PdcchSiRntiGeometrySearchCache locked_cache{
+        .locked = true,
+        .cell_id = geometry_request.cell_id,
+        .n_tx_ports = geometry_request.n_tx_ports,
+        .tx_mode = geometry_request.tx_mode,
+        .subframe_kind = geometry_request.control_subframe.kind,
+        .geometry =
+            {
+                .control_symbol_count = input.control_symbol_count,
+                .phich_resource = pdcch::PhichResource::kOne,
+                .phich_duration = pdcch::PhichDuration::kNormal,
+                .standard_reg_order = true,
+            },
+    };
+    pdcch::PdcchSiRntiGeometrySearchResult locked_result{};
+    const double locked_geometry_us = measure_geometry_search(locked_cache, locked_result);
+    locked_cache.consecutive_miss_count = 4U;
+    pdcch::PdcchSiRntiGeometrySearchResult reprobe_result{};
+    const double reprobe_geometry_us = measure_geometry_search(locked_cache, reprobe_result);
+    if (cold_geometry_us < 0.0 || locked_geometry_us < 0.0 || reprobe_geometry_us < 0.0) {
+        std::cerr << "geometry search benchmark failed\n";
+        return 1;
+    }
+    std::cout << "pdcch_decode_bench.geometry.cold_us=" << cold_geometry_us << '\n';
+    std::cout << "pdcch_decode_bench.geometry.cold_attempt_count="
+              << cold_result.geometry_attempt_count << '\n';
+    std::cout << "pdcch_decode_bench.geometry.locked_us=" << locked_geometry_us << '\n';
+    std::cout << "pdcch_decode_bench.geometry.locked_attempt_count="
+              << locked_result.geometry_attempt_count << '\n';
+    std::cout << "pdcch_decode_bench.geometry.reprobe_us=" << reprobe_geometry_us << '\n';
+    std::cout << "pdcch_decode_bench.geometry.reprobe_attempt_count="
+              << reprobe_result.geometry_attempt_count << '\n';
     return 0;
 }
