@@ -138,7 +138,7 @@ const Complex32& crs_value(const CrsTableKey& key, std::uint32_t pilot_index);
 void ensure_crs_tables();
 
 bool descriptor_supported(const ExtractDescriptor& desc);
-MmseStatus validate_grid(const PlanarGridViewF32& grid);
+MmseStatus validate_grid(const PlanarGridViewF32& grid, const ExtractDescriptor* desc = nullptr);
 MmseStatus validate_output(const EqualizerOutputView& out);
 PreparedSubframeKey make_prepared_subframe_key(const PlanarGridViewF32& grid,
                                                const ExtractDescriptor& desc,

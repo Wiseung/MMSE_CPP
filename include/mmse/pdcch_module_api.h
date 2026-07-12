@@ -21,6 +21,7 @@ struct PhichReservationConfig {
     PhichResource resource = PhichResource::kOne;
     PhichDuration duration = PhichDuration::kNormal;
     std::uint8_t mi = 1;
+    std::uint16_t n_prb = kLteNumPrb20MHz;
     LteControlSubframeContext subframe_ctx{};
 };
 
@@ -77,13 +78,14 @@ inline void append_reg_reserved_res(std::vector<ReservedControlRe>& reserved_con
     }
 }
 
-inline std::array<ControlRegCoord, 4> pcfich_reg_coords(std::uint16_t cell_id) {
+inline std::array<ControlRegCoord, 4> pcfich_reg_coords(std::uint16_t cell_id,
+                                                        std::uint16_t n_prb = kLteNumPrb20MHz) {
     std::array<ControlRegCoord, 4> regs{};
-    const std::uint32_t bandwidth_sc = kLteNumPrb20MHz * kLteNumSubcarriersPerPrb;
-    const std::uint32_t k_hat = 6U * (cell_id % (2U * kLteNumPrb20MHz));
+    const std::uint32_t bandwidth_sc = lte_downlink_subcarrier_count(n_prb);
+    const std::uint32_t k_hat = 6U * (cell_id % (2U * n_prb));
     for (std::uint32_t i = 0; i < regs.size(); ++i) {
         const std::uint32_t k =
-            (k_hat + ((i * kLteNumPrb20MHz) / 2U) * (kLteNumSubcarriersPerPrb / 2U)) % bandwidth_sc;
+            (k_hat + ((i * n_prb) / 2U) * (kLteNumSubcarriersPerPrb / 2U)) % bandwidth_sc;
         regs[i] = {
             .symbol = 0U,
             .prb = k / kLteNumSubcarriersPerPrb,
@@ -104,12 +106,13 @@ inline bool is_pcfich_reg(const ControlRegCoord& reg,
     return false;
 }
 
-inline std::vector<ControlRegCoord> available_symbol0_control_regs(std::uint16_t cell_id) {
+inline std::vector<ControlRegCoord> available_symbol0_control_regs(std::uint16_t cell_id,
+                                                                   std::uint16_t n_prb) {
     std::vector<ControlRegCoord> regs{};
-    regs.reserve(kLteNumPrb20MHz * 2U);
+    regs.reserve(n_prb * 2U);
 
-    const auto pcfich_regs = pcfich_reg_coords(cell_id);
-    for (std::uint32_t prb = 0; prb < kLteNumPrb20MHz; ++prb) {
+    const auto pcfich_regs = pcfich_reg_coords(cell_id, n_prb);
+    for (std::uint32_t prb = 0; prb < n_prb; ++prb) {
         for (std::uint32_t reg_in_symbol_prb = 0; reg_in_symbol_prb < 2U; ++reg_in_symbol_prb) {
             const ControlRegCoord reg{
                 .symbol = 0U,
@@ -125,12 +128,12 @@ inline std::vector<ControlRegCoord> available_symbol0_control_regs(std::uint16_t
 }
 
 inline std::array<std::vector<ControlRegCoord>, 3>
-available_extended_phich_control_regs(std::uint16_t cell_id) {
+available_extended_phich_control_regs(std::uint16_t cell_id, std::uint16_t n_prb) {
     std::array<std::vector<ControlRegCoord>, 3> regs_by_symbol{};
-    regs_by_symbol[0] = available_symbol0_control_regs(cell_id);
+    regs_by_symbol[0] = available_symbol0_control_regs(cell_id, n_prb);
     for (std::uint32_t symbol = 1; symbol < regs_by_symbol.size(); ++symbol) {
-        regs_by_symbol[symbol].reserve(kLteNumPrb20MHz * 3U);
-        for (std::uint32_t prb = 0; prb < kLteNumPrb20MHz; ++prb) {
+        regs_by_symbol[symbol].reserve(n_prb * 3U);
+        for (std::uint32_t prb = 0; prb < n_prb; ++prb) {
             for (std::uint32_t reg_in_symbol_prb = 0; reg_in_symbol_prb < 3U; ++reg_in_symbol_prb) {
                 regs_by_symbol[symbol].push_back(
                     {.symbol = symbol, .prb = prb, .reg_in_symbol_prb = reg_in_symbol_prb});
@@ -140,16 +143,16 @@ available_extended_phich_control_regs(std::uint16_t cell_id) {
     return regs_by_symbol;
 }
 
-inline std::uint32_t phich_base_group_count(PhichResource resource) {
+inline std::uint32_t phich_base_group_count(PhichResource resource, std::uint16_t n_prb) {
     switch (resource) {
     case PhichResource::kOneSixth:
-        return (kLteNumPrb20MHz + 47U) / 48U;
+        return (n_prb + 47U) / 48U;
     case PhichResource::kHalf:
-        return (kLteNumPrb20MHz + 15U) / 16U;
+        return (n_prb + 15U) / 16U;
     case PhichResource::kOne:
-        return (kLteNumPrb20MHz + 7U) / 8U;
+        return (n_prb + 7U) / 8U;
     case PhichResource::kTwo:
-        return (kLteNumPrb20MHz + 3U) / 4U;
+        return (n_prb + 3U) / 4U;
     }
     return 0U;
 }
@@ -185,6 +188,9 @@ inline bool uses_extended_special_case(const PhichReservationConfig& config) {
 }
 
 inline MmseStatus validate_phich_reservation_config(const PhichReservationConfig& config) {
+    if (!is_supported_lte_downlink_bandwidth(config.n_prb)) {
+        return MmseStatus::kInvalidArgument;
+    }
     if (config.subframe_ctx.subframe >= 10U) {
         return MmseStatus::kInvalidArgument;
     }
@@ -203,7 +209,7 @@ inline MmseStatus validate_phich_reservation_config(const PhichReservationConfig
 }
 
 inline std::uint32_t phich_group_count(const PhichReservationConfig& config) {
-    const std::uint32_t base_group_count = phich_base_group_count(config.resource);
+    const std::uint32_t base_group_count = phich_base_group_count(config.resource, config.n_prb);
     if (config.subframe_ctx.duplex_mode == PhichDuplexMode::kTdd) {
         return base_group_count * config.mi;
     }
@@ -212,8 +218,9 @@ inline std::uint32_t phich_group_count(const PhichReservationConfig& config) {
 
 } // namespace detail
 
-inline constexpr std::size_t control_mask_index(std::uint32_t symbol, std::uint32_t prb) {
-    return static_cast<std::size_t>(symbol) * kLteNumPrb20MHz + static_cast<std::size_t>(prb);
+inline constexpr std::size_t control_mask_index(std::uint32_t symbol, std::uint32_t prb,
+                                                std::uint16_t n_prb) {
+    return static_cast<std::size_t>(symbol) * n_prb + static_cast<std::size_t>(prb);
 }
 
 inline void clear_control_re_exclusion_masks(PdcchMmseInput& in) {
@@ -222,28 +229,35 @@ inline void clear_control_re_exclusion_masks(PdcchMmseInput& in) {
 
 inline void exclude_control_re(PdcchMmseInput& in, std::uint32_t symbol, std::uint32_t prb,
                                std::uint32_t tone_in_prb) {
-    if (symbol >= kLteMaxControlSymbolsNormalCp || prb >= kLteNumPrb20MHz ||
+    const std::uint16_t n_prb = in.n_prb == 0U ? kLteNumPrb20MHz : in.n_prb;
+    if (symbol >= lte_max_pdcch_control_symbols_normal_cp(n_prb) || prb >= n_prb ||
         tone_in_prb >= kLteNumSubcarriersPerPrb) {
         return;
     }
-    in.control_re_exclusion_masks[control_mask_index(symbol, prb)] |=
+    in.control_re_exclusion_masks[control_mask_index(symbol, prb, n_prb)] |=
         static_cast<std::uint16_t>(1U << tone_in_prb);
 }
 
 inline bool is_control_re_excluded(const PdcchMmseInput& in, std::uint32_t symbol,
                                    std::uint32_t prb, std::uint32_t tone_in_prb) {
-    if (symbol >= kLteMaxControlSymbolsNormalCp || prb >= kLteNumPrb20MHz ||
+    const std::uint16_t n_prb = in.n_prb == 0U ? kLteNumPrb20MHz : in.n_prb;
+    if (symbol >= lte_max_pdcch_control_symbols_normal_cp(n_prb) || prb >= n_prb ||
         tone_in_prb >= kLteNumSubcarriersPerPrb) {
         return false;
     }
-    return (in.control_re_exclusion_masks[control_mask_index(symbol, prb)] &
+    return (in.control_re_exclusion_masks[control_mask_index(symbol, prb, n_prb)] &
             static_cast<std::uint16_t>(1U << tone_in_prb)) != 0U;
 }
 
-inline std::vector<ReservedControlRe> build_pcfich_reserved_control_re_list(std::uint16_t cell_id) {
+inline std::vector<ReservedControlRe>
+build_pcfich_reserved_control_re_list(std::uint16_t cell_id,
+                                      std::uint16_t n_prb = kLteNumPrb20MHz) {
     std::vector<ReservedControlRe> reserved_control_res;
     reserved_control_res.reserve(16U);
-    for (const auto& reg : detail::pcfich_reg_coords(cell_id)) {
+    if (!is_supported_lte_downlink_bandwidth(n_prb)) {
+        return reserved_control_res;
+    }
+    for (const auto& reg : detail::pcfich_reg_coords(cell_id, n_prb)) {
         detail::append_reg_reserved_res(reserved_control_res, cell_id, reg);
     }
     return reserved_control_res;
@@ -251,26 +265,29 @@ inline std::vector<ReservedControlRe> build_pcfich_reserved_control_re_list(std:
 
 inline std::vector<ReservedControlRe>
 build_pcfich_reserved_control_re_list(std::uint16_t cell_id,
-                                      const LteControlSubframeContext& subframe_ctx) {
+                                      const LteControlSubframeContext& subframe_ctx,
+                                      std::uint16_t n_prb = kLteNumPrb20MHz) {
     (void)subframe_ctx;
-    return build_pcfich_reserved_control_re_list(cell_id);
+    return build_pcfich_reserved_control_re_list(cell_id, n_prb);
 }
 
 inline std::vector<ReservedControlRe>
-build_fdd_phich_reserved_control_re_list(std::uint16_t cell_id, PhichResource resource) {
+build_fdd_phich_reserved_control_re_list(std::uint16_t cell_id, PhichResource resource,
+                                         std::uint16_t n_prb = kLteNumPrb20MHz) {
     std::vector<ReservedControlRe> reserved_control_res;
     const std::vector<detail::ControlRegCoord> regs =
-        detail::available_symbol0_control_regs(cell_id);
+        detail::available_symbol0_control_regs(cell_id, n_prb);
     const std::uint32_t ngroups =
         detail::phich_group_count({.resource = resource,
                                    .duration = PhichDuration::kNormal,
+                                   .n_prb = n_prb,
                                    .subframe_ctx = {.duplex_mode = PhichDuplexMode::kFdd}});
 
     if (regs.empty() || ngroups == 0U) {
         return reserved_control_res;
     }
 
-    const std::uint32_t symbol0_reg_count = 2U * kLteNumPrb20MHz - 4U;
+    const std::uint32_t symbol0_reg_count = 2U * n_prb - 4U;
     for (std::uint32_t group = 0; group < ngroups; ++group) {
         for (std::uint32_t reg_idx = 0; reg_idx < 3U; ++reg_idx) {
             const std::uint32_t reg_slot =
@@ -291,14 +308,14 @@ append_phich_reserved_control_re_list(std::vector<ReservedControlRe>& reserved_c
     }
 
     const std::vector<detail::ControlRegCoord> regs =
-        detail::available_symbol0_control_regs(cell_id);
+        detail::available_symbol0_control_regs(cell_id, config.n_prb);
     const std::uint32_t ngroups = detail::phich_group_count(config);
     if (regs.empty() || ngroups == 0U) {
         return MmseStatus::kOk;
     }
 
     if (config.duration == PhichDuration::kNormal) {
-        const std::uint32_t symbol0_reg_count = 2U * kLteNumPrb20MHz - 4U;
+        const std::uint32_t symbol0_reg_count = 2U * config.n_prb - 4U;
         for (std::uint32_t group = 0; group < ngroups; ++group) {
             for (std::uint32_t reg_idx = 0; reg_idx < 3U; ++reg_idx) {
                 const std::uint32_t reg_slot =
@@ -310,7 +327,8 @@ append_phich_reserved_control_re_list(std::vector<ReservedControlRe>& reserved_c
         return MmseStatus::kOk;
     }
 
-    const auto regs_by_symbol = detail::available_extended_phich_control_regs(cell_id);
+    const auto regs_by_symbol =
+        detail::available_extended_phich_control_regs(cell_id, config.n_prb);
     const std::uint32_t n0 = static_cast<std::uint32_t>(regs_by_symbol[0].size());
     const std::uint32_t n1 = static_cast<std::uint32_t>(regs_by_symbol[1].size());
     const std::uint32_t n2 = static_cast<std::uint32_t>(regs_by_symbol[2].size());
@@ -342,17 +360,17 @@ append_phich_reserved_control_re_list(std::vector<ReservedControlRe>& reserved_c
 
 inline void
 append_pcfich_reserved_control_re_list(std::vector<ReservedControlRe>& reserved_control_res,
-                                       std::uint16_t cell_id) {
-    for (const auto& re : build_pcfich_reserved_control_re_list(cell_id)) {
+                                       std::uint16_t cell_id,
+                                       std::uint16_t n_prb = kLteNumPrb20MHz) {
+    for (const auto& re : build_pcfich_reserved_control_re_list(cell_id, n_prb)) {
         detail::append_reserved_control_re_unique(reserved_control_res, re);
     }
 }
 
-inline void
-append_pcfich_reserved_control_re_list(std::vector<ReservedControlRe>& reserved_control_res,
-                                       std::uint16_t cell_id,
-                                       const LteControlSubframeContext& subframe_ctx) {
-    for (const auto& re : build_pcfich_reserved_control_re_list(cell_id, subframe_ctx)) {
+inline void append_pcfich_reserved_control_re_list(
+    std::vector<ReservedControlRe>& reserved_control_res, std::uint16_t cell_id,
+    const LteControlSubframeContext& subframe_ctx, std::uint16_t n_prb = kLteNumPrb20MHz) {
+    for (const auto& re : build_pcfich_reserved_control_re_list(cell_id, subframe_ctx, n_prb)) {
         detail::append_reserved_control_re_unique(reserved_control_res, re);
     }
 }
@@ -368,20 +386,24 @@ append_fdd_phich_reserved_control_re_list(std::vector<ReservedControlRe>& reserv
 }
 
 inline void append_pcfich_reserved_control_re_list(FrontendPdcchIndication& frontend) {
+    const std::uint16_t n_prb = frontend.n_prb == 0U ? kLteNumPrb20MHz : frontend.n_prb;
     append_pcfich_reserved_control_re_list(frontend.reserved_control_res, frontend.cell_id,
-                                           frontend.control_subframe);
+                                           frontend.control_subframe, n_prb);
 }
 
 inline void append_pcfich_reserved_control_re_list(FrontendPdcchIndication& frontend,
                                                    const LteControlSubframeContext& subframe_ctx) {
+    const std::uint16_t n_prb = frontend.n_prb == 0U ? kLteNumPrb20MHz : frontend.n_prb;
     append_pcfich_reserved_control_re_list(frontend.reserved_control_res, frontend.cell_id,
-                                           subframe_ctx);
+                                           subframe_ctx, n_prb);
 }
 
 inline MmseStatus append_phich_reserved_control_re_list(FrontendPdcchIndication& frontend,
                                                         const PhichReservationConfig& config) {
+    PhichReservationConfig effective_config = config;
+    effective_config.n_prb = frontend.n_prb == 0U ? kLteNumPrb20MHz : frontend.n_prb;
     return append_phich_reserved_control_re_list(frontend.reserved_control_res, frontend.cell_id,
-                                                 config);
+                                                 effective_config);
 }
 
 inline MmseStatus append_phich_reserved_control_re_list(FrontendPdcchIndication& frontend,
@@ -418,7 +440,8 @@ validate_lte_control_subframe_context(const LteControlSubframeContext& control_s
 inline MmseStatus validate_pdcch_mmse_input(const PdcchMmseInput& in) {
     if (in.grid.n_rx_ant == 0U || in.grid.n_rx_ant > kMmseV1MaxNumRxAntennas ||
         in.grid.n_symbols != kLteNumSymbolsNormalCp ||
-        in.grid.n_subcarriers != kLteNumSubcarriers20MHz) {
+        !is_supported_lte_downlink_bandwidth(in.n_prb) ||
+        in.grid.n_subcarriers != lte_downlink_subcarrier_count(in.n_prb)) {
         return MmseStatus::kInvalidArgument;
     }
     for (std::uint32_t rx = 0; rx < in.grid.n_rx_ant; ++rx) {
@@ -426,10 +449,20 @@ inline MmseStatus validate_pdcch_mmse_input(const PdcchMmseInput& in) {
             return MmseStatus::kInvalidArgument;
         }
     }
-    if (in.control_symbol_count == 0U || in.control_symbol_count > kLteMaxControlSymbolsNormalCp) {
+    if (in.control_symbol_count == 0U ||
+        in.control_symbol_count > lte_max_pdcch_control_symbols_normal_cp(in.n_prb)) {
         return MmseStatus::kInvalidArgument;
     }
-    if (in.n_prb == 0U || in.n_prb > kLteNumPrb20MHz) {
+    std::uint32_t bitmap_prb_count = 0U;
+    for (std::uint32_t prb = 0U; prb < kLteNumPrb20MHz; ++prb) {
+        const bool present =
+            (in.prb_bitmap[prb / 16U] & (static_cast<std::uint16_t>(1U) << (prb % 16U))) != 0U;
+        if (present != (prb < in.n_prb)) {
+            return MmseStatus::kInvalidArgument;
+        }
+        bitmap_prb_count += present ? 1U : 0U;
+    }
+    if (bitmap_prb_count != in.n_prb) {
         return MmseStatus::kInvalidArgument;
     }
     if (in.n_tx_ports == 0U || in.n_tx_ports > kMmseV1MaxNumCrsTxPorts) {
@@ -612,19 +645,22 @@ make_backend_pdcch_td_descrambled_llr_indication(const BackendPdcchTdEqualizedIn
 inline MmseStatus build_pdcch_control_region(std::uint16_t cell_id,
                                              std::uint8_t control_symbol_count,
                                              const std::uint16_t* re_grid_indices,
-                                             std::uint32_t n_re,
-                                             PdcchControlRegion& control_region) {
+                                             std::uint32_t n_re, PdcchControlRegion& control_region,
+                                             std::uint16_t n_prb = kLteNumPrb20MHz) {
     control_region = {};
     if (re_grid_indices == nullptr || n_re == 0U || control_symbol_count == 0U ||
-        control_symbol_count > kLteMaxControlSymbolsNormalCp ||
-        n_re > kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz || (n_re % kPdcchRePerReg) != 0U) {
+        !is_supported_lte_downlink_bandwidth(n_prb) ||
+        control_symbol_count > lte_max_pdcch_control_symbols_normal_cp(n_prb) ||
+        n_re > control_symbol_count * lte_downlink_subcarrier_count(n_prb) ||
+        (n_re % kPdcchRePerReg) != 0U) {
         return MmseStatus::kInvalidArgument;
     }
 
     std::array<bool, kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz> seen_grid_indices{};
+    const std::uint32_t n_subcarriers = lte_downlink_subcarrier_count(n_prb);
     for (std::uint32_t re = 0U; re < n_re; ++re) {
         const std::uint16_t grid_index = re_grid_indices[re];
-        const std::uint32_t symbol = grid_index / kLteNumSubcarriers20MHz;
+        const std::uint32_t symbol = grid_index / n_subcarriers;
         if (symbol >= control_symbol_count || seen_grid_indices[grid_index]) {
             return MmseStatus::kInvalidArgument;
         }
@@ -806,7 +842,8 @@ build_pdcch_search_candidate_llrs(const BackendPdcchEqualizedIndication& backend
     PdcchControlRegion control_region{};
     if (const MmseStatus status = build_pdcch_control_region(
             backend.cell_id, backend.control_symbol_count, backend.re_grid_indices.data(),
-            static_cast<std::uint32_t>(backend.re_grid_indices.size()), control_region);
+            static_cast<std::uint32_t>(backend.re_grid_indices.size()), control_region,
+            backend.n_prb);
         status != MmseStatus::kOk) {
         return status;
     }
@@ -866,7 +903,7 @@ build_pdcch_common_search_candidate_llrs(const BackendPdcchEqualizedIndication& 
         build_pdcch_control_region(backend.cell_id, backend.control_symbol_count,
                                    backend.re_grid_indices.data(),
                                    static_cast<std::uint32_t>(backend.re_grid_indices.size()),
-                                   control_region) != MmseStatus::kOk) {
+                                   control_region, backend.n_prb) != MmseStatus::kOk) {
         return MmseStatus::kInvalidArgument;
     }
     std::vector<PdcchCommonSearchCandidate> common_candidates{};
@@ -1026,6 +1063,9 @@ inline MmseStatus check_pdcch_crc_rnti(const std::uint8_t* decoded_bits,
 }
 
 inline constexpr std::uint8_t pdcch_dci_riv_bit_count(std::uint16_t n_prb) noexcept {
+    if (!is_supported_lte_downlink_bandwidth(n_prb)) {
+        return 0U;
+    }
     std::uint32_t max_value = static_cast<std::uint32_t>(n_prb) * (n_prb + 1U) / 2U;
     std::uint8_t bits = 0U;
     --max_value;
@@ -1038,12 +1078,36 @@ inline constexpr std::uint8_t pdcch_dci_riv_bit_count(std::uint16_t n_prb) noexc
 
 inline constexpr std::uint32_t
 pdcch_dci_format1a_payload_bit_count(const PdcchDciFormat1AConfig& config) noexcept {
-    if (config.n_prb != kLteNumPrb20MHz) {
+    if (!is_supported_lte_downlink_bandwidth(config.n_prb)) {
+        return 0U;
+    }
+    if ((config.duplex_mode != PhichDuplexMode::kFdd || config.cif_enabled) &&
+        config.n_prb != kLteNumPrb20MHz) {
         return 0U;
     }
     const std::uint32_t harq_pid_bits = config.duplex_mode == PhichDuplexMode::kFdd ? 3U : 4U;
-    return (config.cif_enabled ? 3U : 0U) + 1U + 1U + pdcch_dci_riv_bit_count(config.n_prb) + 5U +
-           harq_pid_bits + 1U + 2U + 2U + (config.duplex_mode == PhichDuplexMode::kTdd ? 2U : 0U);
+    const std::uint32_t unpadded_bit_count =
+        (config.cif_enabled ? 3U : 0U) + 1U + 1U + pdcch_dci_riv_bit_count(config.n_prb) + 5U +
+        harq_pid_bits + 1U + 2U + 2U + (config.duplex_mode == PhichDuplexMode::kTdd ? 2U : 0U);
+    if (config.duplex_mode != PhichDuplexMode::kFdd || config.cif_enabled) {
+        return unpadded_bit_count;
+    }
+    switch (config.n_prb) {
+    case 6U:
+        return 21U;
+    case 15U:
+        return 22U;
+    case 25U:
+        return 25U;
+    case 50U:
+        return 27U;
+    case 75U:
+        return 27U;
+    case 100U:
+        return 28U;
+    default:
+        return 0U;
+    }
 }
 
 inline MmseStatus decode_pdcch_type2_riv(std::uint16_t resource_indication_value,
@@ -1051,7 +1115,7 @@ inline MmseStatus decode_pdcch_type2_riv(std::uint16_t resource_indication_value
                                          std::uint16_t& allocated_prb_count) {
     start_prb = 0U;
     allocated_prb_count = 0U;
-    if (n_prb == 0U || n_prb > kLteNumPrb20MHz ||
+    if (!is_supported_lte_downlink_bandwidth(n_prb) ||
         resource_indication_value >= static_cast<std::uint32_t>(n_prb) * (n_prb + 1U) / 2U) {
         return MmseStatus::kInvalidArgument;
     }
@@ -1286,7 +1350,7 @@ decode_pdcch_common_search_dci_format1a(const BackendPdcchEqualizedIndication& b
     result = {};
     const std::uint32_t payload_bit_count =
         pdcch_dci_format1a_payload_bit_count(config.dci_format1a);
-    if (payload_bit_count == 0U) {
+    if (payload_bit_count == 0U || backend.n_prb != config.dci_format1a.n_prb) {
         return MmseStatus::kInvalidArgument;
     }
 
@@ -1329,7 +1393,7 @@ decode_pdcch_ue_specific_search_dci_format1a(const BackendPdcchEqualizedIndicati
     result = {};
     const std::uint32_t payload_bit_count =
         pdcch_dci_format1a_payload_bit_count(config.dci_format1a);
-    if (payload_bit_count == 0U) {
+    if (payload_bit_count == 0U || backend.n_prb != config.dci_format1a.n_prb) {
         return MmseStatus::kInvalidArgument;
     }
 
@@ -1341,7 +1405,7 @@ decode_pdcch_ue_specific_search_dci_format1a(const BackendPdcchEqualizedIndicati
         build_pdcch_control_region(backend.cell_id, backend.control_symbol_count,
                                    backend.re_grid_indices.data(),
                                    static_cast<std::uint32_t>(backend.re_grid_indices.size()),
-                                   control_region) != MmseStatus::kOk) {
+                                   control_region, backend.n_prb) != MmseStatus::kOk) {
         return MmseStatus::kInvalidArgument;
     }
 
@@ -1421,9 +1485,11 @@ inline MmseStatus decode_pdcch_si_rnti_dci_format1a(const BackendPdcchEqualizedI
                                                     const PdcchSiRntiSearchConfig& config,
                                                     PdcchSiRntiSearchResult& result) {
     result = {};
-    const PdcchDciFormat1AConfig dci_config{};
-    if (backend.n_prb != kLteNumPrb20MHz ||
-        pdcch_dci_format1a_payload_bit_count(dci_config) == 0U) {
+    const PdcchDciFormat1AConfig dci_config{
+        .n_prb = backend.n_prb,
+        .duplex_mode = PhichDuplexMode::kFdd,
+    };
+    if (pdcch_dci_format1a_payload_bit_count(dci_config) == 0U) {
         return MmseStatus::kInvalidArgument;
     }
 
@@ -1458,7 +1524,7 @@ inline MmseStatus decode_pdcch_si_rnti_dci_format1a(const BackendPdcchEqualizedI
         if (!candidate_result.matched || candidate_result.dci.rnti != kSiRnti ||
             candidate_result.dci.is_pdcch_order || candidate_result.dci.n_prb_1a < 2U ||
             candidate_result.dci.n_prb_1a > 3U ||
-            candidate_result.dci.start_prb + candidate_result.dci.n_prb > kLteNumPrb20MHz) {
+            candidate_result.dci.start_prb + candidate_result.dci.n_prb > backend.n_prb) {
             continue;
         }
         result.hits.push_back({
@@ -1470,9 +1536,11 @@ inline MmseStatus decode_pdcch_si_rnti_dci_format1a(const BackendPdcchEqualizedI
     return MmseStatus::kOk;
 }
 
-inline ReCoord decode_re_grid_index(std::uint16_t grid_index) {
-    const std::uint32_t symbol = grid_index / kLteNumSubcarriers20MHz;
-    const std::uint32_t subcarrier = grid_index % kLteNumSubcarriers20MHz;
+inline ReCoord decode_re_grid_index(std::uint16_t grid_index,
+                                    std::uint16_t n_prb = kLteNumPrb20MHz) {
+    const std::uint32_t n_subcarriers = lte_downlink_subcarrier_count(n_prb);
+    const std::uint32_t symbol = grid_index / n_subcarriers;
+    const std::uint32_t subcarrier = grid_index % n_subcarriers;
     return {
         .symbol = symbol,
         .subcarrier = subcarrier,

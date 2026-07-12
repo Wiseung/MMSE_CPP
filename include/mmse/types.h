@@ -86,7 +86,7 @@ struct ExtractDescriptor {
     std::uint8_t mod_order = 0;
     std::uint16_t n_prb = 0;
     std::array<std::uint16_t, 7> prb_bitmap{};
-    std::array<std::uint16_t, kLteMaxControlSymbolsNormalCp * kLteNumPrb20MHz>
+    std::array<std::uint16_t, kLteMaxPdcchControlSymbolsNormalCp * kLteNumPrb20MHz>
         control_re_exclusion_masks{};
     std::int8_t pmi = -1;
 };
@@ -134,7 +134,7 @@ struct PdcchMmseInput {
     std::uint16_t n_prb = 0;
     std::array<std::uint16_t, 7> prb_bitmap{};
     pdcch::LteControlSubframeContext control_subframe{};
-    std::array<std::uint16_t, kLteMaxControlSymbolsNormalCp * kLteNumPrb20MHz>
+    std::array<std::uint16_t, kLteMaxPdcchControlSymbolsNormalCp * kLteNumPrb20MHz>
         control_re_exclusion_masks{};
     PdcchChainMetadata chain{};
 };

@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <string_view>
@@ -14,7 +16,8 @@ using namespace mmse;
 
 namespace {
 
-constexpr std::uint32_t kPdcchCapacity = kLteMaxControlSymbolsNormalCp * kLteNumSubcarriers20MHz;
+constexpr std::uint32_t kPdcchCapacity =
+    kLteMaxPdcchControlSymbolsNormalCp * kLteNumSubcarriers20MHz;
 constexpr std::uint32_t kWarmupSubframes = 10U;
 constexpr std::uint32_t kMeasuredSubframes = 100U;
 constexpr std::uint32_t kWindowSubframes = 10U;
@@ -54,13 +57,13 @@ struct StageTimes {
     std::uint32_t crc_miss_count = 0U;
 };
 
-GridBuffers make_random_grid(std::uint32_t seed) {
+GridBuffers make_random_grid(std::uint32_t seed, std::uint16_t n_prb) {
     std::mt19937 generator(seed);
     std::normal_distribution<float> distribution(0.0F, 1.0F);
     GridBuffers buffers{};
     for (std::uint32_t rx = 0U; rx < kMmseV1MaxNumRxAntennas; ++rx) {
-        buffers.re[rx].resize(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz);
-        buffers.im[rx].resize(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz);
+        buffers.re[rx].resize(kLteNumSymbolsNormalCp * lte_downlink_subcarrier_count(n_prb));
+        buffers.im[rx].resize(kLteNumSymbolsNormalCp * lte_downlink_subcarrier_count(n_prb));
         for (std::size_t sample = 0U; sample < buffers.re[rx].size(); ++sample) {
             buffers.re[rx][sample] = distribution(generator);
             buffers.im[rx][sample] = distribution(generator);
@@ -75,19 +78,21 @@ PlanarGridViewF32 make_grid_view(const GridBuffers& buffers) {
         .im = {buffers.im[0].data(), buffers.im[1].data()},
         .n_rx_ant = kMmseV1MaxNumRxAntennas,
         .n_symbols = kLteNumSymbolsNormalCp,
-        .n_subcarriers = kLteNumSubcarriers20MHz,
+        .n_subcarriers = static_cast<std::uint32_t>(buffers.re[0].size() / kLteNumSymbolsNormalCp),
     };
 }
 
-PdcchMmseInput make_pdcch_input(const PlanarGridViewF32& grid) {
+PdcchMmseInput make_pdcch_input(const PlanarGridViewF32& grid, std::uint16_t n_prb) {
     pdcch::FrontendPdcchIndication frontend{};
     frontend.cell_id = 1U;
     frontend.n_tx_ports = 1U;
     frontend.tx_mode = 1U;
-    frontend.control_symbol_count = 3U;
-    frontend.n_prb = kLteNumPrb20MHz;
-    frontend.prb_bitmap.fill(0xFFFFU);
-    frontend.prb_bitmap.back() = 0x000FU;
+    frontend.control_symbol_count = n_prb == 6U ? 4U : 3U;
+    frontend.n_prb = n_prb;
+    frontend.prb_bitmap.fill(0U);
+    for (std::uint32_t prb = 0U; prb < n_prb; ++prb) {
+        frontend.prb_bitmap[prb / 16U] |= static_cast<std::uint16_t>(1U << (prb % 16U));
+    }
     frontend.control_subframe = {.duplex_mode = pdcch::PhichDuplexMode::kFdd,
                                  .subframe = 0U,
                                  .ul_dl_config = 0U,
@@ -151,8 +156,8 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
     start = Clock::now();
     if (pdcch::build_pdcch_control_region(
             backend.cell_id, backend.control_symbol_count, backend.re_grid_indices.data(),
-            static_cast<std::uint32_t>(backend.re_grid_indices.size()),
-            control_region) != MmseStatus::kOk) {
+            static_cast<std::uint32_t>(backend.re_grid_indices.size()), control_region,
+            backend.n_prb) != MmseStatus::kOk) {
         return false;
     }
     end = Clock::now();
@@ -179,8 +184,8 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
     end = Clock::now();
     times.candidate_gather_us = std::chrono::duration<double, std::micro>(end - start).count();
 
-    const std::uint32_t payload_bit_count =
-        pdcch::pdcch_dci_format1a_payload_bit_count(pdcch::PdcchDciFormat1AConfig{});
+    const pdcch::PdcchDciFormat1AConfig dci_config{.n_prb = backend.n_prb};
+    const std::uint32_t payload_bit_count = pdcch::pdcch_dci_format1a_payload_bit_count(dci_config);
     std::vector<pdcch::PdcchRateRecoveredLlr> recovered(candidates.size());
     start = Clock::now();
     for (std::size_t candidate = 0U; candidate < candidates.size(); ++candidate) {
@@ -212,8 +217,7 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
                 decoded_bits[candidate].data(),
                 static_cast<std::uint32_t>(decoded_bits[candidate].size()), pdcch::kSiRnti,
                 recovered[candidate].sfn_subframe, recovered[candidate].cell_id,
-                recovered[candidate].chain, pdcch::PdcchDciFormat1AConfig{},
-                result) != MmseStatus::kOk) {
+                recovered[candidate].chain, dci_config, result) != MmseStatus::kOk) {
             return false;
         }
         hit_count += result.matched ? 1U : 0U;
@@ -293,10 +297,33 @@ void print_summaries(std::string_view scope, const std::vector<StageTimes>& valu
 
 } // namespace
 
-int main() {
-    GridBuffers grid_buffers = make_random_grid(42U);
+bool parse_bandwidth(int argc, char** argv, std::uint16_t& n_prb) {
+    if (argc == 1) {
+        return true;
+    }
+    if (argc != 3 || std::string_view(argv[1]) != "--n-prb") {
+        return false;
+    }
+    unsigned int value = 0U;
+    const auto [end, error] =
+        std::from_chars(argv[2], argv[2] + std::char_traits<char>::length(argv[2]), value);
+    if (error != std::errc{} || *end != '\0' || value > std::numeric_limits<std::uint16_t>::max()) {
+        return false;
+    }
+    n_prb = static_cast<std::uint16_t>(value);
+    return is_supported_lte_downlink_bandwidth(n_prb);
+}
+
+int main(int argc, char** argv) {
+    std::uint16_t n_prb = kLteNumPrb20MHz;
+    if (!parse_bandwidth(argc, argv, n_prb)) {
+        std::cerr << "usage: pdcch_decode_bench [--n-prb 6|15|25|50|75|100]\n";
+        return 2;
+    }
+
+    GridBuffers grid_buffers = make_random_grid(42U, n_prb);
     const PlanarGridViewF32 grid = make_grid_view(grid_buffers);
-    const PdcchMmseInput input = make_pdcch_input(grid);
+    const PdcchMmseInput input = make_pdcch_input(grid, n_prb);
 
     MmseEqualizerCpuContext context;
     MmseEqualizerCpuConfig cpu_config{};
@@ -335,6 +362,7 @@ int main() {
 
     std::cout << "pdcch_decode_bench.subframe_count=" << per_subframe.size() << '\n';
     std::cout << "pdcch_decode_bench.window_count=" << per_window.size() << '\n';
+    std::cout << "pdcch_decode_bench.n_prb=" << n_prb << '\n';
     std::cout << "pdcch_decode_bench.decoder=native_tail_biting_viterbi\n";
     print_summaries("subframe_1ms", per_subframe);
     print_summaries("window_10ms", per_window);
@@ -345,6 +373,7 @@ int main() {
     geometry_request.cell_id = input.cell_id;
     geometry_request.n_tx_ports = input.n_tx_ports;
     geometry_request.tx_mode = input.tx_mode;
+    geometry_request.n_prb = input.n_prb;
     geometry_request.control_subframe = input.control_subframe;
     geometry_request.chain = input.chain;
     const auto measure_geometry_search = [&](pdcch::PdcchSiRntiGeometrySearchCache& cache,
@@ -368,6 +397,7 @@ int main() {
         .cell_id = geometry_request.cell_id,
         .n_tx_ports = geometry_request.n_tx_ports,
         .tx_mode = geometry_request.tx_mode,
+        .n_prb = geometry_request.n_prb,
         .subframe_kind = geometry_request.control_subframe.kind,
         .geometry =
             {

@@ -117,11 +117,11 @@ struct TwoLayerCase {
     Complex32 x1;
 };
 
-GridBuffers make_zero_grid() {
+GridBuffers make_zero_grid(std::uint32_t n_subcarriers = kLteNumSubcarriers20MHz) {
     GridBuffers buffers;
     for (std::uint32_t rx = 0; rx < 2; ++rx) {
-        buffers.re[rx].assign(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz, 0.0F);
-        buffers.im[rx].assign(kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz, 0.0F);
+        buffers.re[rx].assign(kLteNumSymbolsNormalCp * n_subcarriers, 0.0F);
+        buffers.im[rx].assign(kLteNumSymbolsNormalCp * n_subcarriers, 0.0F);
     }
     return buffers;
 }
@@ -132,7 +132,7 @@ PlanarGridViewF32 make_grid_view(const GridBuffers& buffers) {
     grid.im = {buffers.im[0].data(), buffers.im[1].data()};
     grid.n_rx_ant = 2;
     grid.n_symbols = kLteNumSymbolsNormalCp;
-    grid.n_subcarriers = kLteNumSubcarriers20MHz;
+    grid.n_subcarriers = static_cast<std::uint32_t>(buffers.re[0].size() / kLteNumSymbolsNormalCp);
     return grid;
 }
 
@@ -142,7 +142,7 @@ PlanarGridViewF32 make_single_rx_grid_view(const GridBuffers& buffers) {
     grid.im = {buffers.im[0].data(), nullptr};
     grid.n_rx_ant = 1U;
     grid.n_symbols = kLteNumSymbolsNormalCp;
-    grid.n_subcarriers = kLteNumSubcarriers20MHz;
+    grid.n_subcarriers = static_cast<std::uint32_t>(buffers.re[0].size() / kLteNumSymbolsNormalCp);
     return grid;
 }
 
@@ -164,7 +164,8 @@ ExtractDescriptor make_fullband_desc() {
     return desc;
 }
 
-ExtractDescriptor make_pdcch_desc() {
+ExtractDescriptor make_pdcch_desc(std::uint16_t n_prb = kLteNumPrb20MHz,
+                                  std::uint8_t control_symbol_count = 3U) {
     ExtractDescriptor desc{};
     desc.cell_id = 0;
     desc.n_tx_ports = 1;
@@ -173,12 +174,14 @@ ExtractDescriptor make_pdcch_desc() {
     desc.tx_mode = 1;
     desc.channel_type = MmseChannelType::kPdcch;
     desc.start_symbol = 0;
-    desc.control_symbol_count = 3;
+    desc.control_symbol_count = control_symbol_count;
     desc.mod_order = 2;
-    desc.n_prb = 100;
+    desc.n_prb = n_prb;
     desc.sfn_subframe = 3;
-    desc.prb_bitmap.fill(0xFFFFU);
-    desc.prb_bitmap.back() = 0x000FU;
+    desc.prb_bitmap.fill(0U);
+    for (std::uint32_t prb = 0U; prb < n_prb; ++prb) {
+        desc.prb_bitmap[prb / 16U] |= static_cast<std::uint16_t>(1U << (prb % 16U));
+    }
     desc.control_re_exclusion_masks.fill(0U);
     return desc;
 }
@@ -592,9 +595,11 @@ void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor& desc, 
                            float data1) {
     mmse::detail::ensure_crs_tables();
     const std::uint32_t subframe = mmse::detail::subframe_from_descriptor(desc);
+    const std::uint32_t n_subcarriers =
+        static_cast<std::uint32_t>(buffers.re[0].size() / kLteNumSymbolsNormalCp);
     for (std::uint32_t symbol = 0; symbol < kLteNumSymbolsNormalCp; ++symbol) {
-        for (std::uint32_t sc = 0; sc < kLteNumSubcarriers20MHz; ++sc) {
-            const std::size_t idx = static_cast<std::size_t>(symbol) * kLteNumSubcarriers20MHz + sc;
+        for (std::uint32_t sc = 0; sc < n_subcarriers; ++sc) {
+            const std::size_t idx = static_cast<std::size_t>(symbol) * n_subcarriers + sc;
             const bool is_data_symbol = symbol >= desc.start_symbol;
             const bool is_port0_crs =
                 mmse::detail::is_crs_re(desc.cell_id, static_cast<std::uint8_t>(symbol), sc) &&
@@ -3508,9 +3513,13 @@ void test_pdcch_td_normalization_restores_cce_re_order() {
                 "td normalization should reject inconsistent RE pair metadata");
 }
 
-std::vector<std::uint8_t> make_si_rnti_dci_format1a_bits() {
-    const mmse::pdcch::PdcchDciFormat1AConfig config{};
-    const std::uint16_t riv = reference_type2_riv(config.n_prb, 10U, 20U);
+std::vector<std::uint8_t> make_si_rnti_dci_format1a_bits(std::uint16_t n_prb = kLteNumPrb20MHz,
+                                                         std::uint16_t start_prb = 10U,
+                                                         std::uint16_t allocated_prb_count = 20U) {
+    const mmse::pdcch::PdcchDciFormat1AConfig config{.n_prb = n_prb};
+    expect_true(start_prb + allocated_prb_count <= n_prb,
+                "SI-RNTI DCI allocation must fit the configured carrier bandwidth");
+    const std::uint16_t riv = reference_type2_riv(config.n_prb, start_prb, allocated_prb_count);
     std::vector<std::uint8_t> payload{};
     append_bits(payload, 1U, 1U);
     append_bits(payload, 0U, 1U);
@@ -3521,6 +3530,9 @@ std::vector<std::uint8_t> make_si_rnti_dci_format1a_bits() {
     append_bits(payload, 2U, 2U);
     append_bits(payload, 0U, 1U);
     append_bits(payload, 1U, 1U);
+    while (payload.size() < mmse::pdcch::pdcch_dci_format1a_payload_bit_count(config)) {
+        payload.push_back(0U);
+    }
     return append_pdcch_crc_rnti_mask(payload, mmse::pdcch::kSiRnti);
 }
 
@@ -3539,6 +3551,12 @@ mmse::pdcch::BackendPdcchEqualizedIndication
 make_native_si_rnti_backend(std::uint16_t first_cce, std::uint8_t aggregation_level,
                             const std::vector<std::uint8_t>& decoded_bits,
                             std::uint32_t cce_count = 8U);
+
+std::vector<Complex32>
+make_native_si_rnti_qpsk_symbols(std::uint32_t n_re, std::uint16_t first_cce,
+                                 std::uint8_t aggregation_level,
+                                 const std::vector<std::uint8_t>& decoded_bits,
+                                 std::uint16_t cell_id, std::uint32_t sfn_subframe);
 
 void test_pdcch_si_rnti_semantics_reject_invalid_grants() {
     std::vector<std::uint8_t> wrong_rnti_bits = make_si_rnti_dci_format1a_bits();
@@ -3599,6 +3617,241 @@ void test_pdcch_dci_format1a_si_numeric_boundaries() {
                     result.dci.redundancy_version == 3U && result.dci.n_prb_1a == 2U &&
                     !result.dci.n_prb_1a_is_three,
                 "SI DCI 1A parser must expose MCS/RV and N_PRB^1A numeric boundaries");
+}
+
+void test_pdcch_fdd_dci_format1a_supports_standard_bandwidths() {
+    constexpr std::array<std::uint16_t, 6> kBandwidths = {6U, 15U, 25U, 50U, 75U, 100U};
+    constexpr std::array<std::uint32_t, 6> kPayloadBitCounts = {21U, 22U, 25U, 27U, 27U, 28U};
+    constexpr std::array<std::uint8_t, 6> kRivBitCounts = {5U, 7U, 9U, 11U, 12U, 13U};
+
+    for (std::size_t index = 0U; index < kBandwidths.size(); ++index) {
+        const std::uint16_t n_prb = kBandwidths[index];
+        const std::uint16_t start_prb = static_cast<std::uint16_t>(n_prb / 3U);
+        const std::uint16_t allocated_prb_count =
+            static_cast<std::uint16_t>(std::min<std::uint16_t>(3U, n_prb - start_prb));
+        const mmse::pdcch::PdcchDciFormat1AConfig config{.n_prb = n_prb};
+        const std::vector<std::uint8_t> decoded_bits =
+            make_si_rnti_dci_format1a_bits(n_prb, start_prb, allocated_prb_count);
+
+        expect_true(
+            mmse::pdcch::pdcch_dci_riv_bit_count(n_prb) == kRivBitCounts[index] &&
+                mmse::pdcch::pdcch_dci_format1a_payload_bit_count(config) ==
+                    kPayloadBitCounts[index] &&
+                decoded_bits.size() == kPayloadBitCounts[index] + mmse::pdcch::kPdcchCrcBitCount,
+            "FDD DCI 1A must use the standard RIV and payload widths for each LTE bandwidth");
+
+        const std::uint32_t unpadded_bit_count = kRivBitCounts[index] + 15U;
+        for (std::uint32_t bit = unpadded_bit_count; bit < kPayloadBitCounts[index]; ++bit) {
+            expect_true(decoded_bits[bit] == 0U,
+                        "Format 0/1A alignment padding must be encoded as zero bits");
+        }
+
+        mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+        expect_true(mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
+                        decoded_bits.data(), static_cast<std::uint32_t>(decoded_bits.size()),
+                        mmse::pdcch::kSiRnti, 3U, 19U, {}, config, result) == MmseStatus::kOk &&
+                        result.matched && result.dci.start_prb == start_prb &&
+                        result.dci.n_prb == allocated_prb_count,
+                    "FDD DCI 1A parser must decode grants at every standard LTE bandwidth");
+    }
+
+    expect_true(mmse::pdcch::pdcch_dci_format1a_payload_bit_count({.n_prb = 12U}) == 0U,
+                "non-standard LTE bandwidths must remain unsupported");
+}
+
+void test_pdcch_control_geometry_supports_standard_bandwidths() {
+    constexpr std::array<std::uint16_t, 6> kBandwidths = {6U, 15U, 25U, 50U, 75U, 100U};
+    for (const std::uint16_t n_prb : kBandwidths) {
+        const std::uint8_t control_symbol_count = n_prb == 6U ? 4U : 3U;
+        const auto pcfich = mmse::pdcch::build_pcfich_reserved_control_re_list(19U, n_prb);
+        const auto phich = mmse::pdcch::build_fdd_phich_reserved_control_re_list(
+            19U, mmse::pdcch::PhichResource::kOne, n_prb);
+        expect_true(pcfich.size() == 16U && !phich.empty(),
+                    "every standard LTE bandwidth must expose PCFICH and PHICH reservations");
+        for (const auto& re : pcfich) {
+            expect_true(re.symbol == 0U && re.prb < n_prb &&
+                            re.tone_in_prb < kLteNumSubcarriersPerPrb,
+                        "PCFICH reservation must remain inside the configured carrier");
+        }
+        for (const auto& re : phich) {
+            expect_true(re.symbol == 0U && re.prb < n_prb &&
+                            re.tone_in_prb < kLteNumSubcarriersPerPrb,
+                        "PHICH reservation must remain inside the configured carrier");
+        }
+
+        const auto desc = make_pdcch_desc(n_prb, control_symbol_count);
+        mmse::detail::ReLayout layout{};
+        const std::uint32_t n_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+        mmse::pdcch::PdcchControlRegion region{};
+        expect_true(mmse::pdcch::build_pdcch_control_region(desc.cell_id, control_symbol_count,
+                                                            layout.grid_indices.data(), n_re,
+                                                            region, n_prb) == MmseStatus::kOk &&
+                        !region.cces.empty(),
+                    "PDCCH REG/CCE construction must succeed for every standard LTE bandwidth");
+        for (std::uint32_t re = 0U; re < n_re; ++re) {
+            const auto coordinate =
+                mmse::pdcch::decode_re_grid_index(layout.grid_indices[re], n_prb);
+            expect_true(coordinate.symbol < control_symbol_count && coordinate.prb < n_prb,
+                        "PDCCH RE index must use the configured carrier stride");
+        }
+    }
+}
+
+void test_pdcch_cpu_si_rnti_search_supports_standard_bandwidths() {
+    constexpr std::array<std::uint16_t, 6> kBandwidths = {6U, 15U, 25U, 50U, 75U, 100U};
+    for (const std::uint16_t n_prb : kBandwidths) {
+        MmseEqualizerCpuContext context;
+        MmseEqualizerCpuConfig cpu_config{};
+        cpu_config.worker_count = 1U;
+        cpu_config.sigma2_min = 1.0e-5F;
+        expect_true(context.init(cpu_config) == MmseStatus::kOk,
+                    "standard-bandwidth SI-RNTI CPU context init");
+
+        const std::uint8_t control_symbol_count = n_prb == 6U ? 4U : 3U;
+        const auto desc = make_pdcch_desc(n_prb, control_symbol_count);
+        GridBuffers buffers = make_zero_grid(lte_downlink_subcarrier_count(n_prb));
+        fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+        mmse::detail::ReLayout layout{};
+        const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+        const std::uint16_t start_prb = static_cast<std::uint16_t>(n_prb / 3U);
+        const std::uint16_t allocated_prb_count =
+            static_cast<std::uint16_t>(std::min<std::uint16_t>(3U, n_prb - start_prb));
+        const std::uint16_t first_cce = n_prb == 6U ? 0U : 4U;
+        const auto symbols = make_native_si_rnti_qpsk_symbols(
+            n_source_re, first_cce, 4U,
+            make_si_rnti_dci_format1a_bits(n_prb, start_prb, allocated_prb_count), desc.cell_id,
+            desc.sfn_subframe);
+        for (std::uint32_t re = 0U; re < n_source_re; ++re) {
+            buffers.re[0][layout.grid_indices[re]] = symbols[re].re;
+            buffers.im[0][layout.grid_indices[re]] = symbols[re].im;
+        }
+
+        PdcchMmseInput input{};
+        input.grid = make_grid_view(buffers);
+        input.sfn_subframe = desc.sfn_subframe;
+        input.cell_id = desc.cell_id;
+        input.n_tx_ports = desc.n_tx_ports;
+        input.tx_mode = desc.tx_mode;
+        input.control_symbol_count = control_symbol_count;
+        input.n_prb = n_prb;
+        input.prb_bitmap = desc.prb_bitmap;
+        input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                                  .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                                  .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+        mmse::pdcch::PdcchSiRntiSearchResult result{};
+        const MmseStatus status =
+            mmse::pdcch::run_pdcch_cpu_si_rnti_search(context, input, {}, result);
+        expect_true(status == MmseStatus::kOk && result.hits.size() == 1U &&
+                        result.hits[0].first_cce == first_cce &&
+                        result.hits[0].aggregation_level == 4U &&
+                        result.hits[0].decoded.dci.start_prb == start_prb &&
+                        result.hits[0].decoded.dci.n_prb == allocated_prb_count,
+                    "CPU SI-RNTI search must decode every standard LTE bandwidth n_prb=" +
+                        std::to_string(n_prb) +
+                        " status=" + std::to_string(static_cast<std::uint32_t>(status)) +
+                        " hits=" + std::to_string(result.hits.size()));
+    }
+}
+
+void test_pdcch_ue_specific_search_supports_standard_bandwidths() {
+    constexpr std::array<std::uint16_t, 6> kBandwidths = {6U, 15U, 25U, 50U, 75U, 100U};
+    constexpr std::uint16_t kRnti = 0x1234U;
+    for (const std::uint16_t n_prb : kBandwidths) {
+        auto decoded_bits = make_si_rnti_dci_format1a_bits(n_prb, 0U, 1U);
+        rewrite_pdcch_crc_rnti_mask(decoded_bits, kRnti);
+        auto backend = make_native_si_rnti_backend(0U, 1U, decoded_bits, 1U);
+        backend.n_prb = n_prb;
+
+        mmse::pdcch::PdcchUeSpecificSearchConfig config{};
+        config.rntis = {kRnti};
+        config.aggregation_level_mask = mmse::pdcch::kPdcchAggregationLevelMaskL1;
+        config.dci_format1a.n_prb = n_prb;
+        mmse::pdcch::PdcchUeSpecificSearchResult result{};
+        expect_true(mmse::pdcch::decode_pdcch_ue_specific_search_dci_format1a(
+                        backend, config, result) == MmseStatus::kOk &&
+                        result.hits.size() == 1U && result.hits[0].rnti == kRnti &&
+                        result.hits[0].decoded.dci.start_prb == 0U &&
+                        result.hits[0].decoded.dci.n_prb == 1U,
+                    "UE-specific DCI 1A search must use the configured LTE bandwidth");
+    }
+}
+
+void test_pdcch_cpu_si_rnti_search_two_tx_supports_selected_bandwidths() {
+    constexpr std::array<std::uint16_t, 3> kBandwidths = {6U, 50U, 100U};
+    for (const std::uint16_t n_prb : kBandwidths) {
+        MmseEqualizerCpuContext context;
+        MmseEqualizerCpuConfig cpu_config{};
+        cpu_config.worker_count = 1U;
+        cpu_config.sigma2_min = 1.0e-5F;
+        expect_true(context.init(cpu_config) == MmseStatus::kOk,
+                    "two-tx standard-bandwidth SI-RNTI CPU context init");
+
+        const std::uint8_t control_symbol_count = n_prb == 6U ? 4U : 3U;
+        auto desc = make_pdcch_desc(n_prb, control_symbol_count);
+        desc.n_tx_ports = 2U;
+        desc.tx_mode = 2U;
+        GridBuffers buffers = make_zero_grid(lte_downlink_subcarrier_count(n_prb));
+        fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+        mmse::detail::ReLayout layout{};
+        const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+        const std::uint16_t first_cce = n_prb == 6U ? 0U : 4U;
+        const std::uint16_t start_prb = static_cast<std::uint16_t>(n_prb / 3U);
+        const auto symbols = make_native_si_rnti_qpsk_symbols(
+            n_source_re, first_cce, 4U, make_si_rnti_dci_format1a_bits(n_prb, start_prb, 1U),
+            desc.cell_id, desc.sfn_subframe);
+        expect_true((n_source_re & 1U) == 0U,
+                    "two-tx standard-bandwidth PDCCH source RE count must be even");
+        for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
+            fill_pdcch_td_pair(buffers, desc, layout.grid_indices[re], layout.grid_indices[re + 1U],
+                               {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F}, {1.0F, 0.0F}, symbols[re],
+                               symbols[re + 1U]);
+        }
+
+        PdcchMmseInput input{};
+        input.grid = make_grid_view(buffers);
+        input.sfn_subframe = desc.sfn_subframe;
+        input.cell_id = desc.cell_id;
+        input.n_tx_ports = desc.n_tx_ports;
+        input.tx_mode = desc.tx_mode;
+        input.control_symbol_count = control_symbol_count;
+        input.n_prb = n_prb;
+        input.prb_bitmap = desc.prb_bitmap;
+        input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                                  .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                                  .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+        mmse::pdcch::PdcchSiRntiSearchResult result{};
+        expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_search(context, input, {}, result) ==
+                            MmseStatus::kOk &&
+                        result.hits.size() == 1U && result.hits[0].first_cce == first_cce &&
+                        result.hits[0].decoded.dci.start_prb == start_prb &&
+                        result.hits[0].decoded.dci.n_prb == 1U,
+                    "two-tx CPU SI-RNTI search must decode selected LTE bandwidths");
+    }
+}
+
+void test_pdcch_geometry_cache_tracks_bandwidth() {
+    mmse::pdcch::PdcchSiRntiGeometrySearchRequest request{};
+    request.cell_id = 19U;
+    request.n_tx_ports = 1U;
+    request.tx_mode = 1U;
+    request.n_prb = 75U;
+    request.control_subframe.kind = mmse::pdcch::LteControlSubframeKind::kRegular;
+
+    mmse::pdcch::PdcchSiRntiGeometrySearchCache cache{};
+    cache.locked = true;
+    cache.cell_id = request.cell_id;
+    cache.n_tx_ports = request.n_tx_ports;
+    cache.tx_mode = request.tx_mode;
+    cache.n_prb = 100U;
+    cache.subframe_kind = request.control_subframe.kind;
+    expect_true(!mmse::pdcch::detail::pdcch_si_rnti_geometry_cache_matches(cache, request),
+                "SI-RNTI geometry cache must not cross carrier bandwidths");
+
+    cache.n_prb = request.n_prb;
+    expect_true(mmse::pdcch::detail::pdcch_si_rnti_geometry_cache_matches(cache, request),
+                "SI-RNTI geometry cache must match an identical carrier bandwidth");
 }
 
 void test_pdcch_native_tail_biting_rate_recovery_l4_l8() {
@@ -5643,6 +5896,18 @@ int main() {
                   &test_pdcch_si_rnti_semantics_reject_invalid_grants},
         std::pair{"pdcch_dci_format1a_si_numeric_boundaries",
                   &test_pdcch_dci_format1a_si_numeric_boundaries},
+        std::pair{"pdcch_fdd_dci_format1a_supports_standard_bandwidths",
+                  &test_pdcch_fdd_dci_format1a_supports_standard_bandwidths},
+        std::pair{"pdcch_control_geometry_supports_standard_bandwidths",
+                  &test_pdcch_control_geometry_supports_standard_bandwidths},
+        std::pair{"pdcch_cpu_si_rnti_search_supports_standard_bandwidths",
+                  &test_pdcch_cpu_si_rnti_search_supports_standard_bandwidths},
+        std::pair{"pdcch_ue_specific_search_supports_standard_bandwidths",
+                  &test_pdcch_ue_specific_search_supports_standard_bandwidths},
+        std::pair{"pdcch_cpu_si_rnti_search_two_tx_supports_selected_bandwidths",
+                  &test_pdcch_cpu_si_rnti_search_two_tx_supports_selected_bandwidths},
+        std::pair{"pdcch_geometry_cache_tracks_bandwidth",
+                  &test_pdcch_geometry_cache_tracks_bandwidth},
         std::pair{"pdcch_cpu_si_rnti_search_runs_full_one_tx_chain",
                   &test_pdcch_cpu_si_rnti_search_runs_full_one_tx_chain},
         std::pair{"pdcch_cpu_si_rnti_search_runs_full_two_tx_chain",

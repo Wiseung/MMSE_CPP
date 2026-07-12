@@ -22,7 +22,8 @@ inline MmseStatus build_pdcch_cpu_backend(MmseEqualizerCpuContext& context,
                                           const PdcchMmseInput& input,
                                           BackendPdcchEqualizedIndication& backend) {
     backend = {};
-    constexpr std::uint32_t kMaxPdcchRe = kLteMaxControlSymbolsNormalCp * kLteNumSubcarriers20MHz;
+    constexpr std::uint32_t kMaxPdcchRe =
+        kLteMaxPdcchControlSymbolsNormalCp * kLteNumSubcarriers20MHz;
     std::vector<float> x_hat_re(kMaxPdcchRe);
     std::vector<float> x_hat_im(kMaxPdcchRe);
     std::vector<float> sinr(kMaxPdcchRe);
@@ -105,8 +106,7 @@ inline MmseStatus run_pdcch_cpu_si_rnti_search(MmseEqualizerCpuContext& context,
                                                const PdcchSiRntiSearchConfig& config,
                                                PdcchSiRntiSearchResult& result) {
     result = {};
-    if (input.n_prb != kLteNumPrb20MHz ||
-        input.control_subframe.duplex_mode != PhichDuplexMode::kFdd) {
+    if (input.control_subframe.duplex_mode != PhichDuplexMode::kFdd) {
         return MmseStatus::kUnsupportedConfig;
     }
 
@@ -124,9 +124,9 @@ inline MmseStatus run_pdcch_cpu_ue_specific_search(MmseEqualizerCpuContext& cont
                                                    const PdcchUeSpecificSearchConfig& config,
                                                    PdcchUeSpecificSearchResult& result) {
     result = {};
-    if (input.n_prb != kLteNumPrb20MHz ||
-        input.control_subframe.duplex_mode != PhichDuplexMode::kFdd ||
-        config.dci_format1a.duplex_mode != PhichDuplexMode::kFdd) {
+    if (input.control_subframe.duplex_mode != PhichDuplexMode::kFdd ||
+        config.dci_format1a.duplex_mode != PhichDuplexMode::kFdd ||
+        input.n_prb != config.dci_format1a.n_prb) {
         return MmseStatus::kUnsupportedConfig;
     }
     BackendPdcchEqualizedIndication backend{};
@@ -144,7 +144,7 @@ pdcch_si_rnti_geometry_cache_matches(const PdcchSiRntiGeometrySearchCache& cache
                                      const PdcchSiRntiGeometrySearchRequest& request) noexcept {
     return cache.locked && cache.cell_id == request.cell_id &&
            cache.n_tx_ports == request.n_tx_ports && cache.tx_mode == request.tx_mode &&
-           cache.subframe_kind == request.control_subframe.kind;
+           cache.n_prb == request.n_prb && cache.subframe_kind == request.control_subframe.kind;
 }
 
 inline MmseStatus
@@ -152,7 +152,8 @@ build_pdcch_si_rnti_geometry_input(const PdcchSiRntiGeometrySearchRequest& reque
                                    const PdcchControlGeometry& geometry, PdcchMmseInput& input) {
     input = {};
     if (!geometry.standard_reg_order || geometry.control_symbol_count == 0U ||
-        geometry.control_symbol_count > kLteMaxControlSymbolsNormalCp ||
+        !is_supported_lte_downlink_bandwidth(request.n_prb) ||
+        geometry.control_symbol_count > lte_max_pdcch_control_symbols_normal_cp(request.n_prb) ||
         request.control_subframe.duplex_mode != PhichDuplexMode::kFdd ||
         request.control_subframe.subframe != request.sfn_subframe % 10U) {
         return MmseStatus::kInvalidArgument;
@@ -164,9 +165,11 @@ build_pdcch_si_rnti_geometry_input(const PdcchSiRntiGeometrySearchRequest& reque
     frontend.n_tx_ports = request.n_tx_ports;
     frontend.tx_mode = request.tx_mode;
     frontend.control_symbol_count = geometry.control_symbol_count;
-    frontend.n_prb = kLteNumPrb20MHz;
-    frontend.prb_bitmap.fill(0xFFFFU);
-    frontend.prb_bitmap.back() = 0x000FU;
+    frontend.n_prb = request.n_prb;
+    frontend.prb_bitmap.fill(0U);
+    for (std::uint32_t prb = 0U; prb < frontend.n_prb; ++prb) {
+        frontend.prb_bitmap[prb / 16U] |= static_cast<std::uint16_t>(1U << (prb % 16U));
+    }
     frontend.control_subframe = request.control_subframe;
     frontend.chain = request.chain;
     append_pcfich_reserved_control_re_list(frontend);
@@ -194,11 +197,13 @@ inline constexpr std::array<PhichDuration, 2> kPdcchGeometryPhichDurations = {
     PhichDuration::kExtended,
 };
 
-inline void build_pdcch_si_rnti_geometry_candidates(std::vector<PdcchControlGeometry>& geometries) {
+inline void build_pdcch_si_rnti_geometry_candidates(std::uint16_t n_prb,
+                                                    std::vector<PdcchControlGeometry>& geometries) {
     geometries.clear();
-    geometries.reserve(kLteMaxControlSymbolsNormalCp * kPdcchGeometryPhichResources.size() *
+    const std::uint32_t max_control_symbols = lte_max_pdcch_control_symbols_normal_cp(n_prb);
+    geometries.reserve(max_control_symbols * kPdcchGeometryPhichResources.size() *
                        kPdcchGeometryPhichDurations.size());
-    for (std::uint8_t cfi = 1U; cfi <= kLteMaxControlSymbolsNormalCp; ++cfi) {
+    for (std::uint8_t cfi = 1U; cfi <= max_control_symbols; ++cfi) {
         for (const PhichResource resource : kPdcchGeometryPhichResources) {
             for (const PhichDuration duration : kPdcchGeometryPhichDurations) {
                 if (duration == PhichDuration::kExtended && cfi < kLteMaxControlSymbolsNormalCp) {
@@ -223,6 +228,7 @@ inline void update_pdcch_si_rnti_geometry_cache(PdcchSiRntiGeometrySearchCache& 
         .cell_id = request.cell_id,
         .n_tx_ports = request.n_tx_ports,
         .tx_mode = request.tx_mode,
+        .n_prb = request.n_prb,
         .subframe_kind = request.control_subframe.kind,
         .geometry = geometry,
         .consecutive_miss_count = 0U,
@@ -237,7 +243,8 @@ inline MmseStatus run_pdcch_cpu_si_rnti_geometry_search(
     PdcchSiRntiGeometrySearchResult& result) {
     result = {};
     if (request.control_subframe.duplex_mode != PhichDuplexMode::kFdd ||
-        request.control_subframe.subframe != request.sfn_subframe % 10U) {
+        request.control_subframe.subframe != request.sfn_subframe % 10U ||
+        !is_supported_lte_downlink_bandwidth(request.n_prb)) {
         return MmseStatus::kUnsupportedConfig;
     }
     if (cache.locked && !detail::pdcch_si_rnti_geometry_cache_matches(cache, request)) {
@@ -256,6 +263,10 @@ inline MmseStatus run_pdcch_cpu_si_rnti_geometry_search(
         if (const MmseStatus status = detail::build_pdcch_cpu_backend(context, input, backend);
             status != MmseStatus::kOk) {
             return status;
+        }
+        if (backend.x_hat_re.empty()) {
+            decoded = {};
+            return MmseStatus::kOk;
         }
         return decode_pdcch_si_rnti_dci_format1a(backend, {.decoder = config.decoder}, decoded);
     };
@@ -283,7 +294,7 @@ inline MmseStatus run_pdcch_cpu_si_rnti_geometry_search(
         cache = {};
     }
     std::vector<PdcchControlGeometry> geometries{};
-    detail::build_pdcch_si_rnti_geometry_candidates(geometries);
+    detail::build_pdcch_si_rnti_geometry_candidates(request.n_prb, geometries);
     PdcchControlGeometry matched_geometry{};
     PdcchSiRntiSearchResult matched_decoded{};
     std::uint32_t matching_geometry_count = 0U;
