@@ -38,6 +38,8 @@ void StaticThreadPool::init(std::uint32_t worker_count) {
         return;
     }
 
+    // The caller thread owns range 0. Background workers start at 1 so a
+    // one-worker configuration needs no thread, mutex wait, or wakeup.
     for (std::uint32_t worker_id = 1; worker_id < impl_->worker_count; ++worker_id) {
         impl_->workers.emplace_back([this, worker_id]() {
             std::uint64_t observed_generation = 0;
@@ -47,6 +49,8 @@ void StaticThreadPool::init(std::uint32_t worker_count) {
                 std::pair<std::uint32_t, std::uint32_t> range{};
                 {
                     std::unique_lock lock(impl_->mutex);
+                    // `generation` is the reusable work ticket; waiting on it
+                    // avoids lost wakeups between successive parallel_for calls.
                     impl_->cv_work.wait(lock, [&]() {
                         return impl_->stop || impl_->generation != observed_generation;
                     });
@@ -101,9 +105,7 @@ std::uint32_t StaticThreadPool::worker_count() const {
 }
 
 void StaticThreadPool::parallel_for(
-    const std::span<const std::pair<std::uint32_t, std::uint32_t>>& ranges,
-    TaskFn fn,
-    void* ctx) {
+    const std::span<const std::pair<std::uint32_t, std::uint32_t>>& ranges, TaskFn fn, void* ctx) {
     if (!impl_ || impl_->worker_count <= 1 || ranges.size() <= 1) {
         if (!ranges.empty() && ranges[0].first < ranges[0].second) {
             fn(ctx, ranges[0].first, ranges[0].second);
@@ -112,6 +114,8 @@ void StaticThreadPool::parallel_for(
     }
 
     {
+        // Publish every range and the callback under one lock, then advance
+        // the generation once so workers observe a consistent task snapshot.
         std::lock_guard lock(impl_->mutex);
         for (std::size_t i = 0; i < ranges.size() && i < impl_->ranges.size(); ++i) {
             impl_->ranges[i] = ranges[i];
@@ -126,16 +130,16 @@ void StaticThreadPool::parallel_for(
         impl_->cv_work.notify_all();
     }
 
+    // Execute range 0 inline while the other workers run in parallel.
     if (ranges[0].first < ranges[0].second) {
         fn(ctx, ranges[0].first, ranges[0].second);
     }
 
     {
         std::unique_lock lock(impl_->mutex);
-        impl_->cv_done.wait(lock, [&]() {
-            return impl_->completed_generation == impl_->generation;
-        });
+        impl_->cv_done.wait(lock,
+                            [&]() { return impl_->completed_generation == impl_->generation; });
     }
 }
 
-}  // namespace mmse::detail
+} // namespace mmse::detail

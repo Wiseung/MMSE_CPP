@@ -64,6 +64,9 @@ enum class MmseChannelType : std::uint8_t {
     kPcfich,
 };
 
+// FFT-domain resource grid stored as one contiguous plane per RX antenna:
+// plane[rx][symbol * n_subcarriers + subcarrier]. `generation` participates in
+// prepared-subframe caching and must change when the pointed-to samples change.
 struct PlanarGridViewF32 {
     std::array<const float*, 2> re{};
     std::array<const float*, 2> im{};
@@ -73,6 +76,9 @@ struct PlanarGridViewF32 {
     std::uint64_t generation = 0;
 };
 
+// LTE extraction parameters shared by the generic, PBCH, PCFICH and PDCCH paths.
+// `prb_bitmap` uses bit `prb % 16` in word `prb / 16`; the count must agree with
+// `n_prb`, while channel-specific validation supplies the remaining constraints.
 struct ExtractDescriptor {
     std::uint32_t sfn_subframe = 0;
     std::uint16_t cell_id = 0;
@@ -139,6 +145,9 @@ struct PdcchMmseInput {
     PdcchChainMetadata chain{};
 };
 
+// Layer-major output view. For layer l and extracted RE r, the sample is at
+// l * capacity_re_per_layer + r. `n_re_per_layer` and `n_layers` are written by
+// the runtime after it has built the channel-specific RE layout.
 struct EqualizerOutputView {
     float* x_hat_re = nullptr;
     float* x_hat_im = nullptr;
@@ -314,6 +323,7 @@ struct PcfichTdMmseResult {
     PcfichChainMetadata chain{};
 };
 
+// Numerical safeguards and execution policy for the CPU MMSE runtime.
 struct MmseEqualizerCpuConfig {
     std::uint32_t worker_count = 1;
     float sigma2_iir_alpha = 0.8F;
@@ -324,6 +334,8 @@ struct MmseEqualizerCpuConfig {
     MmseCpuBackend backend = MmseCpuBackend::kAuto;
 };
 
+// GPU runtime policy. CUDA keeps staging buffers per stream; sigma2 ownership
+// selects whether the host IIR state or the device-side state is authoritative.
 struct MmseEqualizerGpuConfig {
     std::uint32_t device_ordinal = 0;
     std::uint32_t stream_count = 1;
@@ -334,6 +346,8 @@ struct MmseEqualizerGpuConfig {
     float gamma_max = 1.0e4F;
     MmseGpuBackend backend = MmseGpuBackend::kAuto;
     MmseGpuSigma2Ownership sigma2_ownership = MmseGpuSigma2Ownership::kHostOwnedIir;
+    // ReleaseSanity checks finite sampled outputs; TestDeepTrace also compares
+    // sampled intermediate values against the scalar CPU implementation.
     MmseGpuValidationPolicy validation_policy = MmseGpuValidationPolicy::kReleaseSanity;
 };
 

@@ -81,6 +81,8 @@ __device__ inline CudaComplex32 ls_at(const float* re_plane,
     const std::uint32_t symbol = grid_meta->crs_symbols[cs];
     const std::uint32_t sc = 6U * pilot + grid_meta->crs_freq_offsets[tx][cs];
     const std::uint32_t grid_idx = symbol * grid_meta->n_subcarriers + sc;
+    // CRS reference has unit magnitude, so multiplying by its conjugate is the
+    // least-squares channel sample at this pilot position.
     const CudaComplex32 y = load_grid_sample(re_plane, im_plane, grid_idx);
     const float crs_re = grid_meta->crs_pilot_re[tx][cs][pilot];
     const float crs_im = grid_meta->crs_pilot_im[tx][cs][pilot];
@@ -127,6 +129,8 @@ __device__ inline CudaComplex32 estimate_h_at(const float* re_plane,
                                               std::uint32_t rx,
                                               std::uint32_t symbol,
                                               std::uint32_t sc) {
+    // Frequency interpolation is performed independently at the two enclosing
+    // CRS symbols; a second linear interpolation then fills the target symbol.
     std::uint32_t upper = 0U;
     while (upper < kLteNumCrsSymbols && grid_meta->crs_symbols[upper] < symbol) {
         ++upper;
@@ -216,6 +220,9 @@ __global__ void estimate_residual_kernel(const float* grid_re0,
         tx_count * min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas) * kLteNumCrsSymbols *
         (kLteNumPilotTonesPerCrsSymbol - 2U);
 
+    // Stride over pilot residuals so the fixed grid can be processed with any
+    // launch size. Block-local sums are reduced with two global atomics only
+    // once per thread, keeping the reduction independent of grid dimensions.
     float local_sigma2 = 0.0F;
     std::uint32_t local_count = 0U;
     const std::uint32_t stride = blockDim.x * gridDim.x;
@@ -257,6 +264,9 @@ __global__ void estimate_channel_kernel(const float* grid_re0,
         return;
     }
 
+    // Each thread owns one [tx, rx, symbol, subcarrier] output. The fixed
+    // storage stride lets the host reuse the same estimate buffer for all LTE
+    // bandwidth-specific extraction layouts.
     const std::uint32_t tx_count = min_u32(grid_meta->n_tx_ports, kMmseV1MaxNumCrsTxPorts);
     const std::uint32_t rx_count = min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas);
     const std::uint32_t total_h = tx_count * rx_count * kLteNumSymbolsNormalCp *
@@ -294,6 +304,9 @@ __global__ void finalize_sigma2_kernel(const CudaGridMeta* grid_meta,
         return;
     }
 
+    // This single thread is the device-side equivalent of update_sigma2_state:
+    // enforce the floor, optionally apply the IIR update, and leave the result
+    // in the persistent per-slot sigma2 buffer before equalization starts.
     const std::uint32_t residual_count = *residual_count_in;
     float sigma2 = residual_count == 0U ? grid_meta->sigma2
                                          : *sigma2_accum_in / static_cast<float>(residual_count);
@@ -354,6 +367,9 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
         return;
     }
 
+    // One thread handles one compact output RE. `grid_indices` maps that slot
+    // into the FFT grid; PDCCH 1Tx can use the compact slot directly, while
+    // other layouts use the reverse map to preserve channel-specific ordering.
     const std::uint32_t re = blockIdx.x * blockDim.x + threadIdx.x;
     if (re < grid_meta->n_valid_re) {
         const float sigma2 = sigma2_in != nullptr ? *sigma2_in : grid_meta->sigma2;
@@ -401,6 +417,8 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
         const float h10_im = has_rx1 ? h_estimate[h10_base + 1U] : 0.0F;
 
         if (td_mode && re < grid_meta->td_pair_count) {
+            // Alamouti pair: combine two grid positions as four virtual rows,
+            // then apply the same regularized 2x2 solve used by the CPU path.
             const std::uint32_t next_grid_idx = grid_meta->td_pair_grid_indices1[re];
             const std::uint32_t next_symbol = next_grid_idx / grid_meta->n_subcarriers;
             const std::uint32_t next_sc = next_grid_idx % grid_meta->n_subcarriers;
@@ -489,6 +507,8 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
         } else if (td_mode) {
             // One CUDA thread processes a complete explicit TD pair.
         } else if (grid_meta->n_layers == 1U) {
+            // 1x2 maximal-ratio/MMSE path; h00 and h10 are the two RX channels
+            // for the single transmitted layer.
             const float denom = h00_re * h00_re + h00_im * h00_im + h10_re * h10_re +
                                 h10_im * h10_im + sigma2;
             const float w0_re = h00_re / denom;
@@ -508,6 +528,8 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
             gamma0 = gamma0 > gamma_max ? gamma_max : gamma0;
             sinr[out_slot] = gamma0;
         } else {
+            // 2x2 path: form H^H H + sigma2 I, invert the Hermitian 2x2 matrix,
+            // and derive per-layer effective gains and SINRs.
             const CudaComplex32 h00{h00_re, h00_im};
             const CudaComplex32 h01{h_estimate[h01_base], h_estimate[h01_base + 1U]};
             const CudaComplex32 h10{h10_re, h10_im};
@@ -659,6 +681,8 @@ __global__ void pdcch_llr_descramble_kernel(const float* xhat_re,
         return;
     }
 
+    // Equalized QPSK components become soft bits through SINR scaling. Gold
+    // bits are applied as a sign flip in-place, avoiding a second buffer.
     const std::uint32_t re = index >> 1U;
     const float gamma = sinr[re] > 0.0F ? sinr[re] : 0.0F;
     constexpr float kScale = -2.0F / 0.70710678118654752440F;
@@ -681,6 +705,9 @@ __global__ void pdcch_rate_recovery_kernel(const float* llrs,
         candidates == nullptr || recovered_llrs == nullptr) {
         return;
     }
+    // A block is one candidate and each warp/lane owns one recovered output
+    // position. The candidate descriptor supplies the inverse collection map,
+    // so no per-candidate temporary matrix is required.
     constexpr std::uint32_t kColumns = 32U;
     constexpr std::uint8_t kPermutation[kColumns] = {
         1U, 17U, 9U, 25U, 5U, 21U, 13U, 29U, 3U, 19U, 11U, 27U, 7U, 23U, 15U, 31U,
@@ -729,6 +756,9 @@ __global__ void pdcch_viterbi_kernel(const float* recovered_llrs,
         return;
     }
 
+    // Two warps cover all 64 initial states in one candidate block. Each warp
+    // evaluates the 64-state trellis for one initial state and stores one
+    // survivor word per bit; the CRC kernel later performs the traceback.
     __shared__ double metrics[2][64];
     __shared__ double next_metrics[2][64];
     const std::uint32_t target_state = lane * 2U;
@@ -798,6 +828,8 @@ __global__ void pdcch_crc_kernel(const CudaPdcchCandidateDescriptor* candidates,
         survivors == nullptr || terminal_metrics == nullptr || candidate_results == nullptr) {
         return;
     }
+    // Tail-biting traceback is intentionally kept here, after the fixed-work
+    // Viterbi kernel, so only the best closed path needs CRC/RNTI checking.
     double best_metric = kCudaNegativeInfinity;
     std::uint64_t decoded_bits = 0U;
     for (std::uint32_t initial_state = 0U; initial_state < 64U; ++initial_state) {
@@ -859,6 +891,8 @@ __global__ void pdcch_compact_hits_kernel(const CudaPdcchCandidateResult* candid
         compact_results == nullptr || hit_count == nullptr) {
         return;
     }
+    // Candidate count is tiny (the common-search maximum is six), so a single
+    // thread performs stable compaction and makes D2H transfer bounded.
     std::uint32_t count = 0U;
     for (std::uint32_t candidate = 0U; candidate < candidate_count; ++candidate) {
         const CudaPdcchCandidateResult result = candidate_results[candidate];
@@ -1080,6 +1114,9 @@ MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
             return map_cuda_error(status);
         }
     }
+    // PDCCH 1Tx/non-TD metadata is immutable except for the valid grid-index
+    // prefix. Avoid transferring the large reverse-map arrays in that hot path;
+    // TD and other channels still receive the complete metadata block.
     const bool compact_pdcch_meta =
         grid_meta.channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
         grid_meta.n_tx_ports == 1U && grid_meta.td_pair_count == 0U;
@@ -1125,6 +1162,9 @@ MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffer
                                                  const CudaGridMeta& grid_meta,
                                                  std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    // Reused estimates only need dynamic layout fields. Preserve the compact
+    // PDCCH fast path and otherwise update the header plus the arrays consumed
+    // by TD/reordered channels.
     const bool compact_pdcch_meta =
         grid_meta.channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
         grid_meta.n_tx_ports == 1U && grid_meta.td_pair_count == 0U;
@@ -1227,6 +1267,9 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
     if (buffers.h_estimate == nullptr || buffers.scratch == nullptr) {
         return MmseStatus::kInternalError;
     }
+    // scratch[0..1] are the transient residual sum/count. The launches remain
+    // in one stream, so zero -> residual -> estimate -> finalize is ordered
+    // without host synchronization.
     float* sigma2_accum = reinterpret_cast<float*>(buffers.scratch);
     std::uint32_t* residual_count =
         reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::byte*>(buffers.scratch) + sizeof(float));
@@ -1283,6 +1326,8 @@ MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers,
                                      std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     constexpr std::uint32_t kThreadsPerBlock = 256U;
+    // Launch one block even for an empty layout so the completion marker is
+    // written and asynchronous callers can use the same readiness protocol.
     const std::uint32_t blocks = (n_valid_re == 0U) ? 1U : (n_valid_re + kThreadsPerBlock - 1U) /
                                                        kThreadsPerBlock;
     equalize_stub_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
@@ -1458,6 +1503,8 @@ MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers& buffers,
         candidate_count == 0U || candidate_count > kCudaPdcchMaxCandidates) {
         return MmseStatus::kInvalidArgument;
     }
+    // CRC validation and hit compaction are ordered in the same stream; the
+    // following D2H copy therefore observes a compact, fully populated prefix.
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     pdcch_crc_kernel<<<candidate_count, 1U, 0, stream>>>(
         reinterpret_cast<const CudaPdcchCandidateDescriptor*>(buffers.pdcch_candidates),

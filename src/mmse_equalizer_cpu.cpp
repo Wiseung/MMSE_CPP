@@ -18,6 +18,8 @@ namespace {
 
 constexpr std::size_t h_index(std::uint32_t tx, std::uint32_t rx, std::uint32_t symbol,
                               std::uint32_t sc) {
+    // Keep the flat storage order identical to the CUDA h_estimate buffer:
+    // [tx][rx][normal-CP symbol][20 MHz subcarrier].
     return (((static_cast<std::size_t>(tx) * kMmseV1MaxNumRxAntennas + rx) *
                  kLteNumSymbolsNormalCp +
              symbol) *
@@ -390,6 +392,9 @@ const Complex32& crs_value(const CrsTableKey& key, std::uint32_t pilot_index) {
 
 void ensure_crs_tables() {
     std::call_once(g_crs_table_once, []() {
+        // LTE CRS is generated once for every cell/subframe/port/symbol. The
+        // Gold sequence is advanced through Nc=1600 before two bits form each
+        // QPSK pilot, so repeated subframe processing does not redo this work.
         for (std::uint16_t cell_id = 0; cell_id < kLteNumCellIds; ++cell_id) {
             for (std::uint8_t subframe = 0; subframe < 10U; ++subframe) {
                 for (std::uint8_t port = 0; port < kMmseV1MaxNumCrsTxPorts; ++port) {
@@ -443,6 +448,8 @@ void ensure_crs_tables() {
 std::uint32_t build_data_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
     reset_layout(layout);
 
+    // PDSCH output follows symbol -> PRB -> tone order, excluding CRS REs.
+    // Each non-empty symbol becomes one segment for the GPU metadata/profile.
     for (std::uint32_t symbol = desc.start_symbol; symbol < kLteNumSymbolsNormalCp; ++symbol) {
         std::uint32_t segment_begin = layout.n_re;
         for (std::uint32_t prb = 0; prb < kLteNumPrb20MHz; ++prb) {
@@ -480,6 +487,9 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
     std::uint32_t n_physical_regs = 0U;
     const std::uint32_t n_subcarriers = lte_downlink_subcarrier_count(desc.n_prb);
 
+    // Build physical REGs first. Symbol 0 has CRS holes; later symbols use the
+    // three fixed six-tone REG patterns. Reserved PCFICH/PHICH REs are rejected
+    // before the REG enters the interleaver.
     const auto append_reg = [&](std::uint32_t symbol, std::uint32_t prb,
                                 const PdcchRegIndices& tones) {
         PdcchRegIndices grid_indices{};
@@ -528,6 +538,9 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
         return 0U;
     }
 
+    // LTE interleaves REGs through a 32-column matrix, skips dummy entries, then
+    // applies the cell-ID cyclic shift. Only complete groups of nine REGs form
+    // CCEs, so a trailing partial group is intentionally not emitted.
     const std::uint32_t n_rows =
         (n_physical_regs + kPdcchPermutationColumns - 1U) / kPdcchPermutationColumns;
     const std::uint32_t n_dummy = kPdcchPermutationColumns * n_rows - n_physical_regs;
@@ -565,6 +578,8 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
 std::uint32_t build_pbch_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
     reset_layout(layout);
 
+    // PBCH occupies the central six PRBs over four symbols. CRS holes exist in
+    // the first two PBCH symbols and depend on the cell-ID frequency shift.
     for (std::uint32_t symbol = kLtePbchStartSymbolNormalCp;
          symbol < kLtePbchStartSymbolNormalCp + kLtePbchNumSymbols; ++symbol) {
         const std::uint32_t segment_begin = layout.n_re;
@@ -596,6 +611,8 @@ std::uint32_t build_pbch_re_layout(const ExtractDescriptor& desc, ReLayout& layo
 std::uint32_t build_pcfich_re_layout(const ExtractDescriptor& desc, ReLayout& layout) {
     reset_layout(layout);
 
+    // PCFICH is represented as four REGs. Each REG contributes six REs minus
+    // the two CRS positions selected by v_o, yielding four data REs per REG.
     const auto regs = mmse::pdcch::detail::pcfich_reg_coords(desc.cell_id);
     const std::uint32_t vo = desc.cell_id % 3U;
     const std::uint32_t segment_begin = layout.n_re;
@@ -696,6 +713,9 @@ void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& de
     const std::uint32_t n_subcarriers = grid.n_subcarriers;
     const std::uint32_t n_pilot_tones = n_subcarriers / 6U;
 
+    // For each CRS pilot, multiply the received sample by conj(reference) to
+    // obtain a least-squares channel sample. Interpolate first in frequency,
+    // then between CRS symbols in time to fill the complete channel grid.
     for (std::uint32_t tx = 0; tx < desc.n_tx_ports; ++tx) {
         for (std::uint32_t rx = 0; rx < desc.n_rx_ant; ++rx) {
             std::array<std::array<Complex32, kLteNumPilotTonesPerCrsSymbol>, kLteNumCrsSymbols>
@@ -718,6 +738,8 @@ void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& de
                         cmul(grid_at(grid, rx, symbol, sc), cconj(crs_value(key, pilot)));
                 }
 
+                // The second-difference residual estimates pilot/noise error;
+                // 2/3 compensates the variance of x_i-(x_{i-1}+x_{i+1})/2.
                 for (std::uint32_t pilot = 1U; pilot + 1U < n_pilot_tones; ++pilot) {
                     const Complex32 smooth =
                         cscale(cadd(ls[cs][pilot - 1U], ls[cs][pilot + 1U]), 0.5F);
@@ -795,6 +817,8 @@ float update_sigma2_state(Sigma2State& state, float sigma2_estimate,
         state.initialized = true;
         return state.value;
     }
+    // Smooth per-cell estimates so a noisy subframe does not abruptly change
+    // MMSE regularization. The configured floor is enforced at every step.
     state.value =
         config.sigma2_iir_alpha * state.value + (1.0F - config.sigma2_iir_alpha) * sigma2_estimate;
     state.value =
@@ -848,6 +872,8 @@ void pack_equalizer_inputs(const PlanarGridViewF32& grid, const HGridStorage& h_
 
 EqualizedSymbol equalize_1x2_scalar(Complex32 h0, Complex32 h1, Complex32 y0, Complex32 y1,
                                     float sigma2, float g_min, float gamma_max) {
+    // 1x2 MMSE: z = H^H y / (||H||^2 + sigma2). Dividing by the effective
+    // channel gain restores the symbol scale; gamma is the corresponding SINR.
     const float denom = cnorm2(h0) + cnorm2(h1) + sigma2;
     const Complex32 weight0 = cscale(cconj(h0), 1.0F / denom);
     const Complex32 weight1 = cscale(cconj(h1), 1.0F / denom);
@@ -862,6 +888,9 @@ EqualizedSymbol equalize_1x2_scalar(Complex32 h0, Complex32 h1, Complex32 y0, Co
 Equalize2x2Trace trace_equalize_2x2_scalar(Complex32 h00, Complex32 h01, Complex32 h10,
                                            Complex32 h11, Complex32 y0, Complex32 y1, float sigma2,
                                            float det_floor, float g_min, float gamma_max) {
+    // Form A = H^H H + sigma2 I and invert its 2x2 Hermitian form explicitly.
+    // Keeping the full trace is useful for CPU/GPU deep validation and avoids
+    // duplicating the numerically sensitive matrix sequence.
     Equalize2x2Trace trace{};
     trace.a11 = cnorm2(h00) + cnorm2(h10) + sigma2;
     trace.a22 = cnorm2(h01) + cnorm2(h11) + sigma2;
@@ -1039,6 +1068,9 @@ demap_transmit_diversity_mmse_scalar(Complex32 h00, Complex32 h01, Complex32 h10
                                      Complex32 h11_next, Complex32 y0, Complex32 y1,
                                      Complex32 y0_next, Complex32 y1_next, float sigma2,
                                      float det_floor, float g_min, float gamma_max) {
+    // Alamouti-style transmit diversity turns two RE observations into a
+    // four-row virtual 2x2 system. Conjugating the second RE creates the
+    // [y0, y1, conj(y0_next), conj(y1_next)] observation vector.
     const std::array<Complex32, 4> a0 = {h00, h10, cscale(cconj(h01_next), -1.0F),
                                          cscale(cconj(h11_next), -1.0F)};
     const std::array<Complex32, 4> a1 = {h01, h11, cconj(h00_next), cconj(h10_next)};
@@ -1204,11 +1236,15 @@ MmseStatus MmseEqualizerCpuContext::Impl::prepare_subframe_if_needed(const Plana
                                                                      float& sigma2) {
     const detail::PreparedSubframeKey key = detail::make_prepared_subframe_key(grid, desc);
     if (prepared.valid && detail::prepared_subframe_key_equal(prepared.key, key)) {
+        // All channel variants in this prepared subframe reuse the same H grid
+        // and sigma2 state; only their RE layout and output metadata differ.
         sigma2 = prepared.sigma2;
         return MmseStatus::kOk;
     }
 
     float sigma2_estimate = 0.0F;
+    // A cache miss is the expensive boundary: estimate CRS channel response,
+    // update the per-cell IIR noise state, and publish one reusable snapshot.
     detail::estimate_channel(grid, desc, h_full, sigma2_estimate);
     sigma2 = detail::update_sigma2_state(sigma2_by_cell[desc.cell_id], sigma2_estimate, config);
     prepared.key = key;
@@ -1228,6 +1264,8 @@ MmseStatus MmseEqualizerCpuContext::Impl::run_channel_from_prepared_estimate(
         return MmseStatus::kBufferTooSmall;
     }
 
+    // Convert the sparse channel layout to structure-of-arrays form before
+    // dispatching workers; this is the memory shape expected by AVX2 lanes.
     detail::pack_equalizer_inputs(grid, h_full, layout, packed);
 
     out.n_re_per_layer = n_re;
@@ -1252,6 +1290,8 @@ MmseStatus MmseEqualizerCpuContext::Impl::run_channel_from_prepared_estimate(
         ranges[w] = {0U, 0U};
     }
 
+    // Worker 0 runs on the caller thread; the pool only wakes the remaining
+    // workers, keeping synchronization overhead out of the single-worker path.
     pool.parallel_for(
         std::span<const std::pair<std::uint32_t, std::uint32_t>>(ranges.data(), workers),
         Impl::worker_task, &worker_ctx);
@@ -1264,6 +1304,9 @@ void MmseEqualizerCpuContext::Impl::worker_task(void* raw_ctx, std::uint32_t beg
     auto& impl = *ctx->impl;
     auto& out = *ctx->out;
 
+    // AVX2 handles only the 2-layer path because it processes both layers in
+    // the same matrix operation. Scalar execution remains the reference path
+    // for 1-layer and tail ranges.
     if (ctx->desc.n_layers == 2U && impl.use_avx2) {
         detail::equalize_2x2_avx2(impl.packed, begin, end, ctx->sigma2, impl.config.det_floor,
                                   impl.config.g_min, impl.config.gamma_max, out.x_hat_re,
