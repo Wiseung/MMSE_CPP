@@ -130,6 +130,9 @@ struct MmseEqualizerGpuContext::Impl {
         std::vector<StreamState> streams{};
     };
 
+    // One slot owns host/device buffers and events for one in-flight stream.
+    // Slots form a ring so input quantization/copy for the next request can be
+    // separated from output collection of the previous request.
     struct HostPinnedSlot {
         std::uint32_t slot_ordinal = 0;
         std::uint32_t stream_ordinal = 0;
@@ -185,6 +188,8 @@ struct MmseEqualizerGpuContext::Impl {
         detail::CudaDeviceBuffers device{};
     };
 
+    // The ring is bounded by stream_count. A slot is reused only after its
+    // stream has been synchronized or its pending decode has been collected.
     struct StagingBuffers {
         std::array<HostPinnedSlot, kPinnedRingSlotCount> slots{};
         std::uint32_t slot_count = 0U;
@@ -346,6 +351,9 @@ MmseEqualizerGpuContext::Impl::compare_equalize_trace_sample(const HostPinnedSlo
 }
 
 void MmseEqualizerGpuContext::Impl::release_runtime_state() {
+    // Device allocations, events, and pinned host memory are released in the
+    // reverse ownership domain in which they are used; the wrapper functions
+    // select cudaFree/cudaFreeHost versus ordinary host deletion.
     for (auto& slot : buffers.slots) {
         detail::cuda_free_device_buffer(slot.device.grid_re[0]);
         detail::cuda_free_device_buffer(slot.device.grid_re[1]);
@@ -465,6 +473,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::configure_device_state() {
     device.cuda_runtime_available = false;
     device.streams.clear();
 
+    // Auto deliberately leaves the CUDA device unselected and uses the CPU
+    // fallback. Explicit CUDA must successfully select a device and create all
+    // non-blocking streams before staging buffers are allocated.
     const bool request_cuda_runtime = (config.backend == MmseGpuBackend::kCuda);
     if (!request_cuda_runtime) {
         return MmseStatus::kOk;
@@ -497,6 +508,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::configure_device_state() {
 }
 
 MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_storage(HostPinnedSlot& slot) {
+    // Transport and output arrays are pinned when CUDA is requested so the
+    // asynchronous copies below can overlap with host work. The no-CUDA stub
+    // transparently falls back to ordinary host allocations.
     bool grid_pinned = false;
     bool output_pinned = false;
     if (const MmseStatus status =
@@ -576,6 +590,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_device_buffers(HostPin
         return MmseStatus::kOk;
     }
 
+    // Allocate the complete fixed-capacity workspace once. Per-call code then
+    // only changes metadata prefixes and launches kernels, avoiding allocator
+    // synchronization in the decode path.
     if (const MmseStatus status =
             detail::cuda_alloc_device_buffer(slot.device.grid_re[0], slot.grid_plane_bytes);
         status != MmseStatus::kOk) {
@@ -739,6 +756,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::configure_staging_buffers() {
     buffers.next_sequence = 1;
     buffers.slot_count = config.stream_count;
 
+    // One slot maps to one stream. In CPU fallback mode there are no CUDA
+    // streams, but retaining the same ring shape keeps output contracts equal.
     for (std::uint32_t slot_index = 0; slot_index < buffers.slot_count; ++slot_index) {
         auto& slot = buffers.slots[slot_index];
         slot.slot_ordinal = slot_index;
@@ -770,10 +789,16 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& 
     const detail::PreparedSubframeKey key =
         detail::make_prepared_subframe_key(grid, desc, static_cast<std::uint32_t>(config.backend));
     if (prepared.valid && detail::prepared_subframe_key_equal(prepared.key, key)) {
+        // Reusing a prepared subframe selects its owning slot and skips another
+        // full-grid host copy; only dynamic channel layout metadata is refreshed
+        // later when needed.
         buffers.active_slot = prepared.slot_index;
         return MmseStatus::kOk;
     }
 
+    // Cache miss: copy both RX planes into a pinned slot before any asynchronous
+    // H2D operation can read them. The generation is part of the cache key, so
+    // pointer reuse alone cannot accidentally retain stale channel state.
     auto& slot = buffers.slots[buffers.next_stage_slot];
     const Clock::time_point transport_start = Clock::now();
     for (std::uint32_t rx = 0; rx < grid.n_rx_ant; ++rx) {
@@ -946,6 +971,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         !slot.device_buffers_ready || slot.stream_handle == 0U) {
         return MmseStatus::kUnsupportedConfig;
     }
+    // Non-synchronizing submissions must keep sigma2 on the device; otherwise
+    // the host would need a mid-stream sync before equalization. The explicit
+    // ownership setting controls the same behavior for synchronous calls.
     const bool device_sigma_for_call = use_device_owned_sigma2(config) || !synchronize;
 
     last_host_profile.layout_build_us = 0.0;
@@ -967,6 +995,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     last_host_profile.equalize_gpu_us = 0.0;
     last_host_profile.stream_gpu_us = 0.0;
 
+    // Host-side layout/meta packing precedes one ordered stream sequence:
+    // H2D -> estimate/residual -> sigma2 finalize -> equalize -> optional D2H.
     const Clock::time_point layout_start = Clock::now();
     detail::build_channel_re_layout(desc, slot.layout);
     last_host_profile.layout_build_us = elapsed_us(layout_start, Clock::now());
@@ -1048,6 +1078,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
     }
     last_host_profile.grid_meta_pack_us = elapsed_us(grid_meta_pack_start, Clock::now());
     if (!reuse_estimate) {
+        // First use of a grid slot transfers samples and runs channel estimation.
+        // Host-owned sigma2 intentionally synchronizes once to feed the updated
+        // IIR value back to the same stream before equalization.
         const Clock::time_point grid_h2d_start = Clock::now();
         if (const MmseStatus status =
                 detail::cuda_event_record(slot.gpu_event_h2d_start, slot.stream_handle);
@@ -1123,6 +1156,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
             last_host_profile.sigma2_h2d_us = elapsed_us(sigma2_h2d_start, Clock::now());
         }
     } else {
+        // A prepared subframe reuses H and sigma2. Only dynamic layout fields
+        // and the stream ordering event need to be submitted.
         slot.grid_meta.sigma2 = prepared.sigma2;
         if (const MmseStatus status = detail::cuda_copy_grid_meta_dynamic_h2d_async(
                 slot.device, slot.grid_meta, slot.stream_handle);
@@ -1136,6 +1171,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         }
     }
 
+    // The completion token is a monotonically changing slot sequence truncated
+    // to 32 bits; deep validation copies it back to detect stale-slot reuse.
     const std::uint32_t completion_value = static_cast<std::uint32_t>(slot.sequence & 0xFFFFFFFFU);
     const Clock::time_point equalize_launch_start = Clock::now();
     if (const MmseStatus status = detail::cuda_launch_equalize_stub(
@@ -1273,6 +1310,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_backend(const ExtractDescripto
         return MmseStatus::kUnsupportedConfig;
     }
 
+    // Backend selection is intentionally explicit here: CUDA uses the staged
+    // transport path, while Auto uses the CPU context but the same slot output.
     MmseStatus status = MmseStatus::kUnsupportedConfig;
     switch (config.backend) {
     case MmseGpuBackend::kCuda:
@@ -1306,6 +1345,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_outputs(EqualizerOutputView& out
         return MmseStatus::kBufferTooSmall;
     }
 
+    // Copy only the valid prefix for each layer. The slot capacity is fixed for
+    // CUDA, whereas the caller's output capacity may be smaller or larger.
     const Clock::time_point output_stage_start = Clock::now();
     for (std::uint32_t layer = 0; layer < slot.out_view.n_layers; ++layer) {
         const std::size_t src_base =
@@ -1407,6 +1448,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::submit_pdcch_gpu_common_search_decode(
     desc.control_re_exclusion_masks = input.control_re_exclusion_masks;
     desc.pmi = -1;
 
+    // Submission stops after the compact result D2H is queued. No stream sync
+    // occurs here, allowing the batch API to enqueue independent requests.
     const Clock::time_point submit_start = Clock::now();
     prepared.valid = false;
     if (const MmseStatus status = prepare_subframe_if_needed(input.grid, desc);
@@ -1423,6 +1466,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::submit_pdcch_gpu_common_search_decode(
         return status;
     }
 
+    // Reuse the equalized PDCCH layout to build REG/CCE candidates, then copy
+    // only candidate descriptors and Gold words to the device.
     pdcch::PdcchControlRegion control_region{};
     if (const MmseStatus status = pdcch::build_pdcch_control_region(
             input.cell_id, input.control_symbol_count, slot.layout.grid_indices.data(),
@@ -1536,6 +1581,8 @@ MmseStatus MmseEqualizerGpuContext::Impl::collect_pdcch_gpu_common_search_decode
     if (!slot.pdcch_decode_submitted) {
         return MmseStatus::kInternalError;
     }
+    // Collection is the synchronization boundary. The compact hit list is
+    // validated again through the shared CPU DCI parser before it is returned.
     const Clock::time_point collect_start = Clock::now();
     if (const MmseStatus status = detail::cuda_stream_synchronize(slot.stream_handle);
         status != MmseStatus::kOk) {

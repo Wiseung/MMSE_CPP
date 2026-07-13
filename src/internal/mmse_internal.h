@@ -61,9 +61,13 @@ struct TransmitDiversityEqualizePair {
     EqualizedSymbol symbol1{};
 };
 
+// Full channel grid in [tx][rx][symbol][subcarrier] order. The helper h_index
+// in the implementation converts this logical order to the flat array offset.
 using HGridStorage =
     std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>;
 
+// Structure-of-arrays staging format used by both scalar workers and AVX2;
+// one index corresponds to one extracted RE across every field below.
 struct PackedEqualizerInputs {
     std::array<float, kMaxDataRe> h00_re{};
     std::array<float, kMaxDataRe> h00_im{};
@@ -79,6 +83,9 @@ struct PackedEqualizerInputs {
     std::array<float, kMaxDataRe> y1_im{};
 };
 
+// Maps compact output slots back to FFT-grid positions. `grid_indices` is the
+// runtime processing order; the reverse map is used for spot checks and GPU
+// metadata, while segment offsets preserve symbol/PRB ranges for profiling.
 struct ReLayout {
     std::array<std::uint16_t, kMaxDataRe> grid_indices{};
     std::array<std::uint32_t, kMaxGridRe> output_slot_by_grid_re{};
@@ -87,6 +94,8 @@ struct ReLayout {
     std::uint32_t n_segments = 0;
 };
 
+// Pointer identity plus LTE dimensions/generation identifies a reusable channel
+// estimate. A new key means the pointed-to grid or its physical interpretation changed.
 struct PreparedSubframeKey {
     std::array<const float*, 2> re{};
     std::array<const float*, 2> im{};
@@ -100,6 +109,8 @@ struct PreparedSubframeKey {
     std::uint32_t backend_mode = 0;
 };
 
+// Per-cell noise estimate smoothed across calls; initialized distinguishes a
+// real estimate from the configured floor used before the first observation.
 struct Sigma2State {
     float value = kDefaultSigma2Min;
     bool initialized = false;

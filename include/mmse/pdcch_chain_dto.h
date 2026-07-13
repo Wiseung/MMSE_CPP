@@ -140,6 +140,8 @@ struct PdcchControlRegion {
     std::uint32_t n_source_re = 0;
     std::uint32_t n_unassigned_reg = 0;
     std::vector<PdcchReg> regs{};
+    // `regs` are physical REGs after CRS/reserved-RE filtering; `cces` groups
+    // the interleaved REG sequence into nine REGs per CCE for candidate search.
     std::vector<PdcchCce> cces{};
 };
 
@@ -186,6 +188,7 @@ struct PdcchRateRecoveredLlr {
     std::uint32_t codeword_bit_count = 0;
     PdcchSoftBitPolarity soft_bit_polarity = PdcchSoftBitPolarity::kNegativeFavorsZero;
     PdcchConvolutionalLlrOrder llr_order = PdcchConvolutionalLlrOrder::kLteRateRecoveredTriplets;
+    // Three soft bits per trellis bit, ordered as LTE rate-recovered triplets.
     std::vector<float> convolutional_llrs{};
 };
 
@@ -196,6 +199,8 @@ struct PdcchTailBitingConvolutionalDecodeRequest {
     std::uint32_t decoded_bit_count = 0;
     PdcchSoftBitPolarity soft_bit_polarity = PdcchSoftBitPolarity::kNegativeFavorsZero;
     PdcchConvolutionalLlrOrder llr_order = PdcchConvolutionalLlrOrder::kLteRateRecoveredTriplets;
+    // Tail-biting requires the decoded trellis to return to the initial state;
+    // the native decoder searches all 64 possible initial states.
     bool tail_biting = true;
 };
 
@@ -276,6 +281,7 @@ struct PdcchGpuCommonSearchDecodeProfile {
     double d2h_us = 0.0;
     double host_submit_us = 0.0;
     double host_collect_us = 0.0;
+    // D2H contains compact candidate hits rather than the full equalized grid.
     std::uint64_t h2d_bytes = 0U;
     std::uint64_t d2h_bytes = 0U;
     std::uint32_t crc_hit_count = 0U;
@@ -363,6 +369,8 @@ struct PdcchSiRntiGeometrySearchCache {
     std::uint16_t n_prb = 0;
     LteControlSubframeKind subframe_kind = LteControlSubframeKind::kRegular;
     PdcchControlGeometry geometry{};
+    // A locked geometry is tried first; repeated misses invalidate the lock and
+    // force the caller to probe the supported control-region profiles again.
     std::uint8_t consecutive_miss_count = 0;
 };
 

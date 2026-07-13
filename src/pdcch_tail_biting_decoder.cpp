@@ -81,6 +81,9 @@ constexpr std::array<std::uint8_t, kStateCount / 2U> kLowPredecessorZeroOutputCl
     make_low_predecessor_zero_output_classes();
 
 double branch_metric(const float* llrs, std::uint32_t shift_register) noexcept {
+    // Positive metric means the received soft bits agree with this encoder
+    // branch. The sign table converts LTE's negative-favors-zero convention
+    // into the additive metric used by the max-log Viterbi recursion.
     const BranchOutputSigns& signs = kBranchOutputSigns[shift_register];
     return static_cast<double>(signs[0]) * static_cast<double>(llrs[0]) +
            static_cast<double>(signs[1]) * static_cast<double>(llrs[1]) +
@@ -108,6 +111,8 @@ MmseStatus decode_pdcch_tail_biting_convolutional(const PdcchRateRecoveredLlr& r
     std::array<std::array<double, kBranchOutputClassCount>, kMaxCodewordBitCount> branch_metrics;
     std::array<std::uint64_t, kMaxCodewordBitCount> survivor_high_predecessor;
 
+    // Precompute all eight possible 3-bit branch metrics for every trellis
+    // position. Each branch class is reused by the 64 initial-state trials.
     for (std::uint32_t bit = 0U; bit < bit_count; ++bit) {
         const float* const llrs =
             recovered.convolutional_llrs.data() + bit * kPdcchConvolutionalCodeRate;
@@ -121,6 +126,9 @@ MmseStatus decode_pdcch_tail_biting_convolutional(const PdcchRateRecoveredLlr& r
         };
     }
 
+    // Tail-biting has no known zero start state. Run the fixed-work trellis
+    // once per possible state, then retain only paths that return to that same
+    // state after the final bit.
     for (std::uint32_t initial_state = 0U; initial_state < kStateCount; ++initial_state) {
         std::array<double, kStateCount> metric_storage;
         std::array<double, kStateCount> next_metric_storage;
@@ -131,6 +139,9 @@ MmseStatus decode_pdcch_tail_biting_convolutional(const PdcchRateRecoveredLlr& r
 
         for (std::uint32_t bit = 0U; bit < bit_count; ++bit) {
             const auto& bit_metrics = branch_metrics[bit];
+            // One bit per target state records whether the high predecessor
+            // (state | 32) won; this compact survivor mask is enough for reverse
+            // traceback and matches the CUDA representation.
             std::uint64_t high_predecessor_word = 0U;
             for (std::uint32_t target_state = 0U; target_state < kStateCount; target_state += 2U) {
                 const std::uint32_t low_predecessor = target_state >> 1U;
@@ -169,6 +180,8 @@ MmseStatus decode_pdcch_tail_biting_convolutional(const PdcchRateRecoveredLlr& r
         if ((*metrics)[initial_state] <= best_metric) {
             continue;
         }
+        // Trace the selected terminal state backwards. The emitted bit is the
+        // low state bit, while the survivor mask reconstructs the predecessor.
         std::uint32_t state = initial_state;
         for (std::uint32_t bit = bit_count; bit > 0U; --bit) {
             candidate_bits[bit - 1U] = static_cast<std::uint8_t>(state & 1U);

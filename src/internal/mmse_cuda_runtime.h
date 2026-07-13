@@ -9,6 +9,8 @@
 
 namespace mmse::detail {
 
+// Device-side arrays are provisioned for the largest supported normal-CP LTE
+// grid; channel-specific layouts only consume the prefix described by metadata.
 inline constexpr std::uint32_t kCudaMaxGridRe = kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz;
 inline constexpr std::uint32_t kCudaMaxDataRe = kCudaMaxGridRe;
 inline constexpr std::uint32_t kCudaEstimateStubComplexCount =
@@ -25,6 +27,8 @@ inline constexpr std::uint32_t kCudaPdcchCodewordBitCount = 44U;
 inline constexpr std::uint32_t kCudaPdcchRecoveredLlrCount = 3U * kCudaPdcchCodewordBitCount;
 inline constexpr std::uint32_t kCudaPdcchGoldWordCount = (2U * kCudaMaxDataRe + 31U) / 32U;
 
+// Compact descriptor copied once per candidate. The collection-slot map folds
+// the LTE rate-matching/interleaver inverse into the GPU rate-recovery kernel.
 struct CudaPdcchCandidateDescriptor {
     std::uint32_t candidate_id = 0U;
     std::uint16_t first_cce = 0U;
@@ -46,6 +50,8 @@ struct CudaPdcchCandidateResult {
     std::uint64_t decoded_bits = 0U;
 };
 
+// Per-staging-slot device allocations. Pointers are intentionally untyped here
+// so the CUDA and no-CUDA runtime implementations share the same ABI.
 struct CudaDeviceBuffers {
     std::array<void*, 2> grid_re{};
     std::array<void*, 2> grid_im{};
@@ -68,6 +74,9 @@ struct CudaDeviceBuffers {
     void* pdcch_hit_count = nullptr;
 };
 
+// Small fixed-layout control block consumed by channel-estimate/equalize kernels.
+// The arrays after `grid_indices` are copied selectively because their sizes are
+// much larger than the scalar fields and are unchanged on a prepared subframe.
 struct CudaGridMeta {
     std::uint32_t n_rx_ant = 0;
     std::uint32_t n_symbols = 0;
@@ -102,6 +111,8 @@ struct CudaGridMeta {
     std::uint32_t prb_segment_offsets[kCudaMaxDataRe + 1]{};
 };
 
+// PDCCH 1Tx non-TD metadata only needs the header plus the valid grid-index prefix;
+// other modes must copy the additional TD/reverse-map arrays as well.
 inline std::size_t cuda_pdcch_grid_meta_h2d_bytes(std::uint32_t n_valid_re) noexcept {
     const std::size_t valid_re = n_valid_re > kCudaMaxDataRe ? kCudaMaxDataRe : n_valid_re;
     return offsetof(CudaGridMeta, grid_indices) + valid_re * sizeof(std::uint16_t);
