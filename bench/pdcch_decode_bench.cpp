@@ -10,9 +10,11 @@
 #include <string_view>
 #include <vector>
 
+#include "pdcch_benchmark_fixture.h"
 #include "mmse/pdcch_chain_sdk.h"
 
 using namespace mmse;
+namespace fixture = mmse::benchmark::pdcch_fixture;
 
 namespace {
 
@@ -32,6 +34,8 @@ struct PdcchBuffers {
     std::vector<float> x_hat_im = std::vector<float>(kPdcchCapacity);
     std::vector<float> sinr = std::vector<float>(kPdcchCapacity);
     std::vector<std::uint16_t> re_grid_indices = std::vector<std::uint16_t>(kPdcchCapacity);
+    std::vector<std::uint16_t> td_re_grid_indices0 = std::vector<std::uint16_t>(kPdcchCapacity);
+    std::vector<std::uint16_t> td_re_grid_indices1 = std::vector<std::uint16_t>(kPdcchCapacity);
     PdcchMmseOutputView output{
         .x_hat_re = x_hat_re.data(),
         .x_hat_im = x_hat_im.data(),
@@ -41,6 +45,15 @@ struct PdcchBuffers {
         .capacity_re_metadata = kPdcchCapacity,
     };
     PdcchMmseResult metadata{};
+    PdcchTdMmseOutputView td_output{
+        .x_hat_re = x_hat_re.data(),
+        .x_hat_im = x_hat_im.data(),
+        .sinr = sinr.data(),
+        .re_grid_indices0 = td_re_grid_indices0.data(),
+        .re_grid_indices1 = td_re_grid_indices1.data(),
+        .capacity_symbols = kPdcchCapacity,
+    };
+    PdcchTdMmseResult td_metadata{};
 };
 
 struct StageTimes {
@@ -55,6 +68,11 @@ struct StageTimes {
     std::uint32_t candidate_count = 0U;
     std::uint32_t crc_hit_count = 0U;
     std::uint32_t crc_miss_count = 0U;
+    std::uint32_t zero_hit_subframes = 0U;
+    std::uint32_t one_hit_subframes = 0U;
+    std::uint32_t multi_hit_subframes = 0U;
+    std::uint32_t l4_hit_count = 0U;
+    std::uint32_t l8_hit_count = 0U;
 };
 
 GridBuffers make_random_grid(std::uint32_t seed, std::uint16_t n_prb) {
@@ -82,11 +100,12 @@ PlanarGridViewF32 make_grid_view(const GridBuffers& buffers) {
     };
 }
 
-PdcchMmseInput make_pdcch_input(const PlanarGridViewF32& grid, std::uint16_t n_prb) {
+PdcchMmseInput make_pdcch_input(const PlanarGridViewF32& grid, std::uint16_t n_prb,
+                                std::uint8_t n_tx_ports) {
     pdcch::FrontendPdcchIndication frontend{};
     frontend.cell_id = 1U;
-    frontend.n_tx_ports = 1U;
-    frontend.tx_mode = 1U;
+    frontend.n_tx_ports = n_tx_ports;
+    frontend.tx_mode = n_tx_ports == 1U ? 1U : 2U;
     frontend.control_symbol_count = n_prb == 6U ? 4U : 3U;
     frontend.n_prb = n_prb;
     frontend.prb_bitmap.fill(0U);
@@ -137,21 +156,39 @@ bool gather_common_search_candidates(const pdcch::BackendPdcchEqualizedIndicatio
 }
 
 bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchBuffers& buffers,
-                  StageTimes& times, std::uint32_t subframe_index) {
+                  StageTimes& times, std::uint32_t subframe_index,
+                  const fixture::Case* expected_case = nullptr) {
     using Clock = std::chrono::steady_clock;
-    input.sfn_subframe = subframe_index;
-    input.control_subframe.subframe = static_cast<std::uint8_t>(subframe_index % 10U);
+    if (expected_case == nullptr) {
+        input.sfn_subframe = subframe_index;
+        input.control_subframe.subframe = static_cast<std::uint8_t>(subframe_index % 10U);
+    }
 
     const auto total_start = Clock::now();
     auto start = Clock::now();
-    if (context.run_pdcch(input, buffers.output, buffers.metadata) != MmseStatus::kOk) {
-        return false;
+    pdcch::BackendPdcchEqualizedIndication backend{};
+    MmseStatus ce_mmse_status = MmseStatus::kUnsupportedConfig;
+    if (input.n_tx_ports == 1U) {
+        ce_mmse_status = context.run_pdcch(input, buffers.output, buffers.metadata);
+    } else if (input.n_tx_ports == 2U) {
+        ce_mmse_status = context.run_pdcch_td(input, buffers.td_output, buffers.td_metadata);
     }
     auto end = Clock::now();
     times.ce_mmse_us = std::chrono::duration<double, std::micro>(end - start).count();
+    if (ce_mmse_status != MmseStatus::kOk) {
+        return false;
+    }
+    if (input.n_tx_ports == 1U) {
+        backend = pdcch::make_backend_pdcch_equalized_indication(buffers.metadata, buffers.output);
+    } else {
+        const pdcch::BackendPdcchTdEqualizedIndication td_backend =
+            pdcch::make_backend_pdcch_td_equalized_indication(buffers.td_metadata,
+                                                              buffers.td_output);
+        if (pdcch::normalize_pdcch_td_cce_order(td_backend, backend) != MmseStatus::kOk) {
+            return false;
+        }
+    }
 
-    const auto backend =
-        pdcch::make_backend_pdcch_equalized_indication(buffers.metadata, buffers.output);
     pdcch::PdcchControlRegion control_region{};
     start = Clock::now();
     if (pdcch::build_pdcch_control_region(
@@ -211,6 +248,7 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
 
     start = Clock::now();
     std::uint32_t hit_count = 0U;
+    std::vector<pdcch::PdcchDciFormat1ADecodeResult> hits{};
     for (std::size_t candidate = 0U; candidate < recovered.size(); ++candidate) {
         pdcch::PdcchDciFormat1ADecodeResult result{};
         if (pdcch::validate_and_parse_pdcch_dci_format1a(
@@ -221,12 +259,37 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
             return false;
         }
         hit_count += result.matched ? 1U : 0U;
+        if (result.matched) {
+            hits.push_back(std::move(result));
+        }
     }
     end = Clock::now();
     times.crc_dci_us = std::chrono::duration<double, std::micro>(end - start).count();
     times.candidate_count = static_cast<std::uint32_t>(candidates.size());
     times.crc_hit_count = hit_count;
     times.crc_miss_count = times.candidate_count - hit_count;
+    if (hit_count == 0U) {
+        times.zero_hit_subframes = 1U;
+    } else if (hit_count == 1U) {
+        times.one_hit_subframes = 1U;
+    } else {
+        times.multi_hit_subframes = 1U;
+    }
+    for (const auto& hit : hits) {
+        if (hit.dci.chain.aggregation_level == 4U) {
+            ++times.l4_hit_count;
+        } else if (hit.dci.chain.aggregation_level == 8U) {
+            ++times.l8_hit_count;
+        }
+    }
+    if (expected_case != nullptr) {
+        pdcch::PdcchCommonSearchDecodeResult result{};
+        result.candidate_count = times.candidate_count;
+        result.hits = std::move(hits);
+        if (!fixture::validate_result(result, *expected_case)) {
+            return false;
+        }
+    }
     times.total_us = std::chrono::duration<double, std::micro>(Clock::now() - total_start).count();
     return true;
 }
@@ -245,6 +308,11 @@ StageTimes sum_window(const std::vector<StageTimes>& values, std::size_t first, 
         sum.candidate_count += values[index].candidate_count;
         sum.crc_hit_count += values[index].crc_hit_count;
         sum.crc_miss_count += values[index].crc_miss_count;
+        sum.zero_hit_subframes += values[index].zero_hit_subframes;
+        sum.one_hit_subframes += values[index].one_hit_subframes;
+        sum.multi_hit_subframes += values[index].multi_hit_subframes;
+        sum.l4_hit_count += values[index].l4_hit_count;
+        sum.l8_hit_count += values[index].l8_hit_count;
     }
     return sum;
 }
@@ -270,6 +338,27 @@ void print_summary(std::string_view scope, std::string_view stage,
     std::cout << scope << '.' << stage << ".p95_us=" << percentile(0.95) << '\n';
 }
 
+template <typename Projection>
+void print_count_summary(std::string_view scope, std::string_view metric,
+                         const std::vector<StageTimes>& values, Projection projection) {
+    std::vector<double> samples{};
+    samples.reserve(values.size());
+    for (const StageTimes& value : values) {
+        samples.push_back(projection(value));
+    }
+    std::sort(samples.begin(), samples.end());
+    const auto percentile = [&](double percentile_value) {
+        const std::size_t index =
+            static_cast<std::size_t>(percentile_value * static_cast<double>(samples.size() - 1U));
+        return samples[index];
+    };
+    const double average =
+        std::accumulate(samples.begin(), samples.end(), 0.0) / static_cast<double>(samples.size());
+    std::cout << scope << '.' << metric << ".avg_count=" << average << '\n';
+    std::cout << scope << '.' << metric << ".p50_count=" << percentile(0.50) << '\n';
+    std::cout << scope << '.' << metric << ".p95_count=" << percentile(0.95) << '\n';
+}
+
 void print_summaries(std::string_view scope, const std::vector<StageTimes>& values) {
     print_summary(scope, "ce_mmse", values,
                   [](const StageTimes& times) { return times.ce_mmse_us; });
@@ -284,46 +373,95 @@ void print_summaries(std::string_view scope, const std::vector<StageTimes>& valu
                   [](const StageTimes& times) { return times.tail_biting_viterbi_us; });
     print_summary(scope, "crc_dci", values,
                   [](const StageTimes& times) { return times.crc_dci_us; });
-    print_summary(scope, "candidate_count", values, [](const StageTimes& times) {
+    print_count_summary(scope, "candidate", values, [](const StageTimes& times) {
         return static_cast<double>(times.candidate_count);
     });
-    print_summary(scope, "crc_hit", values,
-                  [](const StageTimes& times) { return static_cast<double>(times.crc_hit_count); });
-    print_summary(scope, "crc_miss", values, [](const StageTimes& times) {
+    print_count_summary(scope, "crc_hit", values, [](const StageTimes& times) {
+        return static_cast<double>(times.crc_hit_count);
+    });
+    print_count_summary(scope, "crc_miss", values, [](const StageTimes& times) {
         return static_cast<double>(times.crc_miss_count);
     });
-    print_summary(scope, "total", values, [](const StageTimes& times) { return times.total_us; });
+    print_count_summary(scope, "zero_hit_subframes", values, [](const StageTimes& times) {
+        return static_cast<double>(times.zero_hit_subframes);
+    });
+    print_count_summary(scope, "one_hit_subframes", values, [](const StageTimes& times) {
+        return static_cast<double>(times.one_hit_subframes);
+    });
+    print_count_summary(scope, "multi_hit_subframes", values, [](const StageTimes& times) {
+        return static_cast<double>(times.multi_hit_subframes);
+    });
+    print_count_summary(scope, "l4_hit", values, [](const StageTimes& times) {
+        return static_cast<double>(times.l4_hit_count);
+    });
+    print_count_summary(scope, "l8_hit", values, [](const StageTimes& times) {
+        return static_cast<double>(times.l8_hit_count);
+    });
+    print_summary(scope, "e2e_host_wall", values,
+                  [](const StageTimes& times) { return times.total_us; });
 }
 
 } // namespace
 
-bool parse_bandwidth(int argc, char** argv, std::uint16_t& n_prb) {
-    if (argc == 1) {
-        return true;
-    }
-    if (argc != 3 || std::string_view(argv[1]) != "--n-prb") {
-        return false;
-    }
-    unsigned int value = 0U;
+bool parse_uint_argument(const char* value_text, unsigned int& value) {
     const auto [end, error] =
-        std::from_chars(argv[2], argv[2] + std::char_traits<char>::length(argv[2]), value);
-    if (error != std::errc{} || *end != '\0' || value > std::numeric_limits<std::uint16_t>::max()) {
+        std::from_chars(value_text, value_text + std::char_traits<char>::length(value_text), value);
+    return error == std::errc{} && *end == '\0';
+}
+
+bool parse_arguments(int argc, char** argv, std::uint16_t& n_prb, std::uint8_t& n_tx_ports,
+                     fixture::Workload& workload) {
+    for (int index = 1; index < argc; index += 2) {
+        if (index + 1 >= argc) {
+            return false;
+        }
+        const std::string_view option(argv[index]);
+        if (option == "--workload") {
+            if (!fixture::parse_workload(argv[index + 1], workload)) {
+                return false;
+            }
+            continue;
+        }
+        unsigned int value = 0U;
+        if (!parse_uint_argument(argv[index + 1], value)) {
+            return false;
+        }
+        if (option == "--n-prb") {
+            if (value > std::numeric_limits<std::uint16_t>::max()) {
+                return false;
+            }
+            n_prb = static_cast<std::uint16_t>(value);
+            continue;
+        }
+        if (option == "--n-tx-ports") {
+            if (value > std::numeric_limits<std::uint8_t>::max()) {
+                return false;
+            }
+            n_tx_ports = static_cast<std::uint8_t>(value);
+            continue;
+        }
         return false;
     }
-    n_prb = static_cast<std::uint16_t>(value);
-    return is_supported_lte_downlink_bandwidth(n_prb);
+    return is_supported_lte_downlink_bandwidth(n_prb) && (n_tx_ports == 1U || n_tx_ports == 2U);
+}
+
+void print_usage() {
+    std::cerr << "usage: pdcch_decode_bench [--n-prb 6|15|25|50|75|100] "
+                 "[--n-tx-ports 1|2] [--workload mixed|random]\n";
 }
 
 int main(int argc, char** argv) {
     std::uint16_t n_prb = kLteNumPrb20MHz;
-    if (!parse_bandwidth(argc, argv, n_prb)) {
-        std::cerr << "usage: pdcch_decode_bench [--n-prb 6|15|25|50|75|100]\n";
+    std::uint8_t n_tx_ports = 1U;
+    fixture::Workload workload_kind = fixture::Workload::kMixed;
+    if (!parse_arguments(argc, argv, n_prb, n_tx_ports, workload_kind)) {
+        print_usage();
         return 2;
     }
 
     GridBuffers grid_buffers = make_random_grid(42U, n_prb);
     const PlanarGridViewF32 grid = make_grid_view(grid_buffers);
-    const PdcchMmseInput input = make_pdcch_input(grid, n_prb);
+    const PdcchMmseInput input = make_pdcch_input(grid, n_prb, n_tx_ports);
 
     MmseEqualizerCpuContext context;
     MmseEqualizerCpuConfig cpu_config{};
@@ -333,10 +471,49 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    fixture::MixedWorkload mixed_workload{};
+    if (workload_kind == fixture::Workload::kMixed) {
+        if (!fixture::make_mixed_workload(n_prb, n_tx_ports, mixed_workload)) {
+            std::cerr << "failed to construct mixed workload\n";
+            return 1;
+        }
+        for (std::size_t case_index = 0U; case_index < mixed_workload.cases.size(); ++case_index) {
+            const fixture::Case& benchmark_case = mixed_workload.cases[case_index];
+            pdcch::PdcchCommonSearchDecodeResult smoke_result{};
+            if (pdcch::run_pdcch_cpu_common_search_decode(context, benchmark_case.request.input,
+                                                          benchmark_case.request.config,
+                                                          smoke_result) != MmseStatus::kOk ||
+                !fixture::validate_result(smoke_result, benchmark_case)) {
+                std::cerr << "mixed workload smoke check failed case=" << case_index
+                          << " expected_hits=" << benchmark_case.expected_hits.size()
+                          << " actual_hits=" << smoke_result.hits.size();
+                for (const auto& hit : smoke_result.hits) {
+                    std::cerr << " [cce=" << hit.dci.chain.first_cce
+                              << ",L=" << static_cast<unsigned>(hit.dci.chain.aggregation_level)
+                              << "]";
+                }
+                std::cerr << '\n';
+                return 1;
+            }
+        }
+    }
+
+    const auto select_input = [&](std::uint32_t iteration,
+                                  const fixture::Case*& expected_case) -> PdcchMmseInput {
+        expected_case = nullptr;
+        if (workload_kind == fixture::Workload::kMixed) {
+            expected_case = &mixed_workload.cases[iteration % mixed_workload.cases.size()];
+            return expected_case->request.input;
+        }
+        return input;
+    };
+
     PdcchBuffers buffers{};
     StageTimes ignored{};
     for (std::uint32_t subframe = 0U; subframe < kWarmupSubframes; ++subframe) {
-        if (!run_subframe(context, input, buffers, ignored, subframe)) {
+        const fixture::Case* expected_case = nullptr;
+        const PdcchMmseInput selected_input = select_input(subframe, expected_case);
+        if (!run_subframe(context, selected_input, buffers, ignored, subframe, expected_case)) {
             std::cerr << "warmup failed\n";
             return 1;
         }
@@ -346,7 +523,11 @@ int main(int argc, char** argv) {
     per_subframe.reserve(kMeasuredSubframes);
     for (std::uint32_t subframe = 0U; subframe < kMeasuredSubframes; ++subframe) {
         StageTimes times{};
-        if (!run_subframe(context, input, buffers, times, kWarmupSubframes + subframe)) {
+        const fixture::Case* expected_case = nullptr;
+        const PdcchMmseInput selected_input =
+            select_input(kWarmupSubframes + subframe, expected_case);
+        if (!run_subframe(context, selected_input, buffers, times, kWarmupSubframes + subframe,
+                          expected_case)) {
             std::cerr << "measurement failed\n";
             return 1;
         }
@@ -363,19 +544,32 @@ int main(int argc, char** argv) {
     std::cout << "pdcch_decode_bench.subframe_count=" << per_subframe.size() << '\n';
     std::cout << "pdcch_decode_bench.window_count=" << per_window.size() << '\n';
     std::cout << "pdcch_decode_bench.n_prb=" << n_prb << '\n';
+    std::cout << "pdcch_decode_bench.n_tx_ports=" << static_cast<unsigned>(input.n_tx_ports)
+              << '\n';
+    std::cout << "pdcch_decode_bench.tx_mode=" << static_cast<unsigned>(input.tx_mode) << '\n';
     std::cout << "pdcch_decode_bench.decoder=native_tail_biting_viterbi\n";
+    std::cout << "pdcch_decode_bench.schema=mmse.pdcch.benchmark.v2\n";
+    std::cout << "pdcch_decode_bench.measurement_source=native\n";
+    std::cout << "pdcch_decode_bench.workload=" << fixture::workload_name(workload_kind) << '\n';
+    std::cout << "pdcch_decode_bench.e2e.clock_domain=host_steady\n";
+    std::cout << "pdcch_decode_bench.e2e.scope=single_request_wall\n";
+    std::cout << "pdcch_decode_bench.stage.clock_domain=host_steady\n";
+    std::cout << "pdcch_decode_bench.stage.composable=false\n";
     print_summaries("subframe_1ms", per_subframe);
     print_summaries("window_10ms", per_window);
 
     pdcch::PdcchSiRntiGeometrySearchRequest geometry_request{};
-    geometry_request.grid = grid;
-    geometry_request.sfn_subframe = input.sfn_subframe;
-    geometry_request.cell_id = input.cell_id;
-    geometry_request.n_tx_ports = input.n_tx_ports;
-    geometry_request.tx_mode = input.tx_mode;
-    geometry_request.n_prb = input.n_prb;
-    geometry_request.control_subframe = input.control_subframe;
-    geometry_request.chain = input.chain;
+    const PdcchMmseInput geometry_input = workload_kind == fixture::Workload::kMixed
+                                              ? mixed_workload.cases.front().request.input
+                                              : input;
+    geometry_request.grid = geometry_input.grid;
+    geometry_request.sfn_subframe = geometry_input.sfn_subframe;
+    geometry_request.cell_id = geometry_input.cell_id;
+    geometry_request.n_tx_ports = geometry_input.n_tx_ports;
+    geometry_request.tx_mode = geometry_input.tx_mode;
+    geometry_request.n_prb = geometry_input.n_prb;
+    geometry_request.control_subframe = geometry_input.control_subframe;
+    geometry_request.chain = geometry_input.chain;
     const auto measure_geometry_search = [&](pdcch::PdcchSiRntiGeometrySearchCache& cache,
                                              pdcch::PdcchSiRntiGeometrySearchResult& result) {
         const auto start = std::chrono::steady_clock::now();
@@ -401,7 +595,7 @@ int main(int argc, char** argv) {
         .subframe_kind = geometry_request.control_subframe.kind,
         .geometry =
             {
-                .control_symbol_count = input.control_symbol_count,
+                .control_symbol_count = geometry_input.control_symbol_count,
                 .phich_resource = pdcch::PhichResource::kOne,
                 .phich_duration = pdcch::PhichDuration::kNormal,
                 .standard_reg_order = true,

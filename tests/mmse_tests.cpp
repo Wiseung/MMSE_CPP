@@ -749,13 +749,10 @@ void fill_td_pair(GridBuffers& buffers, std::uint16_t grid0, std::uint16_t grid1
 void fill_pdcch_td_pair(GridBuffers& buffers, const ExtractDescriptor& desc, std::uint16_t grid0,
                         std::uint16_t grid1, Complex32 h00, Complex32 h01, Complex32 h10,
                         Complex32 h11, Complex32 s0, Complex32 s1) {
-    (void)desc;
-    const std::uint32_t symbol0 = grid0 / kLteNumSubcarriers20MHz;
-    const std::uint32_t symbol1 = grid1 / kLteNumSubcarriers20MHz;
-    const std::uint32_t sc0 = grid0 % kLteNumSubcarriers20MHz;
-    const std::uint32_t sc1 = grid1 % kLteNumSubcarriers20MHz;
+    const std::uint32_t n_subcarriers = lte_downlink_subcarrier_count(desc.n_prb);
+    const std::uint32_t symbol0 = grid0 / n_subcarriers;
+    const std::uint32_t symbol1 = grid1 / n_subcarriers;
     expect_true(symbol0 == symbol1, "td pair must stay in one symbol");
-    expect_true(sc1 == sc0 + 1U, "td pair must be adjacent");
     fill_td_pair(buffers, grid0, grid1, h00, h01, h10, h11, s0, s1);
 }
 
@@ -3513,6 +3510,29 @@ void test_pdcch_td_normalization_restores_cce_re_order() {
                 "td normalization should reject inconsistent RE pair metadata");
 }
 
+void test_pdcch_td_normalization_accepts_empty_control_region() {
+    mmse::pdcch::BackendPdcchTdEqualizedIndication td_backend{};
+    td_backend.sfn_subframe = 3U;
+    td_backend.cell_id = 1U;
+    td_backend.n_prb = 6U;
+    td_backend.n_tx_ports = 2U;
+    td_backend.n_rx_ant = 2U;
+    td_backend.n_layers = 1U;
+    td_backend.tx_mode = 2U;
+    td_backend.control_symbol_count = 1U;
+    td_backend.mod_order = 2U;
+    td_backend.chain.request_id = 991U;
+
+    mmse::pdcch::BackendPdcchEqualizedIndication normalized{};
+    expect_true(mmse::pdcch::normalize_pdcch_td_cce_order(td_backend, normalized) ==
+                        MmseStatus::kOk &&
+                    normalized.x_hat_re.empty() && normalized.re_grid_indices.empty() &&
+                    normalized.chain.request_id == td_backend.chain.request_id &&
+                    normalized.n_tx_ports == td_backend.n_tx_ports &&
+                    normalized.tx_mode == td_backend.tx_mode,
+                "td normalization must preserve valid empty control regions as empty backends");
+}
+
 std::vector<std::uint8_t> make_si_rnti_dci_format1a_bits(std::uint16_t n_prb = kLteNumPrb20MHz,
                                                          std::uint16_t start_prb = 10U,
                                                          std::uint16_t allocated_prb_count = 20U) {
@@ -3789,6 +3809,7 @@ void test_pdcch_cpu_si_rnti_search_two_tx_supports_selected_bandwidths() {
 
         const std::uint8_t control_symbol_count = n_prb == 6U ? 4U : 3U;
         auto desc = make_pdcch_desc(n_prb, control_symbol_count);
+        desc.cell_id = 1U;
         desc.n_tx_ports = 2U;
         desc.tx_mode = 2U;
         GridBuffers buffers = make_zero_grid(lte_downlink_subcarrier_count(n_prb));
@@ -3802,6 +3823,17 @@ void test_pdcch_cpu_si_rnti_search_two_tx_supports_selected_bandwidths() {
             desc.cell_id, desc.sfn_subframe);
         expect_true((n_source_re & 1U) == 0U,
                     "two-tx standard-bandwidth PDCCH source RE count must be even");
+        bool found_nonadjacent_pair = false;
+        const std::uint32_t n_subcarriers = lte_downlink_subcarrier_count(n_prb);
+        for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
+            const std::uint16_t grid0 = layout.grid_indices[re];
+            const std::uint16_t grid1 = layout.grid_indices[re + 1U];
+            expect_true(grid0 / n_subcarriers == grid1 / n_subcarriers,
+                        "two-tx PDCCH source-order pair must remain in one OFDM symbol");
+            found_nonadjacent_pair |= (grid1 % n_subcarriers) != (grid0 % n_subcarriers) + 1U;
+        }
+        expect_true(found_nonadjacent_pair,
+                    "PCI 1 PDCCH layout must exercise non-adjacent physical source RE pairs");
         for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
             fill_pdcch_td_pair(buffers, desc, layout.grid_indices[re], layout.grid_indices[re + 1U],
                                {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F}, {1.0F, 0.0F}, symbols[re],
@@ -4232,6 +4264,72 @@ void test_pdcch_si_rnti_geometry_search_acquires_and_reprobes() {
                     result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kMiss &&
                     result.geometry_attempt_count == 16U && !cache.locked,
                 "PDCCH geometry search must re-enumerate after the fifth miss");
+}
+
+void test_pdcch_si_rnti_geometry_search_two_tx_handles_empty_profiles() {
+    MmseEqualizerCpuContext context;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(context.init(cpu_config) == MmseStatus::kOk,
+                "two-tx narrowband geometry CPU context init");
+
+    auto desc = make_pdcch_desc(6U, 4U);
+    desc.cell_id = 1U;
+    desc.n_tx_ports = 2U;
+    desc.tx_mode = 2U;
+    GridBuffers buffers = make_zero_grid(lte_downlink_subcarrier_count(desc.n_prb));
+    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+
+    mmse::pdcch::PdcchSiRntiGeometrySearchRequest request{};
+    request.grid = make_grid_view(buffers);
+    request.sfn_subframe = desc.sfn_subframe;
+    request.cell_id = desc.cell_id;
+    request.n_tx_ports = desc.n_tx_ports;
+    request.tx_mode = desc.tx_mode;
+    request.n_prb = desc.n_prb;
+    request.control_subframe = {
+        .duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+        .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+        .kind = mmse::pdcch::LteControlSubframeKind::kRegular,
+    };
+
+    mmse::pdcch::PdcchSiRntiGeometrySearchCache cache{};
+    mmse::pdcch::PdcchSiRntiGeometrySearchResult result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(context, request, {}, cache,
+                                                                   result) == MmseStatus::kOk &&
+                    result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kMiss &&
+                    result.geometry_attempt_count == 24U && result.candidate_count > 0U,
+                "two-tx 6 PRB geometry search must treat zero-CCE profiles as normal misses");
+
+    cache = {
+        .locked = true,
+        .cell_id = request.cell_id,
+        .n_tx_ports = request.n_tx_ports,
+        .tx_mode = request.tx_mode,
+        .n_prb = request.n_prb,
+        .subframe_kind = request.control_subframe.kind,
+        .geometry =
+            {
+                .control_symbol_count = 4U,
+                .phich_resource = mmse::pdcch::PhichResource::kOne,
+                .phich_duration = mmse::pdcch::PhichDuration::kNormal,
+                .standard_reg_order = true,
+            },
+    };
+    for (std::uint32_t miss = 1U; miss <= 4U; ++miss) {
+        expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(context, request, {}, cache,
+                                                                       result) == MmseStatus::kOk &&
+                        result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kMiss &&
+                        result.geometry_attempt_count == 1U && cache.locked &&
+                        cache.consecutive_miss_count == miss,
+                    "two-tx geometry cache must retain its lock for four misses");
+    }
+    expect_true(mmse::pdcch::run_pdcch_cpu_si_rnti_geometry_search(context, request, {}, cache,
+                                                                   result) == MmseStatus::kOk &&
+                    result.status == mmse::pdcch::PdcchSiRntiGeometrySearchStatus::kMiss &&
+                    result.geometry_attempt_count == 24U && !cache.locked,
+                "two-tx geometry cache must reprobe after the fifth miss");
 }
 
 void test_pdcch_si_rnti_geometry_search_rejects_ambiguous_locks() {
@@ -6298,6 +6396,8 @@ int main() {
                   &test_pdcch_ue_specific_search_decodes_l1_l2_candidates},
         std::pair{"pdcch_si_rnti_geometry_search_acquires_and_reprobes",
                   &test_pdcch_si_rnti_geometry_search_acquires_and_reprobes},
+        std::pair{"pdcch_si_rnti_geometry_search_two_tx_handles_empty_profiles",
+                  &test_pdcch_si_rnti_geometry_search_two_tx_handles_empty_profiles},
         std::pair{"pdcch_si_rnti_geometry_search_rejects_ambiguous_locks",
                   &test_pdcch_si_rnti_geometry_search_rejects_ambiguous_locks},
         std::pair{"pdcch_si_rnti_semantics_reject_invalid_grants",
@@ -6372,6 +6472,8 @@ int main() {
                   &test_pdcch_backend_dto_packs_equalized_output},
         std::pair{"pdcch_td_backend_dto_packs_equalized_output",
                   &test_pdcch_td_backend_dto_packs_equalized_output},
+        std::pair{"pdcch_td_normalization_accepts_empty_control_region",
+                  &test_pdcch_td_normalization_accepts_empty_control_region},
         std::pair{"pdcch_td_normalization_restores_cce_re_order",
                   &test_pdcch_td_normalization_restores_cce_re_order},
         std::pair{"pdcch_cpu_common_search_decode_runs_full_one_tx_chain",

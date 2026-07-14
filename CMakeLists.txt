@@ -139,6 +139,16 @@ if(MMSE_BUILD_BENCH)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 
+    add_executable(pdcch_ncu_workload bench/pdcch_ncu_workload.cpp)
+    target_link_libraries(pdcch_ncu_workload PRIVATE mmse_cpp)
+    target_include_directories(pdcch_ncu_workload PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(MSVC)
+        target_link_options(pdcch_ncu_workload PRIVATE /NODEFAULTLIB:LIBCMT)
+    endif()
+    install(TARGETS pdcch_ncu_workload
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+
     add_executable(mmse_cuda_profile bench/mmse_cuda_profile.cpp)
     target_link_libraries(mmse_cuda_profile PRIVATE mmse_cpp)
     target_include_directories(mmse_cuda_profile PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
