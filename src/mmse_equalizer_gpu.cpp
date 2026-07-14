@@ -1651,7 +1651,6 @@ MmseStatus MmseEqualizerGpuContext::Impl::collect_pdcch_gpu_common_search_decode
         return status;
     }
     slot.pdcch_decode_submitted = false;
-    const Clock::time_point collect_end = Clock::now();
     if (*slot.pdcch_hit_count > pending.candidate_count) {
         return MmseStatus::kInternalError;
     }
@@ -1697,7 +1696,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::collect_pdcch_gpu_common_search_decode
     (void)detail::cuda_event_elapsed_us(slot.gpu_event_pdcch_crc_done, slot.gpu_event_stream_done,
                                         result.profile.d2h_us);
     result.profile.host_submit_us = elapsed_us(pending.submit_start, pending.d2h_start);
-    result.profile.host_collect_us = elapsed_us(collect_start, collect_end);
+    result.profile.host_collect_us = elapsed_us(collect_start, Clock::now());
     result.profile.h2d_bytes = pending.h2d_bytes;
     result.profile.d2h_bytes = sizeof(*slot.pdcch_hit_count) +
                                static_cast<std::uint64_t>(detail::kCudaPdcchMaxCandidates) *

@@ -578,7 +578,7 @@ normalize_pdcch_td_cce_order(const BackendPdcchTdEqualizedIndication& td_backend
     cce_ordered_backend = {};
     const std::size_t symbol_count = td_backend.x_hat_re.size();
     if (td_backend.n_tx_ports != 2U || td_backend.n_layers != 1U || td_backend.tx_mode != 2U ||
-        td_backend.mod_order != 2U || symbol_count == 0U || (symbol_count & 1U) != 0U ||
+        td_backend.mod_order != 2U || (symbol_count & 1U) != 0U ||
         td_backend.x_hat_im.size() != symbol_count || td_backend.sinr.size() != symbol_count ||
         td_backend.re_grid_indices0.size() != symbol_count ||
         td_backend.re_grid_indices1.size() != symbol_count) {
@@ -599,6 +599,9 @@ normalize_pdcch_td_cce_order(const BackendPdcchTdEqualizedIndication& td_backend
     cce_ordered_backend.x_hat_re = td_backend.x_hat_re;
     cce_ordered_backend.x_hat_im = td_backend.x_hat_im;
     cce_ordered_backend.sinr = td_backend.sinr;
+    if (symbol_count == 0U) {
+        return MmseStatus::kOk;
+    }
     cce_ordered_backend.re_grid_indices.resize(symbol_count);
 
     for (std::size_t symbol = 0U; symbol < symbol_count; symbol += 2U) {
