@@ -6,6 +6,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include "mmse/pdcch_chain_sdk.h"
@@ -37,23 +38,24 @@ GridBuffers make_random_grid(std::uint32_t seed) {
     return buffers;
 }
 
-PlanarGridViewF32 make_grid_view(const GridBuffers& buffers) {
+PlanarGridViewF32 make_grid_view(const GridBuffers& buffers, std::uint32_t n_rx_ant) {
     return {
         .re = {buffers.re[0].data(), buffers.re[1].data()},
         .im = {buffers.im[0].data(), buffers.im[1].data()},
-        .n_rx_ant = kMmseV1MaxNumRxAntennas,
+        .n_rx_ant = n_rx_ant,
         .n_symbols = kLteNumSymbolsNormalCp,
         .n_subcarriers = kLteNumSubcarriers20MHz,
     };
 }
 
 pdcch::PdcchGpuCommonSearchDecodeRequest
-make_request(const PlanarGridViewF32& grid, std::uint32_t sfn_subframe, std::uint16_t cell_id) {
+make_request(const PlanarGridViewF32& grid, std::uint32_t sfn_subframe, std::uint16_t cell_id,
+             std::uint8_t n_tx_ports, std::uint8_t tx_mode) {
     pdcch::FrontendPdcchIndication frontend{};
     frontend.sfn_subframe = sfn_subframe;
     frontend.cell_id = cell_id;
-    frontend.n_tx_ports = 1U;
-    frontend.tx_mode = 1U;
+    frontend.n_tx_ports = n_tx_ports;
+    frontend.tx_mode = tx_mode;
     frontend.control_symbol_count = 3U;
     frontend.n_prb = kLteNumPrb20MHz;
     frontend.prb_bitmap.fill(0xFFFFU);
@@ -82,12 +84,14 @@ double percentile(std::vector<double> values, double fraction) {
 }
 
 void run_batch(MmseEqualizerGpuContext& context, const PlanarGridViewF32& grid,
-               std::uint32_t stream_count, std::uint32_t batch_size) {
+               std::uint32_t stream_count, std::uint32_t batch_size, std::uint8_t n_tx_ports,
+               std::uint8_t tx_mode) {
     std::vector<pdcch::PdcchGpuCommonSearchDecodeRequest> requests(batch_size);
     std::vector<pdcch::PdcchGpuCommonSearchDecodeResult> results(batch_size);
     for (std::uint32_t warmup = 0U; warmup < kWarmupIterations; ++warmup) {
         for (std::uint32_t index = 0U; index < batch_size; ++index) {
-            requests[index] = make_request(grid, warmup * batch_size + index, 1U + index);
+            requests[index] =
+                make_request(grid, warmup * batch_size + index, 1U + index, n_tx_ports, tx_mode);
         }
         if (pdcch::run_pdcch_gpu_common_search_decode_batch(context, requests, results) !=
             MmseStatus::kOk) {
@@ -113,8 +117,9 @@ void run_batch(MmseEqualizerGpuContext& context, const PlanarGridViewF32& grid,
     std::uint32_t total_misses = 0U;
     for (std::uint32_t iteration = 0U; iteration < kMeasuredIterations; ++iteration) {
         for (std::uint32_t index = 0U; index < batch_size; ++index) {
-            requests[index] = make_request(grid, 1000U + iteration * batch_size + index,
-                                           static_cast<std::uint16_t>(1U + (index % 32U)));
+            requests[index] =
+                make_request(grid, 1000U + iteration * batch_size + index,
+                             static_cast<std::uint16_t>(1U + (index % 32U)), n_tx_ports, tx_mode);
         }
         const auto start = std::chrono::steady_clock::now();
         const MmseStatus status =
@@ -147,6 +152,9 @@ void run_batch(MmseEqualizerGpuContext& context, const PlanarGridViewF32& grid,
         std::accumulate(latencies_us.begin(), latencies_us.end(), 0.0) / latencies_us.size();
     const double subframes_per_second = static_cast<double>(batch_size) * 1.0e6 / average_us;
     const double sample_count = static_cast<double>(batch_size) * kMeasuredIterations;
+    std::cout << "pdcch_gpu_decode_bench.n_tx_ports=" << static_cast<unsigned>(n_tx_ports) << '\n';
+    std::cout << "pdcch_gpu_decode_bench.tx_mode=" << static_cast<unsigned>(tx_mode) << '\n';
+    std::cout << "pdcch_gpu_decode_bench.n_rx_ant=" << grid.n_rx_ant << '\n';
     std::cout << "pdcch_gpu_decode_bench.stream_count=" << stream_count << '\n';
     std::cout << "pdcch_gpu_decode_bench.batch=" << batch_size << '\n';
     std::cout << std::fixed << std::setprecision(2);
@@ -186,7 +194,7 @@ void run_batch(MmseEqualizerGpuContext& context, const PlanarGridViewF32& grid,
 
 int main() {
     const GridBuffers grid_buffers = make_random_grid(42U);
-    const PlanarGridViewF32 grid = make_grid_view(grid_buffers);
+    const PlanarGridViewF32 grid = make_grid_view(grid_buffers, kMmseV1MaxNumRxAntennas);
     for (const std::uint32_t stream_count : {1U, 2U, 4U}) {
         MmseEqualizerGpuContext context;
         MmseEqualizerGpuConfig config{};
@@ -196,8 +204,31 @@ int main() {
             std::cerr << "pdcch_gpu_decode_bench CUDA initialization failed\n";
             return 1;
         }
-        for (const std::uint32_t batch_size : {1U, 2U, 4U, 8U, 16U}) {
-            run_batch(context, grid, stream_count, batch_size);
+        for (const auto [n_tx_ports, tx_mode] :
+             {std::pair<std::uint8_t, std::uint8_t>{1U, 1U}, {2U, 2U}}) {
+            MmseEqualizerCpuContext cpu;
+            MmseEqualizerCpuConfig cpu_config{};
+            cpu_config.worker_count = 1U;
+            if (cpu.init(cpu_config) != MmseStatus::kOk) {
+                std::cerr << "pdcch_gpu_decode_bench CPU initialization failed\n";
+                return 1;
+            }
+            const auto smoke_request = make_request(grid, 0U, 1U, n_tx_ports, tx_mode);
+            pdcch::PdcchCommonSearchDecodeResult cpu_result{};
+            pdcch::PdcchGpuCommonSearchDecodeResult gpu_result{};
+            if (pdcch::run_pdcch_cpu_common_search_decode(cpu, smoke_request.input,
+                                                          smoke_request.config,
+                                                          cpu_result) != MmseStatus::kOk ||
+                pdcch::run_pdcch_gpu_common_search_decode(context, smoke_request, gpu_result) !=
+                    MmseStatus::kOk ||
+                cpu_result.candidate_count != gpu_result.candidate_count ||
+                cpu_result.hits.size() != gpu_result.hits.size()) {
+                std::cerr << "pdcch_gpu_decode_bench CPU/GPU smoke check failed\n";
+                return 1;
+            }
+            for (const std::uint32_t batch_size : {1U, 2U, 4U, 8U, 16U}) {
+                run_batch(context, grid, stream_count, batch_size, n_tx_ports, tx_mode);
+            }
         }
     }
     return 0;

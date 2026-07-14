@@ -45,6 +45,7 @@ SDK 当前覆盖：
 - UE-specific 候选构造，按目标 RNTI 和子帧枚举 `L=1/2/4/8`
 - 候选级速率恢复、`CRC-RNTI` 校验和 `DCI 1A` 解析 helper
 - 默认内建尾咬卷积码译码的正式 CPU common-search 与 UE-specific `DCI 1A` 链路，可由外部回调覆盖
+- 1Tx 与 2Tx TD 的 GPU common-search / `DCI 1A` 一站式入口及 batch 入口
 - 当前 20 MHz/FDD 边界内的 SI-RNTI 未知控制区几何搜索与调用方持有的锁定缓存
 
 SDK 当前不覆盖：
@@ -52,7 +53,11 @@ SDK 当前不覆盖：
 - PCFICH 译码
 - PHICH 译码
 - 非 `DCI 1A` 的通用 `DCI` 译码
-- GPU 版完整 PDCCH 解码阶段
+- GPU UE-specific、SI-RNTI geometry search、其它 DCI format 或外部 decoder callback
+
+GPU common-search 当前固定为 `20 MHz / FDD / normal CP / regular control subframe`。2Tx 请求
+自动复用 TD 去映射并保持连续 CCE 顺序；设备到主机只返回 compact candidate hits，不返回完整
+equalized grid、SINR 或 LLR。
 
 ## 页面摘要
 

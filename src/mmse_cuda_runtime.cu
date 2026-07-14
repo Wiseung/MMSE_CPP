@@ -1117,10 +1117,7 @@ MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
     // PDCCH 1Tx/non-TD metadata is immutable except for the valid grid-index
     // prefix. Avoid transferring the large reverse-map arrays in that hot path;
     // TD and other channels still receive the complete metadata block.
-    const bool compact_pdcch_meta =
-        grid_meta.channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
-        grid_meta.n_tx_ports == 1U && grid_meta.td_pair_count == 0U;
-    if (!compact_pdcch_meta) {
+    if (!cuda_uses_compact_pdcch_grid_meta(grid_meta)) {
         return map_cuda_error(cudaMemcpyAsync(buffers.grid_meta, &grid_meta, sizeof(grid_meta),
                                               cudaMemcpyHostToDevice, stream));
     }
@@ -1165,10 +1162,7 @@ MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffer
     // Reused estimates only need dynamic layout fields. Preserve the compact
     // PDCCH fast path and otherwise update the header plus the arrays consumed
     // by TD/reordered channels.
-    const bool compact_pdcch_meta =
-        grid_meta.channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
-        grid_meta.n_tx_ports == 1U && grid_meta.td_pair_count == 0U;
-    if (compact_pdcch_meta) {
+    if (cuda_uses_compact_pdcch_grid_meta(grid_meta)) {
         const std::size_t valid_re = min_u32(grid_meta.n_valid_re, kCudaMaxDataRe);
         return map_cuda_error(cudaMemcpyAsync(
             buffers.grid_meta, &grid_meta,
