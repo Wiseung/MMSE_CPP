@@ -30,6 +30,7 @@ SDK 当前提供：
 - common-search 与 UE-specific 候选构造、候选 LLR 切片与速率恢复 helper
 - `CRC-RNTI` 校验、`DCI 1A` 解析 helper
 - 默认内建尾咬卷积码译码的正式 CPU common-search 与 UE-specific `DCI 1A` 链路，可由外部回调覆盖
+- 1Tx 与 2Tx TD 的 GPU common-search / `DCI 1A` 一站式与 batch 入口
 - 当前 `20 MHz / FDD` 边界内的 SI-RNTI 未知控制区几何搜索与调用方持有的缓存锁定
 
 SDK 当前不提供：
@@ -37,7 +38,7 @@ SDK 当前不提供：
 - PCFICH 译码
 - PHICH 译码
 - 非 `DCI 1A` 的通用 `DCI` 译码
-- GPU 版完整 PDCCH 解码阶段
+- GPU UE-specific、SI-RNTI geometry search、其它 DCI format 或外部 decoder callback
 
 ## 最小流程
 
@@ -190,6 +191,12 @@ mmse::pdcch::BackendPdcchTdEqualizedIndication backend =
 
 把 `2Tx` 去分集软符号归一化为与 `1Tx` 一致的连续 CCE 顺序，再复用后续候选构造与
 `DCI 1A` 链路。
+
+若只需要 GPU common-search / `DCI 1A` 最终命中，可直接构造
+`PdcchGpuCommonSearchDecodeRequest` 并调用 `run_pdcch_gpu_common_search_decode(...)`；输入端口组合
+可为 `(1, 1)` 或 `(2, 2)`。2Tx 会自动复用上述 TD 顺序，D2H 只返回 compact candidate hits。
+该入口固定为 `20 MHz / FDD / normal CP / regular control subframe`，并使用 native GPU
+tail-biting Viterbi。
 
 ## CPU `DCI 1A` 最小示例
 

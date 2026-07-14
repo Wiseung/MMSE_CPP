@@ -1410,9 +1410,11 @@ MmseStatus MmseEqualizerGpuContext::Impl::submit_pdcch_gpu_common_search_decode(
     if (!initialized) {
         return MmseStatus::kNotInitialized;
     }
+    const bool supported_tx_mode = (input.n_tx_ports == 1U && input.tx_mode == 1U) ||
+                                   (input.n_tx_ports == 2U && input.tx_mode == 2U);
     if (config.backend != MmseGpuBackend::kCuda || !device.cuda_runtime_available ||
         decode_config.decoder.decode != nullptr || input.n_prb != kLteNumPrb20MHz ||
-        input.n_tx_ports != 1U || input.tx_mode != 1U || input.grid.n_rx_ant == 0U ||
+        !supported_tx_mode || input.grid.n_rx_ant == 0U ||
         input.grid.n_rx_ant > kMmseV1MaxNumRxAntennas ||
         input.grid.n_symbols != kLteNumSymbolsNormalCp ||
         input.grid.n_subcarriers != kLteNumSubcarriers20MHz ||
@@ -1461,9 +1463,25 @@ MmseStatus MmseEqualizerGpuContext::Impl::submit_pdcch_gpu_common_search_decode(
         slot.pdcch_results_host == nullptr) {
         return MmseStatus::kUnsupportedConfig;
     }
+    struct SubmissionGuard {
+        HostPinnedSlot& slot;
+        bool armed = true;
+        ~SubmissionGuard() {
+            if (armed) {
+                (void)detail::cuda_stream_synchronize(slot.stream_handle);
+                slot.pdcch_decode_submitted = false;
+            }
+        }
+    } submission_guard{slot};
     if (const MmseStatus status = execute_cuda_transport_stub(desc, slot, false, false, false);
         status != MmseStatus::kOk) {
         return status;
+    }
+    if (slot.grid_meta.n_valid_re != slot.layout.n_re ||
+        (input.n_tx_ports == 2U && ((slot.layout.n_re & 1U) != 0U ||
+                                    slot.grid_meta.td_pair_count > detail::kCudaMaxDataRe / 2U ||
+                                    slot.grid_meta.td_pair_count * 2U != slot.layout.n_re))) {
+        return MmseStatus::kUnsupportedConfig;
     }
 
     // Reuse the equalized PDCCH layout to build REG/CCE candidates, then copy
@@ -1563,11 +1581,12 @@ MmseStatus MmseEqualizerGpuContext::Impl::submit_pdcch_gpu_common_search_decode(
     pending.ce_mmse_gpu_us = last_host_profile.estimate_gpu_us + last_host_profile.equalize_gpu_us;
     pending.h2d_bytes =
         2U * static_cast<std::uint64_t>(input.grid.n_rx_ant) * slot.grid_plane_bytes +
-        detail::cuda_pdcch_grid_meta_h2d_bytes(slot.layout.n_re) +
+        detail::cuda_grid_meta_h2d_bytes(slot.grid_meta) +
         static_cast<std::uint64_t>(candidate_count) * sizeof(detail::CudaPdcchCandidateDescriptor) +
         static_cast<std::uint64_t>(gold_word_count) * sizeof(std::uint32_t);
     slot.pdcch_decode_submitted = true;
     slot.output_ready = false;
+    submission_guard.armed = false;
     return MmseStatus::kOk;
 }
 
@@ -1588,6 +1607,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::collect_pdcch_gpu_common_search_decode
         status != MmseStatus::kOk) {
         return status;
     }
+    slot.pdcch_decode_submitted = false;
     const Clock::time_point collect_end = Clock::now();
     if (slot.pdcch_hit_count > pending.candidate_count) {
         return MmseStatus::kInternalError;
@@ -1651,7 +1671,6 @@ MmseStatus MmseEqualizerGpuContext::Impl::collect_pdcch_gpu_common_search_decode
                                         result.profile.viterbi_gpu_us);
     (void)detail::cuda_event_elapsed_us(slot.gpu_event_pdcch_viterbi_done,
                                         slot.gpu_event_pdcch_crc_done, result.profile.crc_gpu_us);
-    slot.pdcch_decode_submitted = false;
     buffers.completed_slot = pending.slot_index;
     return MmseStatus::kOk;
 }
@@ -2175,6 +2194,11 @@ MmseStatus MmseEqualizerGpuContext::run_pdcch_gpu_common_search_decode_batch(
             if (const MmseStatus status = impl_->submit_pdcch_gpu_common_search_decode(
                     requests[first + offset], pending[offset]);
                 status != MmseStatus::kOk) {
+                for (std::size_t submitted = 0U; submitted < offset; ++submitted) {
+                    pdcch::PdcchGpuCommonSearchDecodeResult discarded{};
+                    (void)impl_->collect_pdcch_gpu_common_search_decode(pending[submitted],
+                                                                        discarded);
+                }
                 return status;
             }
         }

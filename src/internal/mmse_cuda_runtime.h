@@ -113,8 +113,17 @@ struct CudaGridMeta {
 
 // PDCCH 1Tx non-TD metadata only needs the header plus the valid grid-index prefix;
 // other modes must copy the additional TD/reverse-map arrays as well.
-inline std::size_t cuda_pdcch_grid_meta_h2d_bytes(std::uint32_t n_valid_re) noexcept {
-    const std::size_t valid_re = n_valid_re > kCudaMaxDataRe ? kCudaMaxDataRe : n_valid_re;
+inline bool cuda_uses_compact_pdcch_grid_meta(const CudaGridMeta& grid_meta) noexcept {
+    return grid_meta.channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
+           grid_meta.n_tx_ports == 1U && grid_meta.td_pair_count == 0U;
+}
+
+inline std::size_t cuda_grid_meta_h2d_bytes(const CudaGridMeta& grid_meta) noexcept {
+    if (!cuda_uses_compact_pdcch_grid_meta(grid_meta)) {
+        return sizeof(CudaGridMeta);
+    }
+    const std::size_t valid_re =
+        grid_meta.n_valid_re > kCudaMaxDataRe ? kCudaMaxDataRe : grid_meta.n_valid_re;
     return offsetof(CudaGridMeta, grid_indices) + valid_re * sizeof(std::uint16_t);
 }
 
