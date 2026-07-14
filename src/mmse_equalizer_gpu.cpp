@@ -58,32 +58,11 @@ bool pack_transmit_diversity_pairs(const detail::ReLayout& layout,
     return true;
 }
 
-void populate_pdcch_rate_recovery_map(detail::CudaPdcchCandidateDescriptor& candidate) {
-    constexpr std::array<std::uint8_t, 32> kInversePermutation = {
-        16U, 0U, 24U, 8U, 20U, 4U, 28U, 12U, 18U, 2U, 26U, 10U, 22U, 6U, 30U, 14U,
-        17U, 1U, 25U, 9U, 21U, 5U, 29U, 13U, 19U, 3U, 27U, 11U, 23U, 7U, 31U, 15U,
-    };
-    constexpr std::uint32_t kColumns = 32U;
-    constexpr std::uint32_t kRows = 2U;
-    constexpr std::uint32_t kDummyBits = kRows * kColumns - detail::kCudaPdcchCodewordBitCount;
-    for (std::uint32_t bit = 0U; bit < detail::kCudaPdcchCodewordBitCount; ++bit) {
-        const std::uint32_t padded_bit = bit + kDummyBits;
-        const std::uint32_t row = padded_bit / kColumns;
-        const std::uint32_t column = padded_bit % kColumns;
-        const std::uint32_t interleaved_index = kInversePermutation[column] * kRows + row;
-        for (std::uint32_t stream = 0U; stream < 3U; ++stream) {
-            candidate.rate_recovery_collection_slots[bit * 3U + stream] =
-                static_cast<std::uint8_t>(stream * kRows * kColumns + interleaved_index);
-        }
-    }
-}
-
-std::uint32_t
-populate_pdcch_gold_words(std::uint16_t cell_id, std::uint32_t sfn_subframe, std::uint32_t n_re,
-                          std::array<std::uint32_t, detail::kCudaPdcchGoldWordCount>& words) {
+std::uint32_t populate_pdcch_gold_words(std::uint16_t cell_id, std::uint32_t sfn_subframe,
+                                        std::uint32_t n_re, std::uint32_t* words) {
     const std::uint32_t bit_count = n_re * 2U;
     const std::uint32_t word_count = (bit_count + 31U) / 32U;
-    std::fill(words.begin(), words.end(), 0U);
+    std::fill_n(words, detail::kCudaPdcchGoldWordCount, 0U);
     std::uint32_t x1 = 0U;
     std::uint32_t x2 = 0U;
     lte::detail::init_gold(lte::pdcch_c_init(cell_id, sfn_subframe), x1, x2);
@@ -165,18 +144,24 @@ struct MmseEqualizerGpuContext::Impl {
         std::size_t xhat_plane_bytes = 0;
         std::size_t sinr_plane_bytes = 0;
         detail::CudaGridMeta grid_meta{};
+        detail::CudaGridMeta* grid_meta_staging = nullptr;
+        bool grid_meta_staging_pinned = false;
         detail::ReLayout layout{};
         std::array<float*, 2> transport_re{};
         std::array<float*, 2> transport_im{};
         float* h_estimate = nullptr;
         std::array<float, detail::kCudaScratchTraceFloatCount> scratch_host{};
-        std::array<detail::CudaPdcchCandidateDescriptor, detail::kCudaPdcchMaxCandidates>
-            pdcch_candidates_host{};
+        detail::CudaPdcchCandidateDescriptor* pdcch_candidates_host = nullptr;
+        bool pdcch_candidates_host_pinned = false;
         detail::CudaPdcchCandidateResult* pdcch_results_host = nullptr;
-        std::uint32_t pdcch_hit_count = 0U;
         bool pdcch_results_host_pinned = false;
+        std::uint32_t* pdcch_hit_count = nullptr;
+        bool pdcch_hit_count_host_pinned = false;
         bool pdcch_decode_submitted = false;
-        std::array<std::uint32_t, detail::kCudaPdcchGoldWordCount> pdcch_gold_words_host{};
+        std::uint32_t* pdcch_gold_words_host = nullptr;
+        bool pdcch_gold_words_host_pinned = false;
+        float* sigma2_host = nullptr;
+        bool sigma2_host_pinned = false;
         std::array<float, kOutputPlaneCount> ref_xhat_re{};
         std::array<float, kOutputPlaneCount> ref_xhat_im{};
         std::array<float, kOutputPlaneCount> ref_sinr{};
@@ -250,6 +235,7 @@ struct MmseEqualizerGpuContext::Impl {
 MmseEqualizerGpuContext::MmseEqualizerGpuContext() : impl_(new Impl()) {}
 
 MmseEqualizerGpuContext::~MmseEqualizerGpuContext() {
+    impl_->release_runtime_state();
     delete impl_;
 }
 
@@ -395,7 +381,12 @@ void MmseEqualizerGpuContext::Impl::release_runtime_state() {
         detail::cuda_free_host_f32(slot.xhat_re, slot.host_output_is_pinned);
         detail::cuda_free_host_f32(slot.xhat_im, slot.host_output_is_pinned);
         detail::cuda_free_host_f32(slot.sinr, slot.host_output_is_pinned);
+        detail::cuda_free_host_bytes(slot.grid_meta_staging, slot.grid_meta_staging_pinned);
+        detail::cuda_free_host_bytes(slot.pdcch_candidates_host, slot.pdcch_candidates_host_pinned);
         detail::cuda_free_host_bytes(slot.pdcch_results_host, slot.pdcch_results_host_pinned);
+        detail::cuda_free_host_bytes(slot.pdcch_hit_count, slot.pdcch_hit_count_host_pinned);
+        detail::cuda_free_host_bytes(slot.pdcch_gold_words_host, slot.pdcch_gold_words_host_pinned);
+        detail::cuda_free_host_f32(slot.sigma2_host, slot.sigma2_host_pinned);
         slot.slot_ordinal = 0;
         slot.stream_ordinal = 0;
         slot.stream_handle = 0;
@@ -427,16 +418,23 @@ void MmseEqualizerGpuContext::Impl::release_runtime_state() {
         slot.xhat_plane_bytes = 0;
         slot.sinr_plane_bytes = 0;
         slot.grid_meta = {};
+        slot.grid_meta_staging = nullptr;
+        slot.grid_meta_staging_pinned = false;
         slot.layout = {};
         slot.transport_re = {};
         slot.transport_im = {};
         slot.h_estimate = nullptr;
-        slot.pdcch_candidates_host = {};
+        slot.pdcch_candidates_host = nullptr;
+        slot.pdcch_candidates_host_pinned = false;
         slot.pdcch_results_host = nullptr;
-        slot.pdcch_hit_count = 0U;
         slot.pdcch_results_host_pinned = false;
+        slot.pdcch_hit_count = nullptr;
+        slot.pdcch_hit_count_host_pinned = false;
         slot.pdcch_decode_submitted = false;
-        slot.pdcch_gold_words_host = {};
+        slot.pdcch_gold_words_host = nullptr;
+        slot.pdcch_gold_words_host_pinned = false;
+        slot.sigma2_host = nullptr;
+        slot.sigma2_host_pinned = false;
         slot.xhat_re = nullptr;
         slot.xhat_im = nullptr;
         slot.sinr = nullptr;
@@ -558,6 +556,24 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_storage(HostPinnedSlot
         status != MmseStatus::kOk) {
         return status;
     }
+    void* grid_meta = nullptr;
+    if (const MmseStatus status = detail::cuda_alloc_host_bytes(
+            grid_meta, sizeof(detail::CudaGridMeta), true, slot.grid_meta_staging_pinned);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    slot.grid_meta_staging = static_cast<detail::CudaGridMeta*>(grid_meta);
+    *slot.grid_meta_staging = {};
+    void* pdcch_candidates = nullptr;
+    if (const MmseStatus status = detail::cuda_alloc_host_bytes(
+            pdcch_candidates,
+            detail::kCudaPdcchMaxCandidates * sizeof(detail::CudaPdcchCandidateDescriptor), true,
+            slot.pdcch_candidates_host_pinned);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    slot.pdcch_candidates_host =
+        static_cast<detail::CudaPdcchCandidateDescriptor*>(pdcch_candidates);
     void* pdcch_results = nullptr;
     if (const MmseStatus status = detail::cuda_alloc_host_bytes(
             pdcch_results,
@@ -567,6 +583,28 @@ MmseStatus MmseEqualizerGpuContext::Impl::initialize_slot_storage(HostPinnedSlot
         return status;
     }
     slot.pdcch_results_host = static_cast<detail::CudaPdcchCandidateResult*>(pdcch_results);
+    void* pdcch_hit_count = nullptr;
+    if (const MmseStatus status = detail::cuda_alloc_host_bytes(
+            pdcch_hit_count, sizeof(std::uint32_t), true, slot.pdcch_hit_count_host_pinned);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    slot.pdcch_hit_count = static_cast<std::uint32_t*>(pdcch_hit_count);
+    *slot.pdcch_hit_count = 0U;
+    void* pdcch_gold_words = nullptr;
+    if (const MmseStatus status = detail::cuda_alloc_host_bytes(
+            pdcch_gold_words, detail::kCudaPdcchGoldWordCount * sizeof(std::uint32_t), true,
+            slot.pdcch_gold_words_host_pinned);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    slot.pdcch_gold_words_host = static_cast<std::uint32_t*>(pdcch_gold_words);
+    std::fill_n(slot.pdcch_gold_words_host, detail::kCudaPdcchGoldWordCount, 0U);
+    if (const MmseStatus status =
+            detail::cuda_alloc_host_f32(slot.sigma2_host, 1U, true, slot.sigma2_host_pinned);
+        status != MmseStatus::kOk) {
+        return status;
+    }
 
     slot.grid_view.re = {slot.transport_re[0], slot.transport_re[1]};
     slot.grid_view.im = {slot.transport_im[0], slot.transport_im[1]};
@@ -846,8 +884,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::stage_inputs(const PlanarGridViewF32& 
     slot.kernel_submitted = false;
     slot.d2h_submitted = false;
     slot.completion_value = 0;
-    slot.pdcch_hit_count = 0U;
-    slot.pdcch_candidates_host = {};
+    *slot.pdcch_hit_count = 0U;
+    std::fill_n(slot.pdcch_candidates_host, detail::kCudaPdcchMaxCandidates,
+                detail::CudaPdcchCandidateDescriptor{});
     if (slot.pdcch_results_host != nullptr) {
         std::fill_n(slot.pdcch_results_host, detail::kCudaPdcchMaxCandidates,
                     detail::CudaPdcchCandidateResult{});
@@ -1087,8 +1126,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
             status != MmseStatus::kOk) {
             return status;
         }
+        *slot.grid_meta_staging = slot.grid_meta;
         if (const MmseStatus status = detail::cuda_copy_grid_h2d_async(
-                slot.device, slot.transport_re, slot.transport_im, slot.grid_meta,
+                slot.device, slot.transport_re, slot.transport_im, *slot.grid_meta_staging,
                 slot.grid_plane_bytes, slot.stream_handle);
             status != MmseStatus::kOk) {
             return status;
@@ -1103,9 +1143,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
 
         if (device_sigma_for_call) {
             const detail::Sigma2State& sigma2_state = sigma2_by_cell[desc.cell_id];
-            const float sigma2_seed = sigma2_state.initialized ? sigma2_state.value : 0.0F;
+            *slot.sigma2_host = sigma2_state.initialized ? sigma2_state.value : 0.0F;
             if (const MmseStatus status = detail::cuda_copy_sigma2_h2d_async(
-                    slot.device, sigma2_seed, slot.stream_handle);
+                    slot.device, *slot.sigma2_host, slot.stream_handle);
                 status != MmseStatus::kOk) {
                 return status;
             }
@@ -1148,8 +1188,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
             last_host_profile.sigma2_host_update_us =
                 elapsed_us(sigma2_host_update_start, Clock::now());
             const Clock::time_point sigma2_h2d_start = Clock::now();
+            *slot.sigma2_host = slot.grid_meta.sigma2;
             if (const MmseStatus status = detail::cuda_copy_sigma2_h2d_async(
-                    slot.device, slot.grid_meta.sigma2, slot.stream_handle);
+                    slot.device, *slot.sigma2_host, slot.stream_handle);
                 status != MmseStatus::kOk) {
                 return status;
             }
@@ -1159,8 +1200,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::execute_cuda_transport_stub(const Extr
         // A prepared subframe reuses H and sigma2. Only dynamic layout fields
         // and the stream ordering event need to be submitted.
         slot.grid_meta.sigma2 = prepared.sigma2;
+        *slot.grid_meta_staging = slot.grid_meta;
         if (const MmseStatus status = detail::cuda_copy_grid_meta_dynamic_h2d_async(
-                slot.device, slot.grid_meta, slot.stream_handle);
+                slot.device, *slot.grid_meta_staging, slot.stream_handle);
             status != MmseStatus::kOk) {
             return status;
         }
@@ -1460,7 +1502,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::submit_pdcch_gpu_common_search_decode(
     }
     HostPinnedSlot& slot = buffers.slots[buffers.active_slot];
     if (!slot.device_buffers_ready || slot.stream_handle == 0U ||
-        slot.pdcch_results_host == nullptr) {
+        slot.grid_meta_staging == nullptr || slot.pdcch_candidates_host == nullptr ||
+        slot.pdcch_results_host == nullptr || slot.pdcch_hit_count == nullptr ||
+        slot.pdcch_gold_words_host == nullptr) {
         return MmseStatus::kUnsupportedConfig;
     }
     struct SubmissionGuard {
@@ -1505,18 +1549,17 @@ MmseStatus MmseEqualizerGpuContext::Impl::submit_pdcch_gpu_common_search_decode(
             .aggregation_level = candidates[index].aggregation_level,
             .encoded_bit_count = candidates[index].encoded_bit_count,
         };
-        populate_pdcch_rate_recovery_map(slot.pdcch_candidates_host[index]);
     }
     const std::uint32_t candidate_count = static_cast<std::uint32_t>(candidates.size());
     if (const MmseStatus status = detail::cuda_copy_pdcch_candidates_h2d_async(
-            slot.device, slot.pdcch_candidates_host.data(), candidate_count, slot.stream_handle);
+            slot.device, slot.pdcch_candidates_host, candidate_count, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
     const std::uint32_t gold_word_count = populate_pdcch_gold_words(
         input.cell_id, input.sfn_subframe, slot.layout.n_re, slot.pdcch_gold_words_host);
     if (const MmseStatus status = detail::cuda_copy_pdcch_gold_words_h2d_async(
-            slot.device, slot.pdcch_gold_words_host.data(), gold_word_count, slot.stream_handle);
+            slot.device, slot.pdcch_gold_words_host, gold_word_count, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
@@ -1563,7 +1606,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::submit_pdcch_gpu_common_search_decode(
 
     const Clock::time_point d2h_start = Clock::now();
     if (const MmseStatus status = detail::cuda_copy_pdcch_results_d2h_async(
-            slot.device, slot.pdcch_results_host, slot.pdcch_hit_count, slot.stream_handle);
+            slot.device, slot.pdcch_results_host, *slot.pdcch_hit_count, slot.stream_handle);
         status != MmseStatus::kOk) {
         return status;
     }
@@ -1581,7 +1624,7 @@ MmseStatus MmseEqualizerGpuContext::Impl::submit_pdcch_gpu_common_search_decode(
     pending.ce_mmse_gpu_us = last_host_profile.estimate_gpu_us + last_host_profile.equalize_gpu_us;
     pending.h2d_bytes =
         2U * static_cast<std::uint64_t>(input.grid.n_rx_ant) * slot.grid_plane_bytes +
-        detail::cuda_grid_meta_h2d_bytes(slot.grid_meta) +
+        detail::cuda_grid_meta_h2d_bytes(slot.grid_meta) + sizeof(*slot.sigma2_host) +
         static_cast<std::uint64_t>(candidate_count) * sizeof(detail::CudaPdcchCandidateDescriptor) +
         static_cast<std::uint64_t>(gold_word_count) * sizeof(std::uint32_t);
     slot.pdcch_decode_submitted = true;
@@ -1609,13 +1652,13 @@ MmseStatus MmseEqualizerGpuContext::Impl::collect_pdcch_gpu_common_search_decode
     }
     slot.pdcch_decode_submitted = false;
     const Clock::time_point collect_end = Clock::now();
-    if (slot.pdcch_hit_count > pending.candidate_count) {
+    if (*slot.pdcch_hit_count > pending.candidate_count) {
         return MmseStatus::kInternalError;
     }
 
     result.candidate_count = pending.candidate_count;
-    result.hits.reserve(slot.pdcch_hit_count);
-    for (std::uint32_t hit = 0U; hit < slot.pdcch_hit_count; ++hit) {
+    result.hits.reserve(*slot.pdcch_hit_count);
+    for (std::uint32_t hit = 0U; hit < *slot.pdcch_hit_count; ++hit) {
         const detail::CudaPdcchCandidateResult& device_result = slot.pdcch_results_host[hit];
         if (device_result.matched == 0U || device_result.candidate_id >= pending.candidate_count) {
             return MmseStatus::kInternalError;
@@ -1656,9 +1699,9 @@ MmseStatus MmseEqualizerGpuContext::Impl::collect_pdcch_gpu_common_search_decode
     result.profile.host_submit_us = elapsed_us(pending.submit_start, pending.d2h_start);
     result.profile.host_collect_us = elapsed_us(collect_start, collect_end);
     result.profile.h2d_bytes = pending.h2d_bytes;
-    result.profile.d2h_bytes =
-        sizeof(slot.pdcch_hit_count) + static_cast<std::uint64_t>(detail::kCudaPdcchMaxCandidates) *
-                                           sizeof(detail::CudaPdcchCandidateResult);
+    result.profile.d2h_bytes = sizeof(*slot.pdcch_hit_count) +
+                               static_cast<std::uint64_t>(detail::kCudaPdcchMaxCandidates) *
+                                   sizeof(detail::CudaPdcchCandidateResult);
     result.profile.crc_hit_count = static_cast<std::uint32_t>(result.hits.size());
     result.profile.crc_miss_count = pending.candidate_count - result.profile.crc_hit_count;
     (void)detail::cuda_event_elapsed_us(slot.gpu_event_equalize_done, slot.gpu_event_pdcch_llr_done,

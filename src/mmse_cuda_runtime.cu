@@ -55,8 +55,7 @@ __host__ __device__ inline std::uint32_t ceil_div_u32(std::uint32_t num, std::ui
     return den == 0U ? 0U : (num + den - 1U) / den;
 }
 
-__device__ inline CudaComplex32 load_grid_sample(const float* re_plane,
-                                                 const float* im_plane,
+__device__ inline CudaComplex32 load_grid_sample(const float* re_plane, const float* im_plane,
                                                  std::uint32_t grid_idx) {
     float y_re = 0.0F;
     float y_im = 0.0F;
@@ -71,13 +70,9 @@ __device__ inline CudaComplex32 load_grid_sample(const float* re_plane,
     return {y_re, y_im};
 }
 
-__device__ inline CudaComplex32 ls_at(const float* re_plane,
-                                      const float* im_plane,
-                                      const CudaGridMeta* grid_meta,
-                                      std::uint32_t tx,
-                                      std::uint32_t rx,
-                                      std::uint32_t cs,
-                                      std::uint32_t pilot) {
+__device__ inline CudaComplex32 ls_at(const float* re_plane, const float* im_plane,
+                                      const CudaGridMeta* grid_meta, std::uint32_t tx,
+                                      std::uint32_t rx, std::uint32_t cs, std::uint32_t pilot) {
     const std::uint32_t symbol = grid_meta->crs_symbols[cs];
     const std::uint32_t sc = 6U * pilot + grid_meta->crs_freq_offsets[tx][cs];
     const std::uint32_t grid_idx = symbol * grid_meta->n_subcarriers + sc;
@@ -89,27 +84,22 @@ __device__ inline CudaComplex32 ls_at(const float* re_plane,
     return {y.re * crs_re + y.im * crs_im, y.im * crs_re - y.re * crs_im};
 }
 
-__device__ inline CudaComplex32 interpolate_freq(const float* re_plane,
-                                                 const float* im_plane,
-                                                 const CudaGridMeta* grid_meta,
-                                                 std::uint32_t tx,
-                                                 std::uint32_t rx,
-                                                 std::uint32_t cs,
+__device__ inline CudaComplex32 interpolate_freq(const float* re_plane, const float* im_plane,
+                                                 const CudaGridMeta* grid_meta, std::uint32_t tx,
+                                                 std::uint32_t rx, std::uint32_t cs,
                                                  std::uint32_t sc) {
     const std::uint32_t first_offset = grid_meta->crs_freq_offsets[tx][cs];
-    const std::uint32_t last_sc =
-        6U * (kLteNumPilotTonesPerCrsSymbol - 1U) + first_offset;
+    const std::uint32_t last_sc = 6U * (kLteNumPilotTonesPerCrsSymbol - 1U) + first_offset;
     const bool below_first = sc < first_offset;
     const bool above_last = sc > last_sc;
-    const std::uint32_t lower_pilot =
-        min_u32((sc < first_offset ? 0U : (sc - first_offset) / 6U),
-                kLteNumPilotTonesPerCrsSymbol - 1U);
+    const std::uint32_t lower_pilot = min_u32((sc < first_offset ? 0U : (sc - first_offset) / 6U),
+                                              kLteNumPilotTonesPerCrsSymbol - 1U);
     const std::uint32_t left_pilot =
         below_first ? 0U : (above_last ? kLteNumPilotTonesPerCrsSymbol - 2U : lower_pilot);
     const std::uint32_t right_pilot =
-        below_first ? 1U : (above_last ? kLteNumPilotTonesPerCrsSymbol - 1U
-                                       : min_u32(lower_pilot + 1U,
-                                                 kLteNumPilotTonesPerCrsSymbol - 1U));
+        below_first ? 1U
+                    : (above_last ? kLteNumPilotTonesPerCrsSymbol - 1U
+                                  : min_u32(lower_pilot + 1U, kLteNumPilotTonesPerCrsSymbol - 1U));
     const std::uint32_t left_sc = 6U * left_pilot + first_offset;
     const std::uint32_t right_sc = 6U * right_pilot + first_offset;
     const CudaComplex32 left = ls_at(re_plane, im_plane, grid_meta, tx, rx, cs, left_pilot);
@@ -122,12 +112,9 @@ __device__ inline CudaComplex32 interpolate_freq(const float* re_plane,
     return {left.re + (right.re - left.re) * t, left.im + (right.im - left.im) * t};
 }
 
-__device__ inline CudaComplex32 estimate_h_at(const float* re_plane,
-                                              const float* im_plane,
-                                              const CudaGridMeta* grid_meta,
-                                              std::uint32_t tx,
-                                              std::uint32_t rx,
-                                              std::uint32_t symbol,
+__device__ inline CudaComplex32 estimate_h_at(const float* re_plane, const float* im_plane,
+                                              const CudaGridMeta* grid_meta, std::uint32_t tx,
+                                              std::uint32_t rx, std::uint32_t symbol,
                                               std::uint32_t sc) {
     // Frequency interpolation is performed independently at the two enclosing
     // CRS symbols; a second linear interpolation then fills the target symbol.
@@ -157,10 +144,8 @@ MmseStatus map_cuda_error(cudaError_t status) {
 }
 
 template <typename TKernel>
-MmseStatus fill_kernel_resource_info(TKernel kernel,
-                                     const char* kernel_name,
-                                     std::int32_t block_size,
-                                     CudaKernelResourceInfo& info) {
+MmseStatus fill_kernel_resource_info(TKernel kernel, const char* kernel_name,
+                                     std::int32_t block_size, CudaKernelResourceInfo& info) {
     cudaFuncAttributes attrs{};
     if (const cudaError_t status = cudaFuncGetAttributes(&attrs, kernel); status != cudaSuccess) {
         return map_cuda_error(status);
@@ -204,21 +189,18 @@ MmseStatus fill_kernel_resource_info(TKernel kernel,
     return MmseStatus::kOk;
 }
 
-__global__ void estimate_residual_kernel(const float* grid_re0,
-                                         const float* grid_re1,
-                                         const float* grid_im0,
-                                         const float* grid_im1,
-                                         const CudaGridMeta* grid_meta,
-                                         float* sigma2_accum_out,
+__global__ void estimate_residual_kernel(const float* grid_re0, const float* grid_re1,
+                                         const float* grid_im0, const float* grid_im1,
+                                         const CudaGridMeta* grid_meta, float* sigma2_accum_out,
                                          std::uint32_t* residual_count_out) {
     if (grid_meta == nullptr || sigma2_accum_out == nullptr || residual_count_out == nullptr) {
         return;
     }
 
     const std::uint32_t tx_count = min_u32(grid_meta->n_tx_ports, kMmseV1MaxNumCrsTxPorts);
-    const std::uint32_t total_items =
-        tx_count * min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas) * kLteNumCrsSymbols *
-        (kLteNumPilotTonesPerCrsSymbol - 2U);
+    const std::uint32_t total_items = tx_count *
+                                      min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas) *
+                                      kLteNumCrsSymbols * (kLteNumPilotTonesPerCrsSymbol - 2U);
 
     // Stride over pilot residuals so the fixed grid can be processed with any
     // launch size. Block-local sums are reduced with two global atomics only
@@ -254,12 +236,9 @@ __global__ void estimate_residual_kernel(const float* grid_re0,
     atomicAdd(residual_count_out, local_count);
 }
 
-__global__ void estimate_channel_kernel(const float* grid_re0,
-                                        const float* grid_re1,
-                                        const float* grid_im0,
-                                        const float* grid_im1,
-                                        const CudaGridMeta* grid_meta,
-                                        float* h_estimate) {
+__global__ void estimate_channel_kernel(const float* grid_re0, const float* grid_re1,
+                                        const float* grid_im0, const float* grid_im1,
+                                        const CudaGridMeta* grid_meta, float* h_estimate) {
     if (h_estimate == nullptr || grid_meta == nullptr) {
         return;
     }
@@ -269,8 +248,8 @@ __global__ void estimate_channel_kernel(const float* grid_re0,
     // bandwidth-specific extraction layouts.
     const std::uint32_t tx_count = min_u32(grid_meta->n_tx_ports, kMmseV1MaxNumCrsTxPorts);
     const std::uint32_t rx_count = min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas);
-    const std::uint32_t total_h = tx_count * rx_count * kLteNumSymbolsNormalCp *
-                                  grid_meta->n_subcarriers;
+    const std::uint32_t total_h =
+        tx_count * rx_count * kLteNumSymbolsNormalCp * grid_meta->n_subcarriers;
     const std::uint32_t stride = blockDim.x * gridDim.x;
     for (std::uint32_t linear = blockIdx.x * blockDim.x + threadIdx.x; linear < total_h;
          linear += stride) {
@@ -295,8 +274,7 @@ __global__ void estimate_channel_kernel(const float* grid_re0,
     }
 }
 
-__global__ void finalize_sigma2_kernel(const CudaGridMeta* grid_meta,
-                                       const float* sigma2_accum_in,
+__global__ void finalize_sigma2_kernel(const CudaGridMeta* grid_meta, const float* sigma2_accum_in,
                                        const std::uint32_t* residual_count_in,
                                        float* sigma2_state) {
     if (threadIdx.x != 0 || blockIdx.x != 0 || grid_meta == nullptr || sigma2_state == nullptr ||
@@ -309,7 +287,7 @@ __global__ void finalize_sigma2_kernel(const CudaGridMeta* grid_meta,
     // in the persistent per-slot sigma2 buffer before equalization starts.
     const std::uint32_t residual_count = *residual_count_in;
     float sigma2 = residual_count == 0U ? grid_meta->sigma2
-                                         : *sigma2_accum_in / static_cast<float>(residual_count);
+                                        : *sigma2_accum_in / static_cast<float>(residual_count);
     if (!isfinite(sigma2) || sigma2 < 0.0F) {
         sigma2 = grid_meta->sigma2;
     }
@@ -340,19 +318,12 @@ __global__ void zero_estimate_accumulators_kernel(float* sigma2_accum_out,
     }
 }
 
-__global__ void equalize_stub_kernel(const float* grid_re0,
-                                     const float* grid_re1,
-                                     const float* grid_im0,
-                                     const float* grid_im1,
-                                     const float* h_estimate,
-                                     const float* sigma2_in,
-                                     const CudaGridMeta* grid_meta,
-                                     float* xhat_re,
-                                     float* xhat_im,
-                                     float* sinr,
-                                     float* scratch,
-                                      std::uint32_t* completion,
-                                      std::uint32_t completion_value) {
+__global__ void equalize_stub_kernel(const float* grid_re0, const float* grid_re1,
+                                     const float* grid_im0, const float* grid_im1,
+                                     const float* h_estimate, const float* sigma2_in,
+                                     const CudaGridMeta* grid_meta, float* xhat_re, float* xhat_im,
+                                     float* sinr, float* scratch, std::uint32_t* completion,
+                                     std::uint32_t completion_value) {
     if (grid_meta == nullptr || h_estimate == nullptr || xhat_re == nullptr || xhat_im == nullptr ||
         sinr == nullptr) {
         if (threadIdx.x == 0 && blockIdx.x == 0 && scratch != nullptr && h_estimate != nullptr) {
@@ -377,9 +348,9 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
         const float g_min = grid_meta->g_min;
         const float gamma_max = grid_meta->gamma_max;
         const bool td_mode = grid_meta->td_pair_count != 0U;
-        const std::uint32_t grid_idx =
-            td_mode && re < grid_meta->td_pair_count ? grid_meta->td_pair_grid_indices0[re]
-                                                     : grid_meta->grid_indices[re];
+        const std::uint32_t grid_idx = td_mode && re < grid_meta->td_pair_count
+                                           ? grid_meta->td_pair_grid_indices0[re]
+                                           : grid_meta->grid_indices[re];
         const std::uint32_t out_slot =
             grid_meta->channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
                     grid_meta->n_tx_ports == 1U && grid_meta->td_pair_count == 0U
@@ -447,17 +418,14 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
             const CudaComplex32 h00{h00_re, h00_im};
             const CudaComplex32 h01{h_estimate[h01_base], h_estimate[h01_base + 1U]};
             const CudaComplex32 h10{h10_re, h10_im};
-            const CudaComplex32 h11{
-                has_rx1 ? h_estimate[h11_base] : 0.0F,
-                has_rx1 ? h_estimate[h11_base + 1U] : 0.0F};
+            const CudaComplex32 h11{has_rx1 ? h_estimate[h11_base] : 0.0F,
+                                    has_rx1 ? h_estimate[h11_base + 1U] : 0.0F};
             const CudaComplex32 h00n{h_estimate[h00n_base], h_estimate[h00n_base + 1U]};
             const CudaComplex32 h01n{h_estimate[h01n_base], h_estimate[h01n_base + 1U]};
-            const CudaComplex32 h10n{
-                has_rx1 ? h_estimate[h10n_base] : 0.0F,
-                has_rx1 ? h_estimate[h10n_base + 1U] : 0.0F};
-            const CudaComplex32 h11n{
-                has_rx1 ? h_estimate[h11n_base] : 0.0F,
-                has_rx1 ? h_estimate[h11n_base + 1U] : 0.0F};
+            const CudaComplex32 h10n{has_rx1 ? h_estimate[h10n_base] : 0.0F,
+                                     has_rx1 ? h_estimate[h10n_base + 1U] : 0.0F};
+            const CudaComplex32 h11n{has_rx1 ? h_estimate[h11n_base] : 0.0F,
+                                     has_rx1 ? h_estimate[h11n_base + 1U] : 0.0F};
             const CudaComplex32 y0{y0_re, y0_im};
             const CudaComplex32 y1{y1_re, y1_im};
             const CudaComplex32 y0n{y0n_re, y0n_im};
@@ -509,16 +477,14 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
         } else if (grid_meta->n_layers == 1U) {
             // 1x2 maximal-ratio/MMSE path; h00 and h10 are the two RX channels
             // for the single transmitted layer.
-            const float denom = h00_re * h00_re + h00_im * h00_im + h10_re * h10_re +
-                                h10_im * h10_im + sigma2;
+            const float denom =
+                h00_re * h00_re + h00_im * h00_im + h10_re * h10_re + h10_im * h10_im + sigma2;
             const float w0_re = h00_re / denom;
             const float w0_im = -h00_im / denom;
             const float w1_re = h10_re / denom;
             const float w1_im = -h10_im / denom;
-            const float z0_re =
-                (w0_re * y0_re - w0_im * y0_im) + (w1_re * y1_re - w1_im * y1_im);
-            const float z0_im =
-                (w0_re * y0_im + w0_im * y0_re) + (w1_re * y1_im + w1_im * y1_re);
+            const float z0_re = (w0_re * y0_re - w0_im * y0_im) + (w1_re * y1_re - w1_im * y1_im);
+            const float z0_im = (w0_re * y0_im + w0_im * y0_re) + (w1_re * y1_im + w1_im * y1_re);
             float g0 =
                 (h00_re * h00_re + h00_im * h00_im + h10_re * h10_re + h10_im * h10_im) / denom;
             g0 = g0 < g_min ? g_min : (g0 > 1.0F - g_min ? 1.0F - g_min : g0);
@@ -533,9 +499,8 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
             const CudaComplex32 h00{h00_re, h00_im};
             const CudaComplex32 h01{h_estimate[h01_base], h_estimate[h01_base + 1U]};
             const CudaComplex32 h10{h10_re, h10_im};
-            const CudaComplex32 h11{
-                has_rx1 ? h_estimate[h11_base] : 0.0F,
-                has_rx1 ? h_estimate[h11_base + 1U] : 0.0F};
+            const CudaComplex32 h11{has_rx1 ? h_estimate[h11_base] : 0.0F,
+                                    has_rx1 ? h_estimate[h11_base + 1U] : 0.0F};
             const CudaComplex32 y0{y0_re, y0_im};
             const CudaComplex32 y1{y1_re, y1_im};
 
@@ -583,8 +548,7 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
             sinr[layer1_base] = gamma1;
 
             if (scratch != nullptr && grid_meta->trace_sample_count != 0U) {
-                for (std::uint32_t sample = 0; sample < grid_meta->trace_sample_count;
-                     ++sample) {
+                for (std::uint32_t sample = 0; sample < grid_meta->trace_sample_count; ++sample) {
                     if (grid_meta->spot_check_re_slots[sample] != re) {
                         continue;
                     }
@@ -642,24 +606,6 @@ __global__ void equalize_stub_kernel(const float* grid_re0,
     }
 }
 
-__device__ inline std::uint32_t pdcch_parity(std::uint32_t value) {
-    std::uint32_t result = 0U;
-    while (value != 0U) {
-        result ^= value & 1U;
-        value >>= 1U;
-    }
-    return result;
-}
-
-__device__ inline std::uint8_t pdcch_branch_output_class(std::uint32_t shift_register) {
-    constexpr std::uint32_t kGenerator0 = 0133U;
-    constexpr std::uint32_t kGenerator1 = 0171U;
-    constexpr std::uint32_t kGenerator2 = 0165U;
-    return static_cast<std::uint8_t>(pdcch_parity(shift_register & kGenerator0) |
-                                     (pdcch_parity(shift_register & kGenerator1) << 1U) |
-                                     (pdcch_parity(shift_register & kGenerator2) << 2U));
-}
-
 __device__ inline double pdcch_branch_metric(const float* llrs, std::uint8_t output_class) {
     const double sign0 = (output_class & 0x1U) != 0U ? 1.0 : -1.0;
     const double sign1 = (output_class & 0x2U) != 0U ? 1.0 : -1.0;
@@ -668,12 +614,14 @@ __device__ inline double pdcch_branch_metric(const float* llrs, std::uint8_t out
            sign2 * static_cast<double>(llrs[2]);
 }
 
-__global__ void pdcch_llr_descramble_kernel(const float* xhat_re,
-                                             const float* xhat_im,
-                                             const float* sinr,
-                                             std::uint32_t n_re,
-                                             const std::uint32_t* gold_words,
-                                             float* llrs) {
+__device__ __constant__ std::uint8_t kPdcchLowZeroBranchClass[32] = {
+    0U, 1U, 4U, 5U, 3U, 2U, 7U, 6U, 7U, 6U, 3U, 2U, 4U, 5U, 0U, 1U,
+    6U, 7U, 2U, 3U, 5U, 4U, 1U, 0U, 1U, 0U, 5U, 4U, 2U, 3U, 6U, 7U,
+};
+
+__global__ void pdcch_llr_descramble_kernel(const float* xhat_re, const float* xhat_im,
+                                            const float* sinr, std::uint32_t n_re,
+                                            const std::uint32_t* gold_words, float* llrs) {
     const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     const std::uint32_t llr_count = n_re * 2U;
     if (index >= llr_count || xhat_re == nullptr || xhat_im == nullptr || sinr == nullptr ||
@@ -693,60 +641,40 @@ __global__ void pdcch_llr_descramble_kernel(const float* xhat_re,
     llrs[index] = value;
 }
 
+__device__ __constant__ std::uint8_t kPdcchRateRecoveryInputOffsets[kCudaPdcchRecoveredLlrCount] = {
+    28U, 72U, 116U, 6U,  50U, 94U,  39U, 83U, 127U, 17U, 61U, 105U, 25U, 69U, 113U, 3U,  47U, 91U,
+    36U, 80U, 124U, 14U, 58U, 102U, 31U, 75U, 119U, 9U,  53U, 97U,  42U, 86U, 130U, 20U, 64U, 108U,
+    22U, 66U, 110U, 0U,  44U, 88U,  33U, 77U, 121U, 11U, 55U, 99U,  27U, 71U, 115U, 5U,  49U, 93U,
+    38U, 82U, 126U, 16U, 60U, 104U, 24U, 68U, 112U, 2U,  46U, 90U,  35U, 79U, 123U, 13U, 57U, 101U,
+    30U, 74U, 118U, 8U,  52U, 96U,  41U, 85U, 129U, 19U, 63U, 107U, 23U, 67U, 111U, 1U,  45U, 89U,
+    34U, 78U, 122U, 12U, 56U, 100U, 29U, 73U, 117U, 7U,  51U, 95U,  40U, 84U, 128U, 18U, 62U, 106U,
+    26U, 70U, 114U, 4U,  48U, 92U,  37U, 81U, 125U, 15U, 59U, 103U, 32U, 76U, 120U, 10U, 54U, 98U,
+    43U, 87U, 131U, 21U, 65U, 109U,
+};
+
 __global__ void pdcch_rate_recovery_kernel(const float* llrs,
-                                            const CudaPdcchCandidateDescriptor* candidates,
-                                            std::uint32_t candidate_count,
-                                            float* recovered_llrs) {
+                                           const CudaPdcchCandidateDescriptor* candidates,
+                                           std::uint32_t candidate_count, float* recovered_llrs) {
     const std::uint32_t candidate_index = blockIdx.x;
-    const std::uint32_t lane = threadIdx.x;
-    const std::uint32_t output_index = blockIdx.y * 32U + lane;
+    const std::uint32_t output_index = threadIdx.x;
     if (candidate_index >= candidate_count || output_index >= kCudaPdcchRecoveredLlrCount ||
-        lane >= 32U || llrs == nullptr ||
-        candidates == nullptr || recovered_llrs == nullptr) {
+        llrs == nullptr || candidates == nullptr || recovered_llrs == nullptr) {
         return;
     }
-    // A block is one candidate and each warp/lane owns one recovered output
-    // position. The candidate descriptor supplies the inverse collection map,
-    // so no per-candidate temporary matrix is required.
-    constexpr std::uint32_t kColumns = 32U;
-    constexpr std::uint8_t kPermutation[kColumns] = {
-        1U, 17U, 9U, 25U, 5U, 21U, 13U, 29U, 3U, 19U, 11U, 27U, 7U, 23U, 15U, 31U,
-        0U, 16U, 8U, 24U, 4U, 20U, 12U, 28U, 2U, 18U, 10U, 26U, 6U, 22U, 14U, 30U,
-    };
-    constexpr std::uint32_t kRows = 2U;
-    constexpr std::uint32_t kInterleaverSize = kRows * kColumns;
-    constexpr std::uint32_t kDummyBits = kInterleaverSize - kCudaPdcchCodewordBitCount;
-    constexpr std::uint32_t kCollectionSize = 3U * kInterleaverSize;
     const CudaPdcchCandidateDescriptor* const candidate = candidates + candidate_index;
-    const std::uint8_t output_slot = candidate->rate_recovery_collection_slots[output_index];
     float accumulated = 0.0F;
-
     const std::uint32_t llr_offset = static_cast<std::uint32_t>(candidate->first_cce) * 72U;
-    std::uint32_t input_index = 0U;
-    std::uint32_t collection_index = 0U;
-    while (input_index < candidate->encoded_bit_count) {
-        const std::uint32_t intra_stream_index = collection_index % kInterleaverSize;
-        const std::uint32_t permutation_column = intra_stream_index / kRows;
-        const std::uint32_t row = intra_stream_index % kRows;
-        const std::uint32_t original_bit_index = row * kColumns + kPermutation[permutation_column];
-        if (original_bit_index >= kDummyBits) {
-            const float value = llrs[llr_offset + input_index];
-            if (collection_index == output_slot) {
-                accumulated += value;
-            }
-            ++input_index;
-        }
-        collection_index = (collection_index + 1U) % kCollectionSize;
+    for (std::uint32_t input_index = kPdcchRateRecoveryInputOffsets[output_index];
+         input_index < candidate->encoded_bit_count; input_index += kCudaPdcchRecoveredLlrCount) {
+        accumulated += llrs[llr_offset + input_index];
     }
 
     float* const output = recovered_llrs + candidate_index * kCudaPdcchRecoveredLlrCount;
     output[output_index] = accumulated;
 }
 
-__global__ void pdcch_viterbi_kernel(const float* recovered_llrs,
-                                      std::uint32_t candidate_count,
-                                      std::uint64_t* survivors,
-                                      double* terminal_metrics) {
+__global__ void pdcch_viterbi_kernel(const float* recovered_llrs, std::uint32_t candidate_count,
+                                     std::uint64_t* survivors, double* terminal_metrics) {
     const std::uint32_t candidate_index = blockIdx.x;
     const std::uint32_t warp_index = threadIdx.x >> 5U;
     const std::uint32_t initial_state = blockIdx.y * 2U + warp_index;
@@ -762,8 +690,7 @@ __global__ void pdcch_viterbi_kernel(const float* recovered_llrs,
     __shared__ double metrics[2][64];
     __shared__ double next_metrics[2][64];
     const std::uint32_t target_state = lane * 2U;
-    metrics[warp_index][target_state] =
-        target_state == initial_state ? 0.0 : kCudaNegativeInfinity;
+    metrics[warp_index][target_state] = target_state == initial_state ? 0.0 : kCudaNegativeInfinity;
     metrics[warp_index][target_state + 1U] =
         target_state + 1U == initial_state ? 0.0 : kCudaNegativeInfinity;
     __syncwarp();
@@ -775,11 +702,15 @@ __global__ void pdcch_viterbi_kernel(const float* recovered_llrs,
     for (std::uint32_t bit = 0U; bit < kCudaPdcchCodewordBitCount; ++bit) {
         const std::uint32_t low_predecessor = lane;
         const std::uint32_t high_predecessor = low_predecessor | 32U;
-        const std::uint8_t low_zero_class = pdcch_branch_output_class(low_predecessor << 1U);
+        const std::uint8_t low_zero_class = kPdcchLowZeroBranchClass[lane];
         const std::uint8_t complement_class = low_zero_class ^ 0x7U;
         const float* const bit_llrs = candidate_llrs + bit * 3U;
-        const double direct_branch_metric = pdcch_branch_metric(bit_llrs, low_zero_class);
-        const double complement_branch_metric = pdcch_branch_metric(bit_llrs, complement_class);
+        const double local_branch_metric =
+            lane < 8U ? pdcch_branch_metric(bit_llrs, static_cast<std::uint8_t>(lane)) : 0.0;
+        const double direct_branch_metric =
+            __shfl_sync(0xFFFFFFFFU, local_branch_metric, low_zero_class);
+        const double complement_branch_metric =
+            __shfl_sync(0xFFFFFFFFU, local_branch_metric, complement_class);
         const double low_metric = metrics[warp_index][low_predecessor];
         const double high_metric = metrics[warp_index][high_predecessor];
         const double low_zero_metric = low_metric + direct_branch_metric;
@@ -813,16 +744,15 @@ __global__ void pdcch_viterbi_kernel(const float* recovered_llrs,
         __syncwarp();
     }
     if (lane == 0U) {
-        terminal_metrics[candidate_index * 64U + initial_state] = metrics[warp_index][initial_state];
+        terminal_metrics[candidate_index * 64U + initial_state] =
+            metrics[warp_index][initial_state];
     }
 }
 
 __global__ void pdcch_crc_kernel(const CudaPdcchCandidateDescriptor* candidates,
-                                  std::uint32_t candidate_count,
-                                  const std::uint64_t* survivors,
-                                  const double* terminal_metrics,
-                                  std::uint16_t expected_rnti,
-                                  CudaPdcchCandidateResult* candidate_results) {
+                                 std::uint32_t candidate_count, const std::uint64_t* survivors,
+                                 const double* terminal_metrics, std::uint16_t expected_rnti,
+                                 CudaPdcchCandidateResult* candidate_results) {
     const std::uint32_t candidate_index = blockIdx.x;
     if (candidate_index >= candidate_count || threadIdx.x != 0U || candidates == nullptr ||
         survivors == nullptr || terminal_metrics == nullptr || candidate_results == nullptr) {
@@ -831,26 +761,23 @@ __global__ void pdcch_crc_kernel(const CudaPdcchCandidateDescriptor* candidates,
     // Tail-biting traceback is intentionally kept here, after the fixed-work
     // Viterbi kernel, so only the best closed path needs CRC/RNTI checking.
     double best_metric = kCudaNegativeInfinity;
-    std::uint64_t decoded_bits = 0U;
+    std::uint32_t best_initial_state = 0U;
     for (std::uint32_t initial_state = 0U; initial_state < 64U; ++initial_state) {
         const double metric = terminal_metrics[candidate_index * 64U + initial_state];
-        if (metric <= best_metric) {
-            continue;
-        }
-        std::uint32_t state = initial_state;
-        std::uint64_t candidate_bits = 0U;
-        const std::uint64_t* const candidate_survivors =
-            survivors + (candidate_index * 64U + initial_state) * kCudaPdcchCodewordBitCount;
-        for (std::uint32_t bit = kCudaPdcchCodewordBitCount; bit > 0U; --bit) {
-            candidate_bits |= static_cast<std::uint64_t>(state & 1U) << (bit - 1U);
-            const bool high_predecessor =
-                (candidate_survivors[bit - 1U] & (std::uint64_t{1U} << state)) != 0U;
-            state = (state >> 1U) | (high_predecessor ? 32U : 0U);
-        }
-        if (state == initial_state) {
+        if (metric > best_metric) {
             best_metric = metric;
-            decoded_bits = candidate_bits;
+            best_initial_state = initial_state;
         }
+    }
+    std::uint32_t state = best_initial_state;
+    std::uint64_t decoded_bits = 0U;
+    const std::uint64_t* const candidate_survivors =
+        survivors + (candidate_index * 64U + best_initial_state) * kCudaPdcchCodewordBitCount;
+    for (std::uint32_t bit = kCudaPdcchCodewordBitCount; bit > 0U; --bit) {
+        decoded_bits |= static_cast<std::uint64_t>(state & 1U) << (bit - 1U);
+        const bool high_predecessor =
+            (candidate_survivors[bit - 1U] & (std::uint64_t{1U} << state)) != 0U;
+        state = (state >> 1U) | (high_predecessor ? 32U : 0U);
     }
 
     std::uint16_t transmitted_crc = 0U;
@@ -903,7 +830,7 @@ __global__ void pdcch_compact_hits_kernel(const CudaPdcchCandidateResult* candid
     *hit_count = count;
 }
 
-}  // namespace
+} // namespace
 
 bool cuda_backend_compiled() {
     return true;
@@ -935,8 +862,7 @@ void cuda_destroy_stream(std::uintptr_t stream_handle) {
 
 MmseStatus cuda_query_device_info(std::uint32_t device_ordinal, CudaDeviceInfo& info) {
     cudaDeviceProp prop{};
-    if (const cudaError_t status =
-            cudaGetDeviceProperties(&prop, static_cast<int>(device_ordinal));
+    if (const cudaError_t status = cudaGetDeviceProperties(&prop, static_cast<int>(device_ordinal));
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
@@ -955,8 +881,7 @@ MmseStatus cuda_query_device_info(std::uint32_t device_ordinal, CudaDeviceInfo& 
     info.regs_per_block = static_cast<std::uint32_t>(prop.regsPerBlock);
     info.regs_per_multiprocessor = static_cast<std::uint32_t>(prop.regsPerMultiprocessor);
     info.shared_mem_per_block = static_cast<std::size_t>(prop.sharedMemPerBlock);
-    info.shared_mem_per_multiprocessor =
-        static_cast<std::size_t>(prop.sharedMemPerMultiprocessor);
+    info.shared_mem_per_multiprocessor = static_cast<std::size_t>(prop.sharedMemPerMultiprocessor);
     info.total_global_mem = static_cast<std::size_t>(prop.totalGlobalMem);
     info.l2_cache_size = static_cast<std::size_t>(prop.l2CacheSize);
     return MmseStatus::kOk;
@@ -1012,9 +937,7 @@ MmseStatus cuda_event_elapsed_us(std::uintptr_t start_event_handle, std::uintptr
     return MmseStatus::kOk;
 }
 
-MmseStatus cuda_alloc_host_f32(float*& ptr,
-                               std::size_t count,
-                               bool request_pinned,
+MmseStatus cuda_alloc_host_f32(float*& ptr, std::size_t count, bool request_pinned,
                                bool& pinned_allocation) {
     ptr = nullptr;
     pinned_allocation = false;
@@ -1029,9 +952,8 @@ MmseStatus cuda_alloc_host_f32(float*& ptr,
         return MmseStatus::kOk;
     }
 
-    const cudaError_t status = cudaHostAlloc(reinterpret_cast<void**>(&ptr),
-                                             count * sizeof(float),
-                                             cudaHostAllocDefault);
+    const cudaError_t status =
+        cudaHostAlloc(reinterpret_cast<void**>(&ptr), count * sizeof(float), cudaHostAllocDefault);
     if (status != cudaSuccess) {
         return map_cuda_error(status);
     }
@@ -1096,20 +1018,18 @@ void cuda_free_device_buffer(void* ptr) {
 
 MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
                                     const std::array<float*, 2>& re,
-                                    const std::array<float*, 2>& im,
-                                    const CudaGridMeta& grid_meta,
-                                    std::size_t grid_plane_bytes,
-                                    std::uintptr_t stream_handle) {
+                                    const std::array<float*, 2>& im, const CudaGridMeta& grid_meta,
+                                    std::size_t grid_plane_bytes, std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const std::size_t rx_count = min_u32(grid_meta.n_rx_ant, static_cast<std::uint32_t>(re.size()));
     for (std::size_t rx = 0; rx < rx_count; ++rx) {
-        if (const cudaError_t status =
-                cudaMemcpyAsync(buffers.grid_re[rx], re[rx], grid_plane_bytes, cudaMemcpyHostToDevice, stream);
+        if (const cudaError_t status = cudaMemcpyAsync(
+                buffers.grid_re[rx], re[rx], grid_plane_bytes, cudaMemcpyHostToDevice, stream);
             status != cudaSuccess) {
             return map_cuda_error(status);
         }
-        if (const cudaError_t status =
-                cudaMemcpyAsync(buffers.grid_im[rx], im[rx], grid_plane_bytes, cudaMemcpyHostToDevice, stream);
+        if (const cudaError_t status = cudaMemcpyAsync(
+                buffers.grid_im[rx], im[rx], grid_plane_bytes, cudaMemcpyHostToDevice, stream);
             status != cudaSuccess) {
             return map_cuda_error(status);
         }
@@ -1123,10 +1043,10 @@ MmseStatus cuda_copy_grid_h2d_async(const CudaDeviceBuffers& buffers,
     }
 
     const std::size_t valid_re = min_u32(grid_meta.n_valid_re, kCudaMaxDataRe);
-    if (const cudaError_t status = cudaMemcpyAsync(
-            buffers.grid_meta, &grid_meta,
-            offsetof(CudaGridMeta, grid_indices) + valid_re * sizeof(grid_meta.grid_indices[0]),
-            cudaMemcpyHostToDevice, stream);
+    if (const cudaError_t status = cudaMemcpyAsync(buffers.grid_meta, &grid_meta,
+                                                   offsetof(CudaGridMeta, grid_indices) +
+                                                       valid_re * sizeof(grid_meta.grid_indices[0]),
+                                                   cudaMemcpyHostToDevice, stream);
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
@@ -1147,12 +1067,10 @@ MmseStatus cuda_copy_grid_meta_layout_slice_h2d_async(const CudaDeviceBuffers& b
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const std::byte* base = reinterpret_cast<const std::byte*>(&grid_meta);
     const std::size_t offset = offsetof(CudaGridMeta, n_valid_re);
-    const std::size_t bytes = offsetof(CudaGridMeta, prb_bitmap) + sizeof(grid_meta.prb_bitmap) - offset;
+    const std::size_t bytes =
+        offsetof(CudaGridMeta, prb_bitmap) + sizeof(grid_meta.prb_bitmap) - offset;
     return map_cuda_error(cudaMemcpyAsync(reinterpret_cast<std::byte*>(buffers.grid_meta) + offset,
-                                          base + offset,
-                                          bytes,
-                                          cudaMemcpyHostToDevice,
-                                          stream));
+                                          base + offset, bytes, cudaMemcpyHostToDevice, stream));
 }
 
 MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffers,
@@ -1164,30 +1082,23 @@ MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffer
     // by TD/reordered channels.
     if (cuda_uses_compact_pdcch_grid_meta(grid_meta)) {
         const std::size_t valid_re = min_u32(grid_meta.n_valid_re, kCudaMaxDataRe);
-        return map_cuda_error(cudaMemcpyAsync(
-            buffers.grid_meta, &grid_meta,
-            offsetof(CudaGridMeta, grid_indices) + valid_re * sizeof(grid_meta.grid_indices[0]),
-            cudaMemcpyHostToDevice, stream));
+        return map_cuda_error(cudaMemcpyAsync(buffers.grid_meta, &grid_meta,
+                                              offsetof(CudaGridMeta, grid_indices) +
+                                                  valid_re * sizeof(grid_meta.grid_indices[0]),
+                                              cudaMemcpyHostToDevice, stream));
     }
     const std::byte* base = reinterpret_cast<const std::byte*>(&grid_meta);
     const std::size_t header_offset = offsetof(CudaGridMeta, n_valid_re);
-    const std::size_t header_bytes =
-        offsetof(CudaGridMeta, grid_indices) - header_offset;
+    const std::size_t header_bytes = offsetof(CudaGridMeta, grid_indices) - header_offset;
     if (const cudaError_t status =
             cudaMemcpyAsync(reinterpret_cast<std::byte*>(buffers.grid_meta) + header_offset,
-                            base + header_offset,
-                            header_bytes,
-                            cudaMemcpyHostToDevice,
-                            stream);
+                            base + header_offset, header_bytes, cudaMemcpyHostToDevice, stream);
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
-    if (const cudaError_t status =
-            cudaMemcpyAsync(reinterpret_cast<std::byte*>(buffers.grid_meta) + offsetof(CudaGridMeta, grid_indices),
-                            grid_meta.grid_indices,
-                            sizeof(grid_meta.grid_indices),
-                            cudaMemcpyHostToDevice,
-                            stream);
+    if (const cudaError_t status = cudaMemcpyAsync(
+            reinterpret_cast<std::byte*>(buffers.grid_meta) + offsetof(CudaGridMeta, grid_indices),
+            grid_meta.grid_indices, sizeof(grid_meta.grid_indices), cudaMemcpyHostToDevice, stream);
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
@@ -1207,42 +1118,36 @@ MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffer
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
-    if (const cudaError_t status =
-            cudaMemcpyAsync(reinterpret_cast<std::byte*>(buffers.grid_meta) +
-                                offsetof(CudaGridMeta, output_slot_by_grid_re),
-                            grid_meta.output_slot_by_grid_re,
-                            sizeof(grid_meta.output_slot_by_grid_re),
-                            cudaMemcpyHostToDevice,
-                            stream);
+    if (const cudaError_t status = cudaMemcpyAsync(
+            reinterpret_cast<std::byte*>(buffers.grid_meta) +
+                offsetof(CudaGridMeta, output_slot_by_grid_re),
+            grid_meta.output_slot_by_grid_re, sizeof(grid_meta.output_slot_by_grid_re),
+            cudaMemcpyHostToDevice, stream);
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
     return MmseStatus::kOk;
 }
 
-MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers& buffers,
-                                      float sigma2,
+MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers& buffers, const float& sigma2,
                                       std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     return map_cuda_error(
         cudaMemcpyAsync(buffers.sigma2, &sigma2, sizeof(sigma2), cudaMemcpyHostToDevice, stream));
 }
 
-MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers,
-                                       const float* xhat_re,
-                                       const float* xhat_im,
-                                       const float* sinr,
-                                       std::size_t xhat_plane_bytes,
-                                       std::size_t sinr_plane_bytes,
+MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers, const float* xhat_re,
+                                       const float* xhat_im, const float* sinr,
+                                       std::size_t xhat_plane_bytes, std::size_t sinr_plane_bytes,
                                        std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    if (const cudaError_t status =
-            cudaMemcpyAsync(buffers.xhat_re, xhat_re, xhat_plane_bytes, cudaMemcpyHostToDevice, stream);
+    if (const cudaError_t status = cudaMemcpyAsync(buffers.xhat_re, xhat_re, xhat_plane_bytes,
+                                                   cudaMemcpyHostToDevice, stream);
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
-    if (const cudaError_t status =
-            cudaMemcpyAsync(buffers.xhat_im, xhat_im, xhat_plane_bytes, cudaMemcpyHostToDevice, stream);
+    if (const cudaError_t status = cudaMemcpyAsync(buffers.xhat_im, xhat_im, xhat_plane_bytes,
+                                                   cudaMemcpyHostToDevice, stream);
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
@@ -1254,8 +1159,7 @@ MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers,
     return MmseStatus::kOk;
 }
 
-MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
-                                     std::uintptr_t stream_handle,
+MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers, std::uintptr_t stream_handle,
                                      std::uintptr_t residual_done_event_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     if (buffers.h_estimate == nullptr || buffers.scratch == nullptr) {
@@ -1265,8 +1169,8 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
     // in one stream, so zero -> residual -> estimate -> finalize is ordered
     // without host synchronization.
     float* sigma2_accum = reinterpret_cast<float*>(buffers.scratch);
-    std::uint32_t* residual_count =
-        reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::byte*>(buffers.scratch) + sizeof(float));
+    std::uint32_t* residual_count = reinterpret_cast<std::uint32_t*>(
+        reinterpret_cast<std::byte*>(buffers.scratch) + sizeof(float));
     zero_estimate_accumulators_kernel<<<1, 1, 0, stream>>>(sigma2_accum, residual_count);
     if (const cudaError_t zero_status = cudaGetLastError(); zero_status != cudaSuccess) {
         return map_cuda_error(zero_status);
@@ -1277,9 +1181,7 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
         reinterpret_cast<const float*>(buffers.grid_re[1]),
         reinterpret_cast<const float*>(buffers.grid_im[0]),
         reinterpret_cast<const float*>(buffers.grid_im[1]),
-        reinterpret_cast<const CudaGridMeta*>(buffers.grid_meta),
-        sigma2_accum,
-        residual_count);
+        reinterpret_cast<const CudaGridMeta*>(buffers.grid_meta), sigma2_accum, residual_count);
     if (const cudaError_t residual_status = cudaGetLastError(); residual_status != cudaSuccess) {
         return map_cuda_error(residual_status);
     }
@@ -1291,10 +1193,9 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
         }
     }
 
-    const std::uint32_t total_h = kMmseV1MaxNumCrsTxPorts * kMmseV1MaxNumRxAntennas * kLteNumSymbolsNormalCp *
-                                  kLteNumSubcarriers20MHz;
-    const std::uint32_t estimate_blocks =
-        max(1U, ceil_div_u32(total_h, kEstimateThreadsPerBlock));
+    const std::uint32_t total_h = kMmseV1MaxNumCrsTxPorts * kMmseV1MaxNumRxAntennas *
+                                  kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz;
+    const std::uint32_t estimate_blocks = max(1U, ceil_div_u32(total_h, kEstimateThreadsPerBlock));
     estimate_channel_kernel<<<estimate_blocks, kEstimateThreadsPerBlock, 0, stream>>>(
         reinterpret_cast<const float*>(buffers.grid_re[0]),
         reinterpret_cast<const float*>(buffers.grid_re[1]),
@@ -1307,23 +1208,19 @@ MmseStatus cuda_launch_estimate_stub(const CudaDeviceBuffers& buffers,
     }
 
     finalize_sigma2_kernel<<<1, 1, 0, stream>>>(
-        reinterpret_cast<const CudaGridMeta*>(buffers.grid_meta),
-        sigma2_accum,
-        residual_count,
+        reinterpret_cast<const CudaGridMeta*>(buffers.grid_meta), sigma2_accum, residual_count,
         reinterpret_cast<float*>(buffers.sigma2));
     return map_cuda_error(cudaGetLastError());
 }
 
-MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers,
-                                     std::uint32_t n_valid_re,
-                                     std::uint32_t completion_value,
-                                     std::uintptr_t stream_handle) {
+MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers, std::uint32_t n_valid_re,
+                                     std::uint32_t completion_value, std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     constexpr std::uint32_t kThreadsPerBlock = 256U;
     // Launch one block even for an empty layout so the completion marker is
     // written and asynchronous callers can use the same readiness protocol.
-    const std::uint32_t blocks = (n_valid_re == 0U) ? 1U : (n_valid_re + kThreadsPerBlock - 1U) /
-                                                       kThreadsPerBlock;
+    const std::uint32_t blocks =
+        (n_valid_re == 0U) ? 1U : (n_valid_re + kThreadsPerBlock - 1U) / kThreadsPerBlock;
     equalize_stub_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
         reinterpret_cast<const float*>(buffers.grid_re[0]),
         reinterpret_cast<const float*>(buffers.grid_re[1]),
@@ -1332,12 +1229,9 @@ MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers,
         reinterpret_cast<const float*>(buffers.h_estimate),
         reinterpret_cast<const float*>(buffers.sigma2),
         reinterpret_cast<const CudaGridMeta*>(buffers.grid_meta),
-        reinterpret_cast<float*>(buffers.xhat_re),
-        reinterpret_cast<float*>(buffers.xhat_im),
-        reinterpret_cast<float*>(buffers.sinr),
-        reinterpret_cast<float*>(buffers.scratch),
-        reinterpret_cast<std::uint32_t*>(buffers.completion),
-        completion_value);
+        reinterpret_cast<float*>(buffers.xhat_re), reinterpret_cast<float*>(buffers.xhat_im),
+        reinterpret_cast<float*>(buffers.sinr), reinterpret_cast<float*>(buffers.scratch),
+        reinterpret_cast<std::uint32_t*>(buffers.completion), completion_value);
     const cudaError_t launch_status = cudaGetLastError();
     if (launch_status != cudaSuccess) {
         return MmseStatus::kInternalError;
@@ -1345,21 +1239,17 @@ MmseStatus cuda_launch_equalize_stub(const CudaDeviceBuffers& buffers,
     return MmseStatus::kOk;
 }
 
-MmseStatus cuda_copy_outputs_d2h_async(const CudaDeviceBuffers& buffers,
-                                       float* xhat_re,
-                                       float* xhat_im,
-                                       float* sinr,
-                                       std::size_t xhat_plane_bytes,
-                                       std::size_t sinr_plane_bytes,
-                                       std::uintptr_t stream_handle) {
+MmseStatus cuda_copy_outputs_d2h_async(const CudaDeviceBuffers& buffers, float* xhat_re,
+                                       float* xhat_im, float* sinr, std::size_t xhat_plane_bytes,
+                                       std::size_t sinr_plane_bytes, std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    if (const cudaError_t status =
-            cudaMemcpyAsync(xhat_re, buffers.xhat_re, xhat_plane_bytes, cudaMemcpyDeviceToHost, stream);
+    if (const cudaError_t status = cudaMemcpyAsync(xhat_re, buffers.xhat_re, xhat_plane_bytes,
+                                                   cudaMemcpyDeviceToHost, stream);
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
-    if (const cudaError_t status =
-            cudaMemcpyAsync(xhat_im, buffers.xhat_im, xhat_plane_bytes, cudaMemcpyDeviceToHost, stream);
+    if (const cudaError_t status = cudaMemcpyAsync(xhat_im, buffers.xhat_im, xhat_plane_bytes,
+                                                   cudaMemcpyDeviceToHost, stream);
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
@@ -1371,49 +1261,42 @@ MmseStatus cuda_copy_outputs_d2h_async(const CudaDeviceBuffers& buffers,
     return MmseStatus::kOk;
 }
 
-
-MmseStatus cuda_copy_estimate_d2h_async(const CudaDeviceBuffers& buffers,
-                                        float* h_estimate,
-                                        std::size_t estimate_bytes,
-                                        std::uintptr_t stream_handle) {
+MmseStatus cuda_copy_estimate_d2h_async(const CudaDeviceBuffers& buffers, float* h_estimate,
+                                        std::size_t estimate_bytes, std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    return map_cuda_error(cudaMemcpyAsync(
-        h_estimate, buffers.h_estimate, estimate_bytes, cudaMemcpyDeviceToHost, stream));
+    return map_cuda_error(cudaMemcpyAsync(h_estimate, buffers.h_estimate, estimate_bytes,
+                                          cudaMemcpyDeviceToHost, stream));
 }
 
-MmseStatus cuda_copy_sigma2_d2h_async(const CudaDeviceBuffers& buffers,
-                                      float& sigma2,
+MmseStatus cuda_copy_sigma2_d2h_async(const CudaDeviceBuffers& buffers, float& sigma2,
                                       std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     return map_cuda_error(
         cudaMemcpyAsync(&sigma2, buffers.sigma2, sizeof(sigma2), cudaMemcpyDeviceToHost, stream));
 }
 
-MmseStatus cuda_copy_scratch_d2h_async(const CudaDeviceBuffers& buffers,
-                                       float* scratch,
-                                       std::size_t scratch_bytes,
-                                       std::uintptr_t stream_handle) {
+MmseStatus cuda_copy_scratch_d2h_async(const CudaDeviceBuffers& buffers, float* scratch,
+                                       std::size_t scratch_bytes, std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    return map_cuda_error(cudaMemcpyAsync(
-        scratch, buffers.scratch, scratch_bytes, cudaMemcpyDeviceToHost, stream));
+    return map_cuda_error(
+        cudaMemcpyAsync(scratch, buffers.scratch, scratch_bytes, cudaMemcpyDeviceToHost, stream));
 }
 
 MmseStatus cuda_copy_completion_d2h_async(const CudaDeviceBuffers& buffers,
                                           std::uint32_t& completion_value,
                                           std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    return map_cuda_error(cudaMemcpyAsync(&completion_value,
-                                          buffers.completion,
-                                          sizeof(completion_value),
-                                          cudaMemcpyDeviceToHost,
+    return map_cuda_error(cudaMemcpyAsync(&completion_value, buffers.completion,
+                                          sizeof(completion_value), cudaMemcpyDeviceToHost,
                                           stream));
 }
 
-MmseStatus cuda_copy_pdcch_candidates_h2d_async(
-    const CudaDeviceBuffers& buffers, const CudaPdcchCandidateDescriptor* candidates,
-    std::uint32_t candidate_count, std::uintptr_t stream_handle) {
-    if (buffers.pdcch_candidates == nullptr || candidates == nullptr ||
-        candidate_count == 0U || candidate_count > kCudaPdcchMaxCandidates) {
+MmseStatus cuda_copy_pdcch_candidates_h2d_async(const CudaDeviceBuffers& buffers,
+                                                const CudaPdcchCandidateDescriptor* candidates,
+                                                std::uint32_t candidate_count,
+                                                std::uintptr_t stream_handle) {
+    if (buffers.pdcch_candidates == nullptr || candidates == nullptr || candidate_count == 0U ||
+        candidate_count > kCudaPdcchMaxCandidates) {
         return MmseStatus::kInvalidArgument;
     }
     return map_cuda_error(cudaMemcpyAsync(
@@ -1423,16 +1306,17 @@ MmseStatus cuda_copy_pdcch_candidates_h2d_async(
 }
 
 MmseStatus cuda_copy_pdcch_gold_words_h2d_async(const CudaDeviceBuffers& buffers,
-                                                 const std::uint32_t* gold_words,
-                                                 std::uint32_t word_count,
-                                                 std::uintptr_t stream_handle) {
+                                                const std::uint32_t* gold_words,
+                                                std::uint32_t word_count,
+                                                std::uintptr_t stream_handle) {
     if (buffers.pdcch_gold_words == nullptr || gold_words == nullptr || word_count == 0U ||
         word_count > kCudaPdcchGoldWordCount) {
         return MmseStatus::kInvalidArgument;
     }
-    return map_cuda_error(cudaMemcpyAsync(
-        buffers.pdcch_gold_words, gold_words, static_cast<std::size_t>(word_count) * sizeof(*gold_words),
-        cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream_handle)));
+    return map_cuda_error(
+        cudaMemcpyAsync(buffers.pdcch_gold_words, gold_words,
+                        static_cast<std::size_t>(word_count) * sizeof(*gold_words),
+                        cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream_handle)));
 }
 
 MmseStatus cuda_launch_pdcch_llr_descramble(const CudaDeviceBuffers& buffers, std::uint32_t n_re,
@@ -1446,7 +1330,8 @@ MmseStatus cuda_launch_pdcch_llr_descramble(const CudaDeviceBuffers& buffers, st
     const std::uint32_t blocks = ceil_div_u32(n_re * 2U, kThreads);
     pdcch_llr_descramble_kernel<<<blocks, kThreads, 0,
                                   reinterpret_cast<cudaStream_t>(stream_handle)>>>(
-        reinterpret_cast<const float*>(buffers.xhat_re), reinterpret_cast<const float*>(buffers.xhat_im),
+        reinterpret_cast<const float*>(buffers.xhat_re),
+        reinterpret_cast<const float*>(buffers.xhat_im),
         reinterpret_cast<const float*>(buffers.sinr), n_re,
         reinterpret_cast<const std::uint32_t*>(buffers.pdcch_gold_words),
         reinterpret_cast<float*>(buffers.pdcch_llrs));
@@ -1461,10 +1346,9 @@ MmseStatus cuda_launch_pdcch_rate_recovery(const CudaDeviceBuffers& buffers,
         candidate_count > kCudaPdcchMaxCandidates) {
         return MmseStatus::kInvalidArgument;
     }
-    constexpr std::uint32_t kRateRecoveryWarps =
-        (kCudaPdcchRecoveredLlrCount + 31U) / 32U;
-    pdcch_rate_recovery_kernel<<<dim3(candidate_count, kRateRecoveryWarps), 32U, 0,
-                                  reinterpret_cast<cudaStream_t>(stream_handle)>>>(
+    constexpr std::uint32_t kRateRecoveryThreads = 160U;
+    pdcch_rate_recovery_kernel<<<candidate_count, kRateRecoveryThreads, 0,
+                                 reinterpret_cast<cudaStream_t>(stream_handle)>>>(
         reinterpret_cast<const float*>(buffers.pdcch_llrs),
         reinterpret_cast<const CudaPdcchCandidateDescriptor*>(buffers.pdcch_candidates),
         candidate_count, reinterpret_cast<float*>(buffers.pdcch_recovered_llrs));
@@ -1472,15 +1356,14 @@ MmseStatus cuda_launch_pdcch_rate_recovery(const CudaDeviceBuffers& buffers,
 }
 
 MmseStatus cuda_launch_pdcch_viterbi(const CudaDeviceBuffers& buffers,
-                                    std::uint32_t candidate_count,
-                                    std::uintptr_t stream_handle) {
+                                     std::uint32_t candidate_count, std::uintptr_t stream_handle) {
     if (buffers.pdcch_recovered_llrs == nullptr || buffers.pdcch_survivors == nullptr ||
         buffers.pdcch_terminal_metrics == nullptr || candidate_count == 0U ||
         candidate_count > kCudaPdcchMaxCandidates) {
         return MmseStatus::kInvalidArgument;
     }
     pdcch_viterbi_kernel<<<dim3(candidate_count, 32U), 64U, 0,
-                              reinterpret_cast<cudaStream_t>(stream_handle)>>>(
+                           reinterpret_cast<cudaStream_t>(stream_handle)>>>(
         reinterpret_cast<const float*>(buffers.pdcch_recovered_llrs), candidate_count,
         reinterpret_cast<std::uint64_t*>(buffers.pdcch_survivors),
         reinterpret_cast<double*>(buffers.pdcch_terminal_metrics));
@@ -1488,9 +1371,8 @@ MmseStatus cuda_launch_pdcch_viterbi(const CudaDeviceBuffers& buffers,
 }
 
 MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers& buffers,
-                                        std::uint32_t candidate_count,
-                                        std::uint16_t expected_rnti,
-                                        std::uintptr_t stream_handle) {
+                                         std::uint32_t candidate_count, std::uint16_t expected_rnti,
+                                         std::uintptr_t stream_handle) {
     if (buffers.pdcch_candidates == nullptr || buffers.pdcch_survivors == nullptr ||
         buffers.pdcch_terminal_metrics == nullptr || buffers.pdcch_candidate_results == nullptr ||
         buffers.pdcch_results == nullptr || buffers.pdcch_hit_count == nullptr ||
@@ -1529,14 +1411,14 @@ MmseStatus cuda_copy_pdcch_results_d2h_async(const CudaDeviceBuffers& buffers,
         status != cudaSuccess) {
         return map_cuda_error(status);
     }
-    return map_cuda_error(cudaMemcpyAsync(
-        results, buffers.pdcch_results,
-        static_cast<std::size_t>(kCudaPdcchMaxCandidates) * sizeof(CudaPdcchCandidateResult),
-        cudaMemcpyDeviceToHost, stream));
+    return map_cuda_error(cudaMemcpyAsync(results, buffers.pdcch_results,
+                                          static_cast<std::size_t>(kCudaPdcchMaxCandidates) *
+                                              sizeof(CudaPdcchCandidateResult),
+                                          cudaMemcpyDeviceToHost, stream));
 }
 
 MmseStatus cuda_stream_synchronize(std::uintptr_t stream_handle) {
     return map_cuda_error(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream_handle)));
 }
 
-}  // namespace mmse::detail
+} // namespace mmse::detail

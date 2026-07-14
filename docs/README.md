@@ -32,5 +32,6 @@
 
 ## 性能与预算报告
 
+- [PDCCH CPU/GPU 性能对比分析（2026-07-14）](G:\MMSE_CPP\docs\pdcch_cpu_gpu_performance_analysis_2026-07-14.md)
 - [MMSE CUDA Profiling 报告（2026-07-03）](G:\MMSE_CPP\docs\mmse_cuda_profile_report_2026-07-03.md)
 - [LTE MMSE 预算报告 (2026-07-01)](G:\MMSE_CPP\docs\lte_mmse_budget_report_2026-07-01.md)
