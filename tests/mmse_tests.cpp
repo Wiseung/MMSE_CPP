@@ -4659,7 +4659,7 @@ void test_pdcch_gpu_common_search_decode_matches_cpu_and_rejects_callbacks() {
         2U * static_cast<std::uint64_t>(input.grid.n_rx_ant) * mmse::detail::kCudaMaxGridRe *
             sizeof(float) +
         offsetof(mmse::detail::CudaGridMeta, grid_indices) +
-        static_cast<std::uint64_t>(n_source_re) * sizeof(std::uint16_t) +
+        static_cast<std::uint64_t>(n_source_re) * sizeof(std::uint16_t) + sizeof(float) +
         static_cast<std::uint64_t>(gpu_result.candidate_count) *
             sizeof(mmse::detail::CudaPdcchCandidateDescriptor) +
         static_cast<std::uint64_t>((n_source_re * 2U + 31U) / 32U) * sizeof(std::uint32_t);
@@ -4887,7 +4887,7 @@ void test_pdcch_gpu_common_search_two_tx_matches_cpu() {
     const std::uint64_t expected_h2d_bytes =
         2U * static_cast<std::uint64_t>(input.grid.n_rx_ant) * mmse::detail::kCudaMaxGridRe *
             sizeof(float) +
-        sizeof(mmse::detail::CudaGridMeta) +
+        sizeof(mmse::detail::CudaGridMeta) + sizeof(float) +
         static_cast<std::uint64_t>(gpu_result.candidate_count) *
             sizeof(mmse::detail::CudaPdcchCandidateDescriptor) +
         static_cast<std::uint64_t>((n_source_re * 2U + 31U) / 32U) * sizeof(std::uint32_t);
@@ -5615,6 +5615,37 @@ void test_gpu_context_device_owned_sigma2_tracks_cell_id() {
     expect_true(device_gpu.run(clean_grid0, desc0, device_out) == MmseStatus::kOk,
                 "device-owned clean cell0");
     expect_gpu_matches_cpu_samples(desc0, device_out, host_out, "device-owned cell0");
+#endif
+}
+
+void test_gpu_context_destructor_releases_cuda_runtime_state() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuConfig config{};
+    config.backend = MmseGpuBackend::kCuda;
+    config.stream_count = 4U;
+
+    {
+        MmseEqualizerGpuContext warmup;
+        expect_true(warmup.init(config) == MmseStatus::kOk, "gpu destructor warmup init");
+    }
+
+    std::size_t free_before = 0U;
+    std::size_t total_before = 0U;
+    expect_true(mmse::detail::cuda_query_current_memory_info(free_before, total_before) ==
+                    MmseStatus::kOk,
+                "gpu destructor memory baseline");
+    for (std::uint32_t iteration = 0U; iteration < 4U; ++iteration) {
+        MmseEqualizerGpuContext context;
+        expect_true(context.init(config) == MmseStatus::kOk, "gpu destructor repeated init");
+    }
+    std::size_t free_after = 0U;
+    std::size_t total_after = 0U;
+    expect_true(mmse::detail::cuda_query_current_memory_info(free_after, total_after) ==
+                    MmseStatus::kOk,
+                "gpu destructor memory result");
+    constexpr std::size_t kAllocatorToleranceBytes = 8U * 1024U * 1024U;
+    expect_true(total_after == total_before && free_after + kAllocatorToleranceBytes >= free_before,
+                "gpu destructor must release per-slot CUDA allocations");
 #endif
 }
 
@@ -6381,6 +6412,8 @@ int main() {
         std::pair{"gpu_context_sigma2_state_persists", &test_gpu_context_sigma2_state_persists},
         std::pair{"gpu_context_host_owned_and_device_owned_sigma2_match_samples",
                   &test_gpu_context_host_owned_and_device_owned_sigma2_match_samples},
+        std::pair{"gpu_context_destructor_releases_cuda_runtime_state",
+                  &test_gpu_context_destructor_releases_cuda_runtime_state},
         std::pair{"gpu_context_device_owned_sigma2_state_persists",
                   &test_gpu_context_device_owned_sigma2_state_persists},
         std::pair{"gpu_context_device_owned_sigma2_tracks_cell_id",

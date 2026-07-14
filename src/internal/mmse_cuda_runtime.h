@@ -27,15 +27,14 @@ inline constexpr std::uint32_t kCudaPdcchCodewordBitCount = 44U;
 inline constexpr std::uint32_t kCudaPdcchRecoveredLlrCount = 3U * kCudaPdcchCodewordBitCount;
 inline constexpr std::uint32_t kCudaPdcchGoldWordCount = (2U * kCudaMaxDataRe + 31U) / 32U;
 
-// Compact descriptor copied once per candidate. The collection-slot map folds
-// the LTE rate-matching/interleaver inverse into the GPU rate-recovery kernel.
+// Compact descriptor copied once per candidate. Rate-recovery offsets are
+// common to every supported DCI 1A candidate and live in device constant data.
 struct CudaPdcchCandidateDescriptor {
     std::uint32_t candidate_id = 0U;
     std::uint16_t first_cce = 0U;
     std::uint8_t aggregation_level = 0U;
     std::uint8_t reserved = 0U;
     std::uint32_t encoded_bit_count = 0U;
-    std::uint8_t rate_recovery_collection_slots[kCudaPdcchRecoveredLlrCount]{};
 };
 
 struct CudaPdcchCandidateResult {
@@ -197,7 +196,7 @@ MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffer
                                                  const CudaGridMeta& grid_meta,
                                                  std::uintptr_t stream_handle);
 
-MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers& buffers, float sigma2,
+MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers& buffers, const float& sigma2,
                                       std::uintptr_t stream_handle);
 
 MmseStatus cuda_copy_outputs_h2d_async(const CudaDeviceBuffers& buffers, const float* xhat_re,

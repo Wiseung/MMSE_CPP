@@ -107,7 +107,7 @@ MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers&, const
     return MmseStatus::kUnsupportedConfig;
 }
 
-MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers&, float, std::uintptr_t) {
+MmseStatus cuda_copy_sigma2_h2d_async(const CudaDeviceBuffers&, const float&, std::uintptr_t) {
     return MmseStatus::kUnsupportedConfig;
 }
 
