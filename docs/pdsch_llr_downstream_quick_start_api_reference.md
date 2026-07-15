@@ -28,6 +28,11 @@
 - 调用方持有 `LLR` buffer 的 caller-owned 输出面
 - 显式 `PdschDescramblingPlanCache`，用于复用同一 `(cell_id, rnti, sfn_subframe, codeword, llr_count)` 的 scrambling bits
 
+它可接收两类上游 PDSCH 均衡结果：
+
+- 通用 `run(...)` 写入的 `EqualizerOutputView`
+- `run_pdsch_td(...)` 写入的单层 `PdschTdMmseOutputView`，通过下面的轻量 view 适配器接入
+
 当前 `PDSCH` 下游 helper 不提供：
 
 - 速率恢复
@@ -42,6 +47,40 @@
 **equalized `PDSCH` soft symbol / `SINR` -> 解扰后的 `LLR`**
 
 而不是完整 `PDSCH` 译码链。
+
+## `2Tx` 发射分集上游接入
+
+对于 `channel_type == kPdsch`、`n_tx_ports == 2`、`n_layers == 1`、`tx_mode == 2`、
+`pmi == -1` 的组合，调用方必须先执行 `run_pdsch_td(...)`，不能调用通用 `run(...)`。
+
+`PdschTdMmseOutputView` 的软符号平面可零拷贝适配为单层 `EqualizerOutputView`，再复用本页的
+LLR / 解扰 helper：
+
+```cpp
+mmse::PdschTdMmseOutputView td_out = ...;
+mmse::PdschTdMmseResult td_meta{};
+
+const mmse::MmseStatus td_status =
+    ctx.run_pdsch_td(grid, desc, td_out, td_meta);
+if (td_status != mmse::MmseStatus::kOk) {
+    return;
+}
+
+mmse::EqualizerOutputView eq_out{};
+eq_out.x_hat_re = td_out.x_hat_re;
+eq_out.x_hat_im = td_out.x_hat_im;
+eq_out.sinr = td_out.sinr;
+eq_out.capacity_re_per_layer = td_out.capacity_symbols;
+eq_out.n_re_per_layer = td_meta.n_symbols;
+eq_out.n_layers = 1U;
+eq_out.mod_order = td_meta.mod_order;
+
+const auto backend =
+    mmse::pdsch::make_backend_pdsch_descrambled_llr_indication(desc, eq_out, rnti);
+```
+
+`re_grid_indices0 / re_grid_indices1` 不参与 LLR 计算，但应与下游日志或调度上下文一起保留，
+以便回溯每两个连续软符号的 Alamouti 来源 RE 对。
 
 ## 推荐用法
 
@@ -237,6 +276,8 @@ BackendPdschDescrambledLlrIndication make_backend_pdsch_descrambled_llr_indicati
 当前 helper 约束：
 
 - 输入必须已经是 equalized `PDSCH` 输出
+- `2Tx + 1 layer + TM2` 的上游输出必须来自 `run_pdsch_td(...)`；适配为 `EqualizerOutputView`
+  时固定 `n_layers == 1`
 - `mod_order` 仅支持 `2 / 4 / 6 / 8`
 - `capacity_re_per_layer >= n_re_per_layer`
 - caller-owned 输出面要求 `capacity_llrs >= n_layers * n_re_per_layer * mod_order`

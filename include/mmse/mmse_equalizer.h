@@ -25,6 +25,8 @@ class MmseEqualizerCpuContext {
     // writes equalized symbols in the layer-major layout of EqualizerOutputView.
     MmseStatus run(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                    EqualizerOutputView& out);
+    MmseStatus run_pdsch_td(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
+                            PdschTdMmseOutputView& out, PdschTdMmseResult& meta);
     MmseStatus run_pbch(const PbchMmseInput& in, PbchMmseOutputView& out, PbchMmseResult& meta);
     MmseStatus run_pbch_td(const PbchMmseInput& in, PbchTdMmseOutputView& out,
                            PbchTdMmseResult& meta);
@@ -54,6 +56,8 @@ class MmseEqualizerGpuContext {
     // stream path and preserves the same output contract as the CPU context.
     MmseStatus run(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
                    EqualizerOutputView& out);
+    MmseStatus run_pdsch_td(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
+                            PdschTdMmseOutputView& out, PdschTdMmseResult& meta);
     MmseStatus run_pbch(const PbchMmseInput& in, PbchMmseOutputView& out, PbchMmseResult& meta);
     MmseStatus run_pbch_td(const PbchMmseInput& in, PbchTdMmseOutputView& out,
                            PbchTdMmseResult& meta);

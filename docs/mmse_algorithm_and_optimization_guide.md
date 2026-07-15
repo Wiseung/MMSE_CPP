@@ -29,6 +29,7 @@
 - `PCFICH` 的 `run_pcfich(...)`
 - `PDCCH` 的 `run_pdcch(...)`
 - `2 Tx port PDCCH transmit-diversity` 的 `run_pdcch_td(...)`
+- `2 Tx port PDSCH transmit-diversity` 的 `run_pdsch_td(...)`
 
 对应公开运行时类型在 [include/mmse/mmse_equalizer.h](G:\MMSE_CPP\include\mmse\mmse_equalizer.h)。
 
@@ -67,7 +68,8 @@ MmseStatus run(const PlanarGridViewF32& grid,
                EqualizerOutputView& out);
 ```
 
-其上又包装出 `PBCH / PCFICH / PDCCH / PDCCH-TD` 的专用 DTO 入口。
+其上又包装出 `PBCH / PCFICH / PDCCH / PDCCH-TD` 的专用 DTO 入口，并为 `PDSCH`
+提供 `run_pdsch_td(...)` 的专用 TD 输出面。
 
 这里最重要的设计点有两个。
 
@@ -139,6 +141,15 @@ MmseStatus run(const PlanarGridViewF32& grid,
 - 从 `start_symbol` 开始
 - 按 PRB bitmap 遍历资源
 - 跳过 CRS RE
+
+对于 `2Tx + 1 layer + TM2` 的 PDSCH TD 路径，布局还必须满足以下配对规则：
+
+- CRS 已同时按 port 0/1 的位置排除
+- 相邻输出 RE 按 `(2k, 2k+1)` 配对
+- 每个配对必须位于同一 OFDM symbol
+
+当前 `run_pdsch_td(...)` 在建立 RE 对后显式验证上述同 symbol 约束；若布局不满足成对
+条件则返回不支持配置，而不会退化为只使用 port 0 的单层均衡。
 
 `PDCCH` 使用 `build_pdcch_re_layout(...)`：
 
@@ -361,25 +372,32 @@ gamma = g / (1 - g)
 
 这也是为什么本项目的输出契约始终是“equalized symbol + SINR”，而不是只给 complex symbol。
 
-## 9. PDCCH 2 Tx transmit-diversity 的处理
+## 9. 2 Tx transmit-diversity 的处理
 
-`PDCCH` 的 2 发端口场景并不是简单套用普通 `2x2 / 2 layer` 路径，因为这里是 transmit diversity，而不是双层 spatial multiplexing。
+`PDCCH` 和 `PDSCH` 的 2 发端口发射分集场景都不能简单套用普通 `2x2 / 2 layer` 路径，
+因为这里是 transmit diversity，而不是双层 spatial multiplexing。
 
-当前 CPU 路径通过：
+当前 CPU 路径复用以下组件：
 
-- `build_pdcch_td_re_pairs(...)`
-- `demap_pdcch_transmit_diversity_from_grid(...)`
+- `build_transmit_diversity_re_pairs(...)`
+- `demap_transmit_diversity_from_grid(...)`
+- `equalize_transmit_diversity_pairs(...)`
 - `run_pdcch_td(...)`
+- `run_pdsch_td(...)`
 
-把同一个 TD 对偶 RE 成对处理。
+它把同一 OFDM symbol 的两个 RE 成对处理。对每个 RX，第二个 RE 取共轭并与两端口的
+信道估计一起构成四行虚拟观测；随后求解联合 `2x2` MMSE，直接恢复该 Alamouti 对的两个软符号。
+这既利用了 port 0/1 的两组 CRS 信道估计，也避免了“两次独立均衡后再做经验加权”带来的模型偏差。
 
-GPU 路径在 `equalize_stub_kernel` 里也有单独分支：
+GPU 路径在 `equalize_stub_kernel` 中同样通过 `td_pair_count` 进入同一类联合解调分支：
 
-- 识别 `td_pdcch_mode`
-- 判断 `is_pdcch_td_pair_start(...)`
-- 对一对 RE 一次性写出两个符号
+- 读取每对 RE 的 `td_pair_grid_indices0 / td_pair_grid_indices1`
+- 对一对 RE 一次性写出两个软符号
+- 按 CPU 相同顺序返回连续输出和重复的 RE 对索引
 
-这说明当前项目不是把所有 LTE 场景都硬塞进一个统一数学内核，而是对协议上本质不同的模式做了专门分支。
+通用 `run(...)` 只保留 `1Tx` 单层和 `2Tx + 2 layer` 空间复用语义；它会拒绝
+`PDSCH + 2Tx + 1 layer + TM2`，由 `run_pdsch_td(...)` 独占该发射分集契约。这样 CPU、
+GPU 和 GPU `kAuto` 回退路径不会因后端不同而得到不同物理含义。
 
 ## 10. CPU 实现结构与优化
 

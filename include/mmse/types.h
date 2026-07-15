@@ -212,6 +212,17 @@ struct PcfichTdMmseOutputView {
     std::uint32_t capacity_symbols = 0;
 };
 
+// One transmit-diversity output sequence. Adjacent symbols are recovered from
+// the paired source REs referenced by re_grid_indices0/re_grid_indices1.
+struct PdschTdMmseOutputView {
+    float* x_hat_re = nullptr;
+    float* x_hat_im = nullptr;
+    float* sinr = nullptr;
+    std::uint16_t* re_grid_indices0 = nullptr;
+    std::uint16_t* re_grid_indices1 = nullptr;
+    std::uint32_t capacity_symbols = 0;
+};
+
 struct PbchMmseResult {
     std::uint32_t n_re = 0;
     std::uint32_t sfn_subframe = 0;
@@ -321,6 +332,25 @@ struct PcfichTdMmseResult {
     std::uint8_t mod_order = 0;
     float sigma2 = 0.0F;
     PcfichChainMetadata chain{};
+};
+
+struct PdschTdMmseResult {
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_source_re = 0;
+    std::uint32_t sfn_subframe = 0;
+    std::uint32_t grid_symbol_count = 0;
+    std::uint32_t grid_subcarrier_count = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t start_symbol = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t mod_order = 0;
+    std::int8_t pmi = -1;
+    float sigma2 = 0.0F;
+    std::array<std::uint16_t, 7> prb_bitmap{};
 };
 
 // Numerical safeguards and execution policy for the CPU MMSE runtime.

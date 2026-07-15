@@ -58,6 +58,24 @@ bool pack_transmit_diversity_pairs(const detail::ReLayout& layout,
     return true;
 }
 
+bool is_pdsch_transmit_diversity_descriptor(const ExtractDescriptor& desc) {
+    return desc.channel_type == MmseChannelType::kPdsch && desc.n_tx_ports == 2U &&
+           desc.n_layers == 1U && desc.tx_mode == 2U && desc.pmi == -1;
+}
+
+bool transmit_diversity_pairs_stay_in_one_symbol(const detail::CudaGridMeta& grid_meta) {
+    if (grid_meta.n_subcarriers == 0U) {
+        return false;
+    }
+    for (std::uint32_t pair = 0U; pair < grid_meta.td_pair_count; ++pair) {
+        if (grid_meta.td_pair_grid_indices0[pair] / grid_meta.n_subcarriers !=
+            grid_meta.td_pair_grid_indices1[pair] / grid_meta.n_subcarriers) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::uint32_t populate_pdcch_gold_words(std::uint16_t cell_id, std::uint32_t sfn_subframe,
                                         std::uint32_t n_re, std::uint32_t* words) {
     const std::uint32_t bit_count = n_re * 2U;
@@ -1778,6 +1796,9 @@ MmseStatus MmseEqualizerGpuContext::run(const PlanarGridViewF32& grid,
     if (!detail::descriptor_supported(desc)) {
         return MmseStatus::kUnsupportedConfig;
     }
+    if (is_pdsch_transmit_diversity_descriptor(desc)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
     if (const MmseStatus status = impl_->prepare_subframe_if_needed(grid, desc);
         status != MmseStatus::kOk) {
         return status;
@@ -1788,6 +1809,63 @@ MmseStatus MmseEqualizerGpuContext::run(const PlanarGridViewF32& grid,
     if (const MmseStatus status = impl_->stage_outputs(out); status != MmseStatus::kOk) {
         return status;
     }
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerGpuContext::run_pdsch_td(const PlanarGridViewF32& grid,
+                                                 const ExtractDescriptor& desc,
+                                                 PdschTdMmseOutputView& out,
+                                                 PdschTdMmseResult& meta) {
+    if (!impl_->initialized) {
+        return MmseStatus::kNotInitialized;
+    }
+    if (!is_pdsch_transmit_diversity_descriptor(desc) || !detail::descriptor_supported(desc)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (out.x_hat_re == nullptr || out.x_hat_im == nullptr || out.sinr == nullptr ||
+        out.re_grid_indices0 == nullptr || out.re_grid_indices1 == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+    if (impl_->config.backend == MmseGpuBackend::kAuto) {
+        return impl_->cpu_fallback.run_pdsch_td(grid, desc, out, meta);
+    }
+
+    EqualizerOutputView base_out{out.x_hat_re, out.x_hat_im, out.sinr, out.capacity_symbols};
+    if (const MmseStatus status = impl_->run_transmit_diversity(grid, desc, base_out);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    const auto& slot = impl_->buffers.slots[impl_->buffers.completed_slot];
+    if (slot.grid_meta.td_pair_count * 2U != base_out.n_re_per_layer ||
+        !transmit_diversity_pairs_stay_in_one_symbol(slot.grid_meta)) {
+        return MmseStatus::kInternalError;
+    }
+    for (std::uint32_t pair = 0U; pair < slot.grid_meta.td_pair_count; ++pair) {
+        const std::uint32_t index = pair * 2U;
+        const std::uint16_t grid0 = slot.grid_meta.td_pair_grid_indices0[pair];
+        const std::uint16_t grid1 = slot.grid_meta.td_pair_grid_indices1[pair];
+        out.re_grid_indices0[index] = out.re_grid_indices0[index + 1U] = grid0;
+        out.re_grid_indices1[index] = out.re_grid_indices1[index + 1U] = grid1;
+    }
+
+    meta = {};
+    meta.n_symbols = base_out.n_re_per_layer;
+    meta.n_source_re = base_out.n_re_per_layer;
+    meta.sfn_subframe = desc.sfn_subframe;
+    meta.grid_symbol_count = grid.n_symbols;
+    meta.grid_subcarrier_count = grid.n_subcarriers;
+    meta.cell_id = desc.cell_id;
+    meta.n_prb = desc.n_prb;
+    meta.start_symbol = desc.start_symbol;
+    meta.n_tx_ports = desc.n_tx_ports;
+    meta.n_rx_ant = desc.n_rx_ant;
+    meta.n_layers = desc.n_layers;
+    meta.tx_mode = desc.tx_mode;
+    meta.mod_order = desc.mod_order;
+    meta.pmi = desc.pmi;
+    meta.sigma2 = slot.grid_meta.sigma2;
+    meta.prb_bitmap = desc.prb_bitmap;
     return MmseStatus::kOk;
 }
 
@@ -2129,7 +2207,7 @@ MmseStatus MmseEqualizerGpuContext::run_pdcch_td(const PdcchMmseInput& in,
         return status;
     }
     if (in.n_prb != kLteNumPrb20MHz || in.control_symbol_count > kLteMaxControlSymbolsNormalCp ||
-        in.n_tx_ports != 2U) {
+        in.n_tx_ports != 2U || in.tx_mode != 2U) {
         return MmseStatus::kUnsupportedConfig;
     }
     if (impl_->config.backend == MmseGpuBackend::kAuto) {

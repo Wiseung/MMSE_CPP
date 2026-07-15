@@ -141,6 +141,7 @@
   - caller-owned `LLR` 输出面
 - `PDCCH` 场景下对 `PCFICH / PHICH` 占用资源的排除
 - `PDCCH 2Tx` 发射分集去映射
+- `PDSCH 2Tx + 1 layer + TM2` 发射分集去映射
 - `PDCCH` 的 `REG / CCE` 恢复 helper
 - `PDCCH common search` 与 UE-specific 候选构造、`L=1/2/4/8` 速率恢复、`CRC-RNTI` 与 `DCI 1A` 解析 helper
 - 默认内建尾咬卷积码译码的正式 CPU common-search 与 UE-specific `DCI 1A` 链路，可由外部回调覆盖
@@ -170,7 +171,7 @@
 
 ## 四、当前工程代码的公开输出面
 
-### 1. 通用 PDSCH 均衡输出
+### 1. 通用 PDSCH 空间复用均衡输出
 
 输入：
 
@@ -187,7 +188,48 @@
 - `n_layers`
 - `mod_order`
 
-### 1.1 PDSCH 下游 LLR / 解扰 helper 输出
+该入口用于 `1Tx` 单层或 `2Tx + 2 layer` 空间复用。对于 `PDSCH + 2Tx + 1 layer + TM2`，
+通用 `run(...)` 会返回不支持配置，调用方必须改用下面的 TD 专用输出面。
+
+### 1.1 PDSCH 2Tx 发射分集输出
+
+_该流程展示单一输入网格如何同时利用 port 0/1 的 CRS 信道估计，通过 Alamouti 联合 MMSE
+恢复一组连续 PDSCH 软符号。_
+
+```mermaid
+flowchart LR
+    accTitle: PDSCH TD Equalization Flow
+    accDescr: A single LTE grid produces port zero and port one CRS channel estimates, pairs same-symbol data resource elements, and performs joint Alamouti MMSE demapping into one soft-symbol output sequence.
+
+    input_grid[📥 输入 LTE 网格] --> crs_estimate[⚙️ 两组 CRS 信道估计]
+    crs_estimate --> data_layout[📋 排除 CRS 的 PDSCH RE 布局]
+    data_layout --> re_pairs[🔗 同 symbol Alamouti RE 对]
+    re_pairs --> joint_mmse[⚙️ 联合 MMSE 去分集]
+    joint_mmse --> td_output[📤 单层软符号、SINR 与 RE 对索引]
+```
+
+输入：
+
+- `PlanarGridViewF32`
+- `ExtractDescriptor`，且 `channel_type == kPdsch`、`n_tx_ports == 2`、
+  `n_layers == 1`、`tx_mode == 2`、`pmi == -1`
+
+输出：
+
+- `PdschTdMmseOutputView`
+- `PdschTdMmseResult`
+- `x_hat_re / x_hat_im / sinr`
+- `re_grid_indices0 / re_grid_indices1`
+
+入口：
+
+- `MmseEqualizerCpuContext::run_pdsch_td(...)`
+- `MmseEqualizerGpuContext::run_pdsch_td(...)`
+
+该输出不是两份独立均衡矩阵的经验加权。它对每对 RE 构造联合 Alamouti 观测并一次求解两个
+软符号；连续输出中的 `2k` 与 `2k+1` 元素共享同一对来源 RE 索引。
+
+### 1.2 PDSCH 下游 LLR / 解扰 helper 输出
 
 输入：
 

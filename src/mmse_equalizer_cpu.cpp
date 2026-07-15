@@ -1053,6 +1053,21 @@ bool build_transmit_diversity_re_pairs(const ReLayout& layout,
     return true;
 }
 
+bool pairs_stay_in_one_symbol(const std::vector<TransmitDiversityRePair>& pairs,
+                              std::uint32_t n_subcarriers) {
+    if (n_subcarriers == 0U) {
+        return false;
+    }
+    return std::all_of(pairs.begin(), pairs.end(), [n_subcarriers](const auto& pair) {
+        return pair.grid_index0 / n_subcarriers == pair.grid_index1 / n_subcarriers;
+    });
+}
+
+bool is_pdsch_transmit_diversity_descriptor(const ExtractDescriptor& desc) {
+    return desc.channel_type == MmseChannelType::kPdsch && desc.n_tx_ports == 2U &&
+           desc.n_layers == 1U && desc.tx_mode == 2U && desc.pmi == -1;
+}
+
 detail::TransmitDiversityEqualizePair
 demap_transmit_diversity_from_grid(const HGridStorage& h_full, const PlanarGridViewF32& grid,
                                    std::uint16_t grid_index0, std::uint16_t grid_index1,
@@ -1356,6 +1371,9 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
     if (!detail::descriptor_supported(desc)) {
         return MmseStatus::kUnsupportedConfig;
     }
+    if (is_pdsch_transmit_diversity_descriptor(desc)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
 
     float sigma2 = 0.0F;
     if (const MmseStatus status = impl_->prepare_subframe_if_needed(grid, desc, sigma2);
@@ -1363,6 +1381,66 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
         return status;
     }
     return impl_->run_channel_from_prepared_estimate(grid, desc, out, sigma2);
+}
+
+MmseStatus MmseEqualizerCpuContext::run_pdsch_td(const PlanarGridViewF32& grid,
+                                                 const ExtractDescriptor& desc,
+                                                 PdschTdMmseOutputView& out,
+                                                 PdschTdMmseResult& meta) {
+    if (!impl_->initialized) {
+        return MmseStatus::kNotInitialized;
+    }
+    if (!is_pdsch_transmit_diversity_descriptor(desc) || !detail::descriptor_supported(desc)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (const MmseStatus status = detail::validate_grid(grid, &desc); status != MmseStatus::kOk) {
+        return status;
+    }
+    if (out.x_hat_re == nullptr || out.x_hat_im == nullptr || out.sinr == nullptr ||
+        out.re_grid_indices0 == nullptr || out.re_grid_indices1 == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    float sigma2 = 0.0F;
+    if (const MmseStatus status = impl_->prepare_subframe_if_needed(grid, desc, sigma2);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    const std::uint32_t n_source_re = detail::build_data_re_layout(desc, impl_->layout);
+    std::vector<TransmitDiversityRePair> pairs{};
+    if (!build_transmit_diversity_re_pairs(impl_->layout, pairs) ||
+        !pairs_stay_in_one_symbol(pairs, grid.n_subcarriers)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    const std::uint32_t n_symbols = static_cast<std::uint32_t>(pairs.size() * 2U);
+    if (const MmseStatus status = equalize_transmit_diversity_pairs(
+            impl_->h_full, grid, pairs, sigma2, impl_->config.det_floor, impl_->config.g_min,
+            impl_->config.gamma_max, out.x_hat_re, out.x_hat_im, out.sinr, out.re_grid_indices0,
+            out.re_grid_indices1, out.capacity_symbols);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    meta = {};
+    meta.n_symbols = n_symbols;
+    meta.n_source_re = n_source_re;
+    meta.sfn_subframe = desc.sfn_subframe;
+    meta.grid_symbol_count = grid.n_symbols;
+    meta.grid_subcarrier_count = grid.n_subcarriers;
+    meta.cell_id = desc.cell_id;
+    meta.n_prb = desc.n_prb;
+    meta.start_symbol = desc.start_symbol;
+    meta.n_tx_ports = desc.n_tx_ports;
+    meta.n_rx_ant = desc.n_rx_ant;
+    meta.n_layers = desc.n_layers;
+    meta.tx_mode = desc.tx_mode;
+    meta.mod_order = desc.mod_order;
+    meta.pmi = desc.pmi;
+    meta.sigma2 =
+        detail::peek_sigma2_state(impl_->sigma2_by_cell[desc.cell_id], impl_->config.sigma2_min);
+    meta.prb_bitmap = desc.prb_bitmap;
+    return MmseStatus::kOk;
 }
 
 MmseStatus MmseEqualizerCpuContext::run_pbch(const PbchMmseInput& in, PbchMmseOutputView& out,
@@ -1705,7 +1783,7 @@ MmseStatus MmseEqualizerCpuContext::run_pdcch_td(const PdcchMmseInput& in,
         status != MmseStatus::kOk) {
         return status;
     }
-    if (in.n_tx_ports != 2U) {
+    if (in.n_tx_ports != 2U || in.tx_mode != 2U) {
         return MmseStatus::kUnsupportedConfig;
     }
     if (out.x_hat_re == nullptr || out.x_hat_im == nullptr || out.sinr == nullptr ||

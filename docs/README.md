@@ -16,6 +16,7 @@
 - [PBCH 快速开始](G:\MMSE_CPP\docs\pbch_chain_sdk_quick_start.md)
 - [PCFICH 快速开始与 API 参考](G:\MMSE_CPP\docs\pcfich_chain_sdk_quick_start_api_reference.md)
 - [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](G:\MMSE_CPP\docs\pdsch_llr_downstream_quick_start_api_reference.md)
+  包含通用空间复用与 `2Tx` transmit-diversity 均衡输出接入下游 `LLR` helper 的方式。
 
 ## PDCCH SDK 子页面
 
