@@ -27,6 +27,7 @@
 - 直接返回 `std::vector<float>` 的后端 DTO builder
 - 调用方持有 `LLR` buffer 的 caller-owned 输出面
 - 显式 `PdschDescramblingPlanCache`，用于复用同一 `(cell_id, rnti, sfn_subframe, codeword, llr_count)` 的 scrambling bits
+- `PdschGrantV1 -> ExtractDescriptor` 适配器，用于消费已命中的 localized DCI 1A
 
 它可接收两类上游 PDSCH 均衡结果：
 
@@ -39,7 +40,6 @@
 - `HARQ` 软合并
 - `Turbo` 译码
 - `MAC PDU` 解析
-- 仓库内置的真实 `PDSCH` 下游 context / grant context / decode context
 - 隐藏的全局 cache
 
 也就是说，这一层仍然只是：
@@ -47,6 +47,26 @@
 **equalized `PDSCH` soft symbol / `SINR` -> 解扰后的 `LLR`**
 
 而不是完整 `PDSCH` 译码链。
+
+## 从 PDCCH Grant 接入
+
+若上游已经通过 `make_pdsch_grant_v1(...)` 得到 `PdschGrantV1`，使用
+`make_pdsch_extract_descriptor_v1(...)` 生成 equalizer descriptor：
+
+```cpp
+mmse::handoff::PdschGrantV1 grant = get_pdsch_grant();
+mmse::ExtractDescriptor desc{};
+if (mmse::handoff::make_pdsch_extract_descriptor_v1(grant, n_rx_ant, desc) !=
+    mmse::MmseStatus::kOk) {
+    return;
+}
+
+// 1Tx/TM1 调用 run(...)；2Tx/TM2/单层调用 run_pdsch_td(...).
+```
+
+Grant 自有原始 DCI payload 和物理 PRB 位图，不引用 PDCCH 命中对象。`rnti`、`codeword`、
+`start_symbol` 和 `modulation_order` 可继续用于本页的 LLR/解扰 helper。完整交接契约见
+[PDCCH→PDSCH 交接 SDK V1](pdcch_pdsch_handoff_sdk_v1.md)。
 
 ## `2Tx` 发射分集上游接入
 

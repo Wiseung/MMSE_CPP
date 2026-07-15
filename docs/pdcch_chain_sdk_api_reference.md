@@ -480,6 +480,8 @@ helper 打包得到的正式下游 owning DTO。
 | `PdcchTailBitingConvolutionalDecoder` | 可选外部尾咬卷积码覆盖器                   | 未设置时使用内建 `64-state` 尾咬 Viterbi                     |
 | `PdcchDciFormat1AConfig`              | `DCI 1A` 解析配置                          | FDD/no-CIF支持 6/15/25/50/75/100 RB；其它组合仍限 100 RB     |
 | `PdcchDciFormat1ADecodeResult`        | `CRC-RNTI + DCI 1A` 校验与解析结果         | 只有 `matched == true` 才表示命中                            |
+| `PdcchPdschHandoffConfigV1`           | DCI 1A 到 PDSCH 的外部 PHY 上下文          | 首版只支持单层、单码字、TM1 或 TM2                           |
+| `PdschGrantV1`                        | PDSCH 可直接消费的 host-owned Grant        | 仅 localized DCI 1A；失败时输出清零                          |
 | `PdcchCommonSearchDecodeConfig`       | 正式 CPU `common search DCI 1A` 入口配置   | `decoder.decode` 可选；默认内建 Viterbi                      |
 | `PdcchSiRntiSearchConfig`             | 固定 SI-RNTI 搜索入口配置                  | 仅允许外部 decoder 覆盖                                      |
 | `PdcchSiRntiSearchResult`             | 固定 SI-RNTI 搜索输出                      | 返回全部命中及其 `first_cce`                                 |
@@ -490,6 +492,13 @@ helper 打包得到的正式下游 owning DTO。
 | `PdcchSiRntiGeometrySearchRequest`    | 未知几何 SI-RNTI 搜索输入                  | CPU 支持 6/15/25/50/75/100 RB、FDD、normal CP                |
 | `PdcchSiRntiGeometrySearchCache`      | 调用方持有的几何锁定 cache                 | PCI、端口、发射模式、带宽或子帧类型变化时失效                |
 | `PdcchSiRntiGeometrySearchResult`     | 未知几何搜索诊断和命中                     | 状态为 `kAcquired/kLocked/kMiss/kAmbiguous`                  |
+
+`PdcchDciFormat1A` 对末尾字段使用显式有效性标志：
+
+- SI-RNTI：5 位字段按 `transport_block_size_index` 解释，`n_prb_1a_valid == true`；`NDI/TPC` 无效
+- C-RNTI：5 位字段按 `MCS` 解释，并派生 `transport_block_size_index`；`new_data_indicator_valid` 与 `transmit_power_control_valid` 为真
+- FDD 下 `downlink_assignment_index_valid == false`；TDD 下 DAI 才有效
+- `mcs_tbs_index` 保留原始 5 位值用于兼容，调用方必须结合 `rnti_type` 和有效性标志解释
 
 ## 3. 基础网格类型
 
@@ -729,6 +738,22 @@ GPU 一站式 common-search / `DCI 1A` 入口，接受 `(n_tx_ports, tx_mode) ==
 Viterbi；不支持 UE-specific、SI-RNTI geometry search、其它 DCI format、CIF 或外部 decoder
 callback。D2H 仅包含 hit count 和固定容量 compact candidate result buffer，不包含完整
 equalized grid、SINR 或 LLR。batch 入口保持相同语义，并允许 batch 大于 stream 数量。
+
+### `make_pdsch_grant_v1(...)`
+
+把一个已命中的 localized DCI 1A 转为调用方持有的 `PdschGrantV1`。输出包含 CRC、CCE、
+聚合级别、原始 payload、物理 PRB 位图、起始 symbol、MCS/Qm/TBS、HARQ/NDI/RV/TPC/DAI
+和单码字 PHY 配置。
+
+约束：当前 PDSCH equalizer 使用 `100 PRB / 1200 subcarriers` 网格，因此 handoff V1 只接受
+100 PRB 载波；PDCCH order、distributed VRB、CIF、保留 MCS/I_TBS、非单层单码字以及非
+TM1/TM2 配置返回 `kUnsupportedConfig`。任何失败都会先清零输出 Grant。
+
+### `make_pdsch_extract_descriptor_v1(...)`
+
+把成功的 `PdschGrantV1` 转为现有 `ExtractDescriptor`。该函数复核 localized PRB 位图、调制
+阶数、端口/层/TM 和接收天线边界；TM1 descriptor 交给通用 `run(...)`，2Tx/TM2/单层
+descriptor 交给 `run_pdsch_td(...)`。
 
 ### `decode_re_grid_index(grid_index)`
 

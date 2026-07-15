@@ -25,6 +25,8 @@
 - [PDCCH Chain SDK API 参考](G:\MMSE_CPP\docs\pdcch_chain_sdk_api_reference.md)
 - [PDCCH Chain SDK 版本策略](G:\MMSE_CPP\docs\pdcch_chain_sdk_versioning_policy.md)
 - [PDCCH Module API 集成示例](G:\MMSE_CPP\docs\pdcch_module_api_example.md)
+- [PDCCH→PDSCH 交接 SDK V1](G:\MMSE_CPP\docs\pdcch_pdsch_handoff_sdk_v1.md)
+  包含 Grant 字段、所有权、状态码、支持矩阵、CMake 集成与联调检查清单。
 
 ## 其他设计说明
 

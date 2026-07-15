@@ -146,6 +146,8 @@
 - `PDCCH common search` 与 UE-specific 候选构造、`L=1/2/4/8` 速率恢复、`CRC-RNTI` 与 `DCI 1A` 解析 helper
 - 默认内建尾咬卷积码译码的正式 CPU common-search 与 UE-specific `DCI 1A` 链路，可由外部回调覆盖
 - 当前 `20 MHz / FDD` 边界内的 SI-RNTI 未知控制区几何搜索与缓存锁定
+- SI-RNTI/C-RNTI localized DCI 1A 到 host-owned `PdschGrantV1` 的转换
+- PDSCH 物理 PRB 位图、起始 symbol、MCS/Qm/TBS 和 HARQ 控制字段交接
 
 ### 2. 未覆盖的能力
 
@@ -156,14 +158,11 @@
 - `PCFICH` 译码
 - `PHICH` 译码
 - 非 `DCI 1A` 的通用 `DCI` 解码
-- 仓库内真实存在的 `PDSCH` 下游 context / grant context / decode context
 - `PDSCH` 速率恢复 / `HARQ` 软合并 / `Turbo` 译码
 - `MAC PDU` 解码
 - `RRC / ASN.1` 解码
 
-也就是说，本工程当前主要处于：
-
-本工程当前主要处于：`资源网格 -> 有效 RE 提取 -> 信道估计 -> 均衡 -> LLR -> PDCCH common-search / UE-specific DCI 1A 输出`。
+也就是说，本工程当前主要处于：`资源网格 -> 有效 RE 提取 -> 信道估计 -> 均衡 -> LLR -> PDCCH common-search / UE-specific DCI 1A 输出 -> localized PDSCH Grant`。
 
 这一段。
 
@@ -313,6 +312,10 @@ downstream context。
 - 默认内建尾咬卷积码译码（可选外部回调覆盖）
 - 当前 `20 MHz / FDD` 的 SI-RNTI CFI/PHICH 几何枚举与锁定
 
+命中后可调用 `make_pdsch_grant_v1(...)` 生成 `PdschGrantV1`。首版只支持 SI-RNTI/C-RNTI、
+localized DCI 1A、100 PRB PDSCH 网格、单层单码字 TM1/TM2；distributed VRB 和 PDCCH order
+会被明确拒绝。
+
 ---
 
 ## 五、工程代码文件定位
@@ -325,6 +328,8 @@ downstream context。
 - [include/mmse/pdsch_module_api.h](G:\MMSE_CPP\include\mmse\pdsch_module_api.h)
 - [include/mmse/pdcch_chain_dto.h](G:\MMSE_CPP\include\mmse\pdcch_chain_dto.h)
 - [include/mmse/pdcch_module_api.h](G:\MMSE_CPP\include\mmse\pdcch_module_api.h)
+- [include/mmse/pdcch_pdsch_handoff.h](G:\MMSE_CPP\include\mmse\pdcch_pdsch_handoff.h)
+- [include/mmse/lte_pdsch_transport.h](G:\MMSE_CPP\include\mmse\lte_pdsch_transport.h)
 
 ### 2. CPU 路径
 

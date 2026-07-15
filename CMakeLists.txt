@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.31)
 
 project(MMSE_CPP LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 option(MMSE_BUILD_TESTS "Build MMSE unit tests" ON)
 option(MMSE_BUILD_BENCH "Build MMSE benchmark" ON)
 option(MMSE_ENABLE_CUDA "Enable CUDA backend when toolkit is available" ON)
@@ -27,10 +29,12 @@ add_library(mmse_cpp
     src/pdcch_tail_biting_decoder.cpp
     src/thread_pool.cpp
 )
+add_library(MMSE_CPP::mmse_cpp ALIAS mmse_cpp)
 
 target_include_directories(mmse_cpp
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
@@ -75,12 +79,31 @@ endif()
 target_compile_definitions(mmse_cpp PRIVATE NOMINMAX)
 target_compile_definitions(mmse_cpp PRIVATE MMSE_CUDA_ENABLED=$<BOOL:${MMSE_CUDA_ENABLED}>)
 
-include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+set(MMSE_CPP_CONFIG_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/MMSE_CPP")
+configure_package_config_file(
+    cmake/MMSE_CPPConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/MMSE_CPPConfig.cmake"
+    INSTALL_DESTINATION "${MMSE_CPP_CONFIG_INSTALL_DIR}"
+)
 
 install(TARGETS mmse_cpp
+    EXPORT MMSE_CPPTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+install(EXPORT MMSE_CPPTargets
+    FILE MMSE_CPPTargets.cmake
+    NAMESPACE MMSE_CPP::
+    DESTINATION "${MMSE_CPP_CONFIG_INSTALL_DIR}"
+)
+
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/MMSE_CPPConfig.cmake"
+    DESTINATION "${MMSE_CPP_CONFIG_INSTALL_DIR}"
 )
 
 install(DIRECTORY include/
@@ -89,6 +112,10 @@ install(DIRECTORY include/
 
 install(FILES README.md
     DESTINATION .
+)
+
+install(FILES docs/pdcch_pdsch_handoff_sdk_v1.md
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/MMSE_CPP
 )
 
 if(MMSE_BUILD_TESTS)
@@ -119,6 +146,12 @@ if(MMSE_BUILD_BENCH)
     target_link_libraries(pdcch_module_demo PRIVATE mmse_cpp)
     target_include_directories(pdcch_module_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     install(TARGETS pdcch_module_demo
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+
+    add_executable(pdcch_pdsch_handoff_demo bench/pdcch_pdsch_handoff_demo.cpp)
+    target_link_libraries(pdcch_pdsch_handoff_demo PRIVATE mmse_cpp)
+    install(TARGETS pdcch_pdsch_handoff_demo
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 

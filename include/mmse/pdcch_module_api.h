@@ -6,6 +6,7 @@
 
 #include "mmse/constants.h"
 #include "mmse/lte_descrambling.h"
+#include "mmse/lte_pdsch_transport.h"
 #include "mmse/lte_soft_demod.h"
 #include "mmse/pdcch_chain_dto.h"
 #include "mmse/types.h"
@@ -1191,6 +1192,9 @@ inline MmseStatus parse_pdcch_dci_format1a(const std::uint8_t* payload_bits,
     dci.sfn_subframe = sfn_subframe;
     dci.cell_id = cell_id;
     dci.rnti = rnti;
+    dci.downlink_bandwidth_prb = config.n_prb;
+    dci.rnti_type =
+        rnti == kSiRnti ? PdcchDciFormat1ARntiType::kSiRnti : PdcchDciFormat1ARntiType::kCRnti;
     dci.chain = chain;
     dci.raw_payload_bits.assign(payload_bits, payload_bits + payload_bit_count);
 
@@ -1234,34 +1238,57 @@ inline MmseStatus parse_pdcch_dci_format1a(const std::uint8_t* payload_bits,
         return MmseStatus::kInvalidArgument;
     }
     dci.mcs_tbs_index = static_cast<std::uint8_t>(value);
+    if (dci.rnti_type == PdcchDciFormat1ARntiType::kSiRnti) {
+        dci.transport_block_size_index = dci.mcs_tbs_index;
+        dci.transport_block_size_index_valid = dci.transport_block_size_index <= 26U;
+    } else {
+        lte::PdschMcsParameters mcs_parameters{};
+        dci.modulation_and_coding_scheme_valid =
+            lte::pdsch_mcs_parameters(dci.mcs_tbs_index, mcs_parameters);
+        dci.transport_block_size_index = mcs_parameters.transport_block_size_index;
+        dci.transport_block_size_index_valid = dci.modulation_and_coding_scheme_valid;
+    }
     const std::uint8_t harq_pid_bits = config.duplex_mode == PhichDuplexMode::kFdd ? 3U : 4U;
     if (!reader.read(harq_pid_bits, value)) {
         return MmseStatus::kInvalidArgument;
     }
     dci.harq_process = static_cast<std::uint8_t>(value);
 
-    if (dci.distributed_vrb_assignment && config.n_prb >= 50U) {
-        if (!reader.read(1U, value)) {
-            return MmseStatus::kInvalidArgument;
-        }
-        dci.n_gap_is_two = value != 0U;
-    } else if (!reader.read(1U, value)) {
+    if (!reader.read(1U, value)) {
         return MmseStatus::kInvalidArgument;
+    }
+    if (dci.rnti_type == PdcchDciFormat1ARntiType::kSiRnti) {
+        if (dci.distributed_vrb_assignment && config.n_prb >= 50U) {
+            dci.n_gap_is_two = value != 0U;
+        }
+    } else {
+        dci.new_data_indicator = static_cast<std::uint8_t>(value);
+        dci.new_data_indicator_valid = true;
     }
     if (!reader.read(2U, value)) {
         return MmseStatus::kInvalidArgument;
     }
     dci.redundancy_version = static_cast<std::uint8_t>(value);
-    if (!reader.read(1U, value) || value != 0U || !reader.read(1U, value)) {
+    if (!reader.read(2U, value)) {
         return MmseStatus::kInvalidArgument;
     }
-    dci.n_prb_1a_is_three = value != 0U;
-    dci.n_prb_1a = dci.n_prb_1a_is_three ? 3U : 2U;
+    if (dci.rnti_type == PdcchDciFormat1ARntiType::kSiRnti) {
+        if ((value & 2U) != 0U) {
+            return MmseStatus::kInvalidArgument;
+        }
+        dci.n_prb_1a_is_three = (value & 1U) != 0U;
+        dci.n_prb_1a = dci.n_prb_1a_is_three ? 3U : 2U;
+        dci.n_prb_1a_valid = true;
+    } else {
+        dci.transmit_power_control = static_cast<std::uint8_t>(value);
+        dci.transmit_power_control_valid = true;
+    }
     if (config.duplex_mode == PhichDuplexMode::kTdd) {
         if (!reader.read(2U, value)) {
             return MmseStatus::kInvalidArgument;
         }
         dci.downlink_assignment_index = static_cast<std::uint8_t>(value);
+        dci.downlink_assignment_index_valid = true;
     }
     if (!reader.remaining_bits_are_zero()) {
         return MmseStatus::kInvalidArgument;

@@ -278,6 +278,39 @@ for (const auto& hit : ue_result.hits) {
 约束：`rntis` 必须非空、唯一，不能包含 `0` 或 `kSiRnti`；`kSiRnti` 继续使用 common-search
 入口。CRC-RNTI 不匹配是正常 blind-search miss，记入 `crc_rnti_miss_count`，不视为 API 失败。
 
+## DCI 1A 到 PDSCH Grant
+
+对已命中的 SI-RNTI 或 C-RNTI localized DCI 1A，可通过统一头文件生成 host-owned Grant，
+再适配到现有 PDSCH equalizer descriptor：
+
+```cpp
+#include "mmse/lte_chain_sdk.h"
+
+const mmse::pdcch::PdcchDciFormat1ADecodeResult& hit = get_matched_dci_1a();
+
+mmse::handoff::PdcchPdschHandoffConfigV1 handoff{};
+handoff.start_symbol = control_symbol_count;
+handoff.n_tx_ports = n_tx_ports;
+handoff.n_layers = 1U;
+handoff.transmission_mode = tx_mode;
+
+mmse::handoff::PdschGrantV1 grant{};
+if (mmse::handoff::make_pdsch_grant_v1(hit, handoff, grant) != mmse::MmseStatus::kOk) {
+    return;
+}
+
+mmse::ExtractDescriptor pdsch_desc{};
+if (mmse::handoff::make_pdsch_extract_descriptor_v1(grant, n_rx_ant, pdsch_desc) !=
+    mmse::MmseStatus::kOk) {
+    return;
+}
+```
+
+`handoff.start_symbol`、端口、层数、TM、PMI 和码字配置来自已确认的 CFI/小区/UE 上下文，
+不在 DCI 1A payload 内。首版明确拒绝 PDCCH order、distributed VRB、保留 MCS、CIF、
+非 100 PRB PDSCH 网格和非单层单码字 PHY 配置。完整字段和 CMake 安装说明见
+[PDCCH→PDSCH 交接 SDK V1](pdcch_pdsch_handoff_sdk_v1.md)。
+
 ## SI-RNTI 未知几何示例
 
 当调用方拥有当前频域网格和小区上下文，但尚未获得可信 CFI/PHICH 几何时，可使用

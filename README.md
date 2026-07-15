@@ -342,6 +342,7 @@ symbol 的数据 `RE` 组成 Alamouti 对，执行联合 MMSE 去分集。输出
 - [PDCCH Chain SDK 快速开始](./docs/pdcch_chain_sdk_quick_start.md)
 - [PDCCH Chain SDK API 参考](./docs/pdcch_chain_sdk_api_reference.md)
 - [PDCCH Module API 集成示例](./docs/pdcch_module_api_example.md)
+- [PDCCH→PDSCH 交接 SDK V1](./docs/pdcch_pdsch_handoff_sdk_v1.md)
 - [LTE DCI 输出语义与 CE/MMSE 接口说明](./docs/lte_dci_and_ce_mmse_reference.md)
 
 ### 如果你想看 `PBCH / PCFICH / PDSCH`

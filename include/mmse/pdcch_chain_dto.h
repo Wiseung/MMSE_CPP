@@ -218,6 +218,11 @@ struct PdcchDciFormat1AConfig {
     bool cif_enabled = false;
 };
 
+enum class PdcchDciFormat1ARntiType : std::uint8_t {
+    kSiRnti = 0,
+    kCRnti,
+};
+
 struct PdcchCrcRntiCheck {
     std::uint16_t transmitted_crc = 0;
     std::uint16_t calculated_crc = 0;
@@ -229,6 +234,8 @@ struct PdcchDciFormat1A {
     std::uint32_t sfn_subframe = 0;
     std::uint16_t cell_id = 0;
     std::uint16_t rnti = 0;
+    std::uint16_t downlink_bandwidth_prb = 0;
+    PdcchDciFormat1ARntiType rnti_type = PdcchDciFormat1ARntiType::kCRnti;
     PdcchChainMetadata chain{};
     bool cif_present = false;
     std::uint8_t carrier_indicator = 0;
@@ -242,10 +249,21 @@ struct PdcchDciFormat1A {
     std::uint16_t resource_indication_value = 0;
     std::uint16_t start_prb = 0;
     std::uint16_t n_prb = 0;
+    // Raw five-bit DCI field retained for source compatibility. Its meaning is
+    // selected by `rnti_type` and made explicit by the validity flags below.
     std::uint8_t mcs_tbs_index = 0;
+    std::uint8_t transport_block_size_index = 0;
+    bool modulation_and_coding_scheme_valid = false;
+    bool transport_block_size_index_valid = false;
     std::uint8_t harq_process = 0;
+    std::uint8_t new_data_indicator = 0;
+    bool new_data_indicator_valid = false;
     std::uint8_t redundancy_version = 0;
+    std::uint8_t transmit_power_control = 0;
+    bool transmit_power_control_valid = false;
+    bool n_prb_1a_valid = false;
     std::uint8_t downlink_assignment_index = 0;
+    bool downlink_assignment_index_valid = false;
     std::vector<std::uint8_t> raw_payload_bits{};
 };
 
