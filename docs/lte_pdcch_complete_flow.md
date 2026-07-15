@@ -210,11 +210,12 @@ flowchart TB
 当前仓库对这一步的处理是明确分开的：
 
 - 传统 `run_pdcch(...)` 会拒绝 `n_tx_ports == 2`
-- `2Tx` 必须改走 `run_pdcch_td(...)`
+- `2Tx` 必须以 `tx_mode == 2` 调用 `run_pdcch_td(...)`
 
 对应 CPU 侧关键路径包括：
 
-- `build_pdcch_td_re_pairs(...)`
+- `build_transmit_diversity_re_pairs(...)`
+- `demap_transmit_diversity_from_grid(...)`
 - `demap_pdcch_transmit_diversity_scalar(...)`
 
 输出也不再是单个 `RE -> 单个软符号` 的传统关系，而是：

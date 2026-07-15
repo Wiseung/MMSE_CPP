@@ -37,8 +37,9 @@
 - 显式 caller-owned `LLR` 输出面与显式 `PDSCH` scrambling plan cache
 
 当前文档深度仍然主要集中在 `PDCCH` 集成路径上。`PBCH`、`PCFICH`
-和 `PDSCH` 现在已经共享同一套 `LTE` 运行时 / DTO 风格；其中 `PDSCH`
-当前提供的是下游 `LLR / descrambling` helper 页面，而不是完整译码链页面。
+和 `PDSCH` 现在已经共享同一套 `LTE` 运行时 / DTO 风格；其中 `PDSCH` 同时提供
+通用空间复用入口、`2Tx` 发射分集入口和下游 `LLR / descrambling` helper 页面，但不提供
+完整译码链页面。
 
 ## 推荐阅读顺序
 
@@ -46,7 +47,8 @@
 2. 如果要先把 `DCI` 语义、CE/MMSE 输入输出和 `10 ms` 调用口径讲清楚，阅读 [LTE DCI 输出语义与 CE/MMSE 接口说明](/G:/MMSE_CPP/docs/lte_dci_and_ce_mmse_reference.md)。
 3. 如果要集成 PBCH equalized-RE 接口，阅读 [PBCH 快速开始](/G:/MMSE_CPP/docs/pbch_chain_sdk_quick_start.md)。
 4. 如果要集成 PCFICH equalized-RE 接口，阅读 [PCFICH 快速开始与 API 参考](/G:/MMSE_CPP/docs/pcfich_chain_sdk_quick_start_api_reference.md)。
-5. 如果要在 equalized `PDSCH` 输出之后生成解扰后的 `LLR`，阅读 [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](/G:/MMSE_CPP/docs/pdsch_llr_downstream_quick_start_api_reference.md)。
+5. 如果要集成 `PDSCH` 的 `2Tx + 1 layer + TM2` 发射分集路径，使用
+   `run_pdsch_td(...)`；其输出可继续交给 [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](/G:/MMSE_CPP/docs/pdsch_llr_downstream_quick_start_api_reference.md)。
 6. 如果要查看当前文档最完整的信道专页，阅读 [PDCCH 子页面](/G:/MMSE_CPP/docs/pdcch_chain_sdk_interface.md)。
 
 ## 公开头文件布局
@@ -73,7 +75,11 @@
 
 - 下游 helper 命名空间：`mmse::pdsch`
 - 低层输入 / 输出：
-  - 输入仍然是通用 `ExtractDescriptor + EqualizerOutputView`
+  - 通用空间复用输入 / 输出：`ExtractDescriptor + EqualizerOutputView`
+  - 2Tx 发射分集输入 / 输出：
+    - `PlanarGridViewF32 + ExtractDescriptor`
+    - `PdschTdMmseOutputView`
+    - `PdschTdMmseResult`
   - `PdschDescrambledLlrOutputView`
   - `PdschDescrambledLlrResult`
   - `PdschDescramblingPlanCache`
@@ -81,6 +87,13 @@
 - 运行时入口：
   - `MmseEqualizerCpuContext::run(...)`
   - `MmseEqualizerGpuContext::run(...)`
+  - `MmseEqualizerCpuContext::run_pdsch_td(...)`
+  - `MmseEqualizerGpuContext::run_pdsch_td(...)`
+- 选择规则：
+  - `run(...)` 用于 `1Tx` 单层或 `2Tx + 2 layer` 空间复用
+  - `run_pdsch_td(...)` 仅用于 `channel_type == kPdsch`、`n_tx_ports == 2`、
+    `n_layers == 1`、`tx_mode == 2`、`pmi == -1` 的 Alamouti 发射分集
+  - 通用 `run(...)` 会拒绝上述 `PDSCH` TD 组合，保证 CPU 与 CUDA 后端具有相同契约
 - 下游 helper：
   - `prepare_pdsch_descrambling_plan(...)`
   - `build_backend_pdsch_descrambled_llr_result(...)`

@@ -820,7 +820,9 @@ void test_single_layer_identity_channel_equalization() {
 
     GridBuffers buffers = make_zero_grid();
     auto desc = make_fullband_desc();
-    desc.n_layers = 1;
+    desc.n_tx_ports = 1U;
+    desc.n_layers = 1U;
+    desc.tx_mode = 1U;
     fill_identity_channel(buffers, desc, 1.0F, 0.0F);
     auto grid = make_grid_view(buffers);
 
@@ -831,7 +833,7 @@ void test_single_layer_identity_channel_equalization() {
     EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
     expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "run must succeed");
     expect_true(out.n_re_per_layer > 0U, "must output REs");
-    expect_true(out.n_re_per_layer == 14400U, "full-band RE count");
+    expect_true(out.n_re_per_layer == 15000U, "full-band RE count");
     expect_near(out.x_hat_re[0], 1.0F, 1.0e-3F, "layer0 xhat");
     expect_near(out.x_hat_im[0], 0.0F, 1.0e-5F, "layer0 imag");
     if (!(out.sinr[0] > 10.0F)) {
@@ -1253,7 +1255,9 @@ void test_single_layer_path() {
     expect_true(ctx.init(config) == MmseStatus::kOk, "init must succeed");
 
     auto desc = make_fullband_desc();
-    desc.n_layers = 1;
+    desc.n_tx_ports = 1U;
+    desc.n_layers = 1U;
+    desc.tx_mode = 1U;
     GridBuffers buffers = make_zero_grid();
     fill_identity_channel(buffers, desc, 0.75F, 0.0F);
     auto grid = make_grid_view(buffers);
@@ -1265,6 +1269,168 @@ void test_single_layer_path() {
     EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
     expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "single-layer run");
     expect_near(out.x_hat_re[0], 0.75F, 1.0e-3F, "single-layer xhat");
+}
+
+void test_pdsch_td_two_crs_joint_equalization_and_contract() {
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.backend = MmseCpuBackend::kScalar;
+    cpu_config.sigma2_min = 1.0e-5F;
+    cpu_config.det_floor = 1.0e-6F;
+    cpu_config.g_min = 1.0e-4F;
+    cpu_config.gamma_max = 1.0e4F;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "pdsch td cpu init");
+
+    auto desc = make_fullband_desc();
+    desc.n_rx_ant = 1U;
+    desc.n_layers = 1U;
+    desc.start_symbol = 4U;
+    desc.mod_order = 2U;
+    desc.n_prb = 3U;
+    desc.prb_bitmap.fill(0U);
+    desc.prb_bitmap[0] = 0x0094U;
+
+    const Complex32 h00{0.90F, 0.15F};
+    const Complex32 h01{-0.30F, 0.45F};
+    const Complex32 s0{0.70710678F, 0.70710678F};
+    const Complex32 s1{-0.70710678F, 0.70710678F};
+    GridBuffers buffers = make_zero_grid();
+    fill_constant_mimo_channel(buffers, desc, h00, h01, {}, {}, s0, s1);
+
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_data_re_layout(desc, layout);
+    expect_true(n_source_re == 324U && (n_source_re & 1U) == 0U,
+                "pdsch td sparse layout count must be even");
+    for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
+        expect_true(layout.grid_indices[re] / kLteNumSubcarriers20MHz ==
+                        layout.grid_indices[re + 1U] / kLteNumSubcarriers20MHz,
+                    "pdsch td pair must stay in one OFDM symbol");
+    }
+    fill_td_layout(buffers, layout, h00, h01, {}, {}, s0, s1);
+    PlanarGridViewF32 grid = make_single_rx_grid_view(buffers);
+    grid.generation = 101U;
+
+    std::vector<float> xre(n_source_re), xim(n_source_re), sinr(n_source_re);
+    std::vector<std::uint16_t> grid0(n_source_re), grid1(n_source_re);
+    PdschTdMmseOutputView out{xre.data(),   xim.data(),   sinr.data(),
+                              grid0.data(), grid1.data(), n_source_re};
+    PdschTdMmseResult meta{};
+
+    std::vector<float> generic_re(n_source_re), generic_im(n_source_re), generic_sinr(n_source_re);
+    EqualizerOutputView generic_out{generic_re.data(), generic_im.data(), generic_sinr.data(),
+                                    n_source_re};
+    expect_true(cpu.run(grid, desc, generic_out) == MmseStatus::kUnsupportedConfig,
+                "generic PDSCH run must reject transmit diversity");
+    expect_true(cpu.run_pdsch_td(grid, desc, out, meta) == MmseStatus::kOk, "pdsch td cpu run");
+    expect_true(meta.n_symbols == n_source_re && meta.n_source_re == n_source_re &&
+                    meta.n_tx_ports == 2U && meta.n_layers == 1U && meta.tx_mode == 2U &&
+                    meta.start_symbol == desc.start_symbol && meta.prb_bitmap == desc.prb_bitmap,
+                "pdsch td metadata");
+    for (std::uint32_t re = 0U; re < meta.n_symbols; re += 2U) {
+        expect_true(grid0[re] == layout.grid_indices[re] &&
+                        grid1[re] == layout.grid_indices[re + 1U] && grid0[re + 1U] == grid0[re] &&
+                        grid1[re + 1U] == grid1[re],
+                    "pdsch td source pair metadata");
+        expect_near(xre[re], s0.re, 1.0e-3F, "pdsch td symbol zero real");
+        expect_near(xim[re], s0.im, 1.0e-3F, "pdsch td symbol zero imag");
+        expect_near(xre[re + 1U], s1.re, 1.0e-3F, "pdsch td symbol one real");
+        expect_near(xim[re + 1U], s1.im, 1.0e-3F, "pdsch td symbol one imag");
+        expect_true(sinr[re] > 10.0F && sinr[re + 1U] > 10.0F, "pdsch td SINR");
+    }
+
+    auto invalid = desc;
+    invalid.tx_mode = 1U;
+    expect_true(cpu.run_pdsch_td(grid, invalid, out, meta) == MmseStatus::kUnsupportedConfig,
+                "pdsch td must require TM2");
+    invalid = desc;
+    invalid.n_layers = 2U;
+    expect_true(cpu.run_pdsch_td(grid, invalid, out, meta) == MmseStatus::kUnsupportedConfig,
+                "pdsch td must require one output layer");
+    PdschTdMmseOutputView small_out = out;
+    small_out.capacity_symbols = n_source_re - 1U;
+    expect_true(cpu.run_pdsch_td(grid, desc, small_out, meta) == MmseStatus::kBufferTooSmall,
+                "pdsch td must reject a small output matrix");
+
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kAuto;
+    gpu_config.sigma2_min = cpu_config.sigma2_min;
+    gpu_config.det_floor = cpu_config.det_floor;
+    gpu_config.g_min = cpu_config.g_min;
+    gpu_config.gamma_max = cpu_config.gamma_max;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "pdsch td gpu auto init");
+    std::vector<float> gpu_re(n_source_re), gpu_im(n_source_re), gpu_sinr(n_source_re);
+    std::vector<std::uint16_t> gpu_grid0(n_source_re), gpu_grid1(n_source_re);
+    PdschTdMmseOutputView gpu_out{gpu_re.data(),    gpu_im.data(),    gpu_sinr.data(),
+                                  gpu_grid0.data(), gpu_grid1.data(), n_source_re};
+    PdschTdMmseResult gpu_meta{};
+    expect_true(gpu.run_pdsch_td(grid, desc, gpu_out, gpu_meta) == MmseStatus::kOk,
+                "pdsch td gpu auto run");
+    for (std::uint32_t re = 0U; re < n_source_re; ++re) {
+        expect_near(gpu_re[re], xre[re], 1.0e-5F, "pdsch td gpu auto real");
+        expect_near(gpu_im[re], xim[re], 1.0e-5F, "pdsch td gpu auto imag");
+        expect_near(gpu_sinr[re], sinr[re], 1.0e-5F, "pdsch td gpu auto sinr");
+        expect_true(gpu_grid0[re] == grid0[re] && gpu_grid1[re] == grid1[re],
+                    "pdsch td gpu auto source pair");
+    }
+
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext cuda;
+    MmseEqualizerGpuConfig cuda_config = gpu_config;
+    cuda_config.backend = MmseGpuBackend::kCuda;
+    cuda_config.validation_policy = MmseGpuValidationPolicy::kTestDeepTrace;
+    expect_true(cuda.init(cuda_config) == MmseStatus::kOk, "pdsch td cuda init");
+    std::vector<float> cuda_re(n_source_re), cuda_im(n_source_re), cuda_sinr(n_source_re);
+    std::vector<std::uint16_t> cuda_grid0(n_source_re), cuda_grid1(n_source_re);
+    PdschTdMmseOutputView cuda_out{cuda_re.data(),    cuda_im.data(),    cuda_sinr.data(),
+                                   cuda_grid0.data(), cuda_grid1.data(), n_source_re};
+    PdschTdMmseResult cuda_meta{};
+    expect_true(cuda.run_pdsch_td(grid, desc, cuda_out, cuda_meta) == MmseStatus::kOk,
+                "pdsch td cuda run");
+    expect_true(cuda_meta.n_symbols == meta.n_symbols && cuda_meta.sigma2 == meta.sigma2,
+                "pdsch td cuda metadata");
+    for (std::uint32_t re = 0U; re < n_source_re; ++re) {
+        expect_near(cuda_re[re], xre[re], 1.0e-4F, "pdsch td cuda real");
+        expect_near(cuda_im[re], xim[re], 1.0e-4F, "pdsch td cuda imag");
+        expect_near(cuda_sinr[re], sinr[re], 1.0e-4F, "pdsch td cuda sinr");
+        expect_true(cuda_grid0[re] == grid0[re] && cuda_grid1[re] == grid1[re],
+                    "pdsch td cuda source pair");
+    }
+#endif
+}
+
+void test_pdcch_td_requires_tm2() {
+    GridBuffers buffers = make_zero_grid();
+    const auto desc = make_pdcch_desc();
+    PdcchMmseInput in{};
+    in.grid = make_grid_view(buffers);
+    in.sfn_subframe = desc.sfn_subframe;
+    in.cell_id = desc.cell_id;
+    in.n_tx_ports = 2U;
+    in.tx_mode = 1U;
+    in.control_symbol_count = desc.control_symbol_count;
+    in.n_prb = desc.n_prb;
+    in.prb_bitmap = desc.prb_bitmap;
+    in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                           .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                           .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "pdcch td TM2 cpu init");
+    PdcchTdMmseOutputView out{};
+    PdcchTdMmseResult meta{};
+    expect_true(cpu.run_pdcch_td(in, out, meta) == MmseStatus::kUnsupportedConfig,
+                "cpu pdcch td must reject TM1");
+
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kAuto;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "pdcch td TM2 gpu init");
+    expect_true(gpu.run_pdcch_td(in, out, meta) == MmseStatus::kUnsupportedConfig,
+                "gpu pdcch td must reject TM1");
 }
 
 void test_pdcch_layout_excludes_crs_and_reserved_res() {
@@ -1759,11 +1925,12 @@ void test_pbch_and_pcfich_td_cpu_golden_and_dto() {
     pbch_desc.n_rx_ant = 1U;
     pbch_desc.tx_mode = 2U;
     GridBuffers pbch_buffers = make_zero_grid();
-    fill_identity_channel(pbch_buffers, pbch_desc, 0.0F, 0.0F);
+    const Complex32 pbch_h00{0.85F, 0.10F};
+    const Complex32 pbch_h01{-0.20F, 0.35F};
+    fill_constant_mimo_channel(pbch_buffers, pbch_desc, pbch_h00, pbch_h01, {}, {}, s0, s1);
     mmse::detail::ReLayout pbch_layout{};
     const std::uint32_t pbch_re = mmse::detail::build_pbch_re_layout(pbch_desc, pbch_layout);
-    fill_td_layout(pbch_buffers, pbch_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
-                   {0.0F, 0.0F}, s0, s1);
+    fill_td_layout(pbch_buffers, pbch_layout, pbch_h00, pbch_h01, {}, {}, s0, s1);
     PbchMmseInput pbch_in{.grid = make_single_rx_grid_view(pbch_buffers),
                           .sfn_subframe = pbch_desc.sfn_subframe,
                           .cell_id = pbch_desc.cell_id,
@@ -1794,12 +1961,17 @@ void test_pbch_and_pcfich_td_cpu_golden_and_dto() {
     pcfich_desc.n_tx_ports = 2U;
     pcfich_desc.tx_mode = 2U;
     GridBuffers pcfich_buffers = make_zero_grid();
-    fill_identity_channel(pcfich_buffers, pcfich_desc, 0.0F, 0.0F);
+    const Complex32 pcfich_h00{0.90F, 0.10F};
+    const Complex32 pcfich_h01{-0.25F, 0.30F};
+    const Complex32 pcfich_h10{0.20F, -0.15F};
+    const Complex32 pcfich_h11{0.80F, -0.20F};
+    fill_constant_mimo_channel(pcfich_buffers, pcfich_desc, pcfich_h00, pcfich_h01, pcfich_h10,
+                               pcfich_h11, s0, s1);
     mmse::detail::ReLayout pcfich_layout{};
     const std::uint32_t pcfich_re =
         mmse::detail::build_pcfich_re_layout(pcfich_desc, pcfich_layout);
-    fill_td_layout(pcfich_buffers, pcfich_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
-                   {1.0F, 0.0F}, s0, s1);
+    fill_td_layout(pcfich_buffers, pcfich_layout, pcfich_h00, pcfich_h01, pcfich_h10, pcfich_h11,
+                   s0, s1);
     PcfichMmseInput pcfich_in{.grid = make_grid_view(pcfich_buffers),
                               .sfn_subframe = pcfich_desc.sfn_subframe,
                               .cell_id = pcfich_desc.cell_id,
@@ -1848,11 +2020,12 @@ void test_gpu_cuda_pbch_and_pcfich_td_match_cpu() {
     pbch_desc.n_rx_ant = 1U;
     pbch_desc.tx_mode = 2U;
     GridBuffers pbch_buffers = make_zero_grid();
-    fill_identity_channel(pbch_buffers, pbch_desc, 0.0F, 0.0F);
+    const Complex32 pbch_h00{0.85F, 0.10F};
+    const Complex32 pbch_h01{-0.20F, 0.35F};
+    fill_constant_mimo_channel(pbch_buffers, pbch_desc, pbch_h00, pbch_h01, {}, {}, s0, s1);
     mmse::detail::ReLayout pbch_layout{};
     const std::uint32_t pbch_count = mmse::detail::build_pbch_re_layout(pbch_desc, pbch_layout);
-    fill_td_layout(pbch_buffers, pbch_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
-                   {0.0F, 0.0F}, s0, s1);
+    fill_td_layout(pbch_buffers, pbch_layout, pbch_h00, pbch_h01, {}, {}, s0, s1);
     PbchMmseInput pbch_in{.grid = make_single_rx_grid_view(pbch_buffers),
                           .sfn_subframe = pbch_desc.sfn_subframe,
                           .cell_id = pbch_desc.cell_id,
@@ -1886,12 +2059,17 @@ void test_gpu_cuda_pbch_and_pcfich_td_match_cpu() {
     pcfich_desc.n_tx_ports = 2U;
     pcfich_desc.tx_mode = 2U;
     GridBuffers pcfich_buffers = make_zero_grid();
-    fill_identity_channel(pcfich_buffers, pcfich_desc, 0.0F, 0.0F);
+    const Complex32 pcfich_h00{0.90F, 0.10F};
+    const Complex32 pcfich_h01{-0.25F, 0.30F};
+    const Complex32 pcfich_h10{0.20F, -0.15F};
+    const Complex32 pcfich_h11{0.80F, -0.20F};
+    fill_constant_mimo_channel(pcfich_buffers, pcfich_desc, pcfich_h00, pcfich_h01, pcfich_h10,
+                               pcfich_h11, s0, s1);
     mmse::detail::ReLayout pcfich_layout{};
     const std::uint32_t pcfich_count =
         mmse::detail::build_pcfich_re_layout(pcfich_desc, pcfich_layout);
-    fill_td_layout(pcfich_buffers, pcfich_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
-                   {1.0F, 0.0F}, s0, s1);
+    fill_td_layout(pcfich_buffers, pcfich_layout, pcfich_h00, pcfich_h01, pcfich_h10, pcfich_h11,
+                   s0, s1);
     PcfichMmseInput pcfich_in{.grid = make_grid_view(pcfich_buffers),
                               .sfn_subframe = pcfich_desc.sfn_subframe,
                               .cell_id = pcfich_desc.cell_id,
@@ -6326,6 +6504,9 @@ int main() {
                   &test_single_rx_single_layer_equalization_and_pdcch},
         std::pair{"sigma2_state_persists", &test_sigma2_state_persists},
         std::pair{"single_layer_path", &test_single_layer_path},
+        std::pair{"pdsch_td_two_crs_joint_equalization_and_contract",
+                  &test_pdsch_td_two_crs_joint_equalization_and_contract},
+        std::pair{"pdcch_td_requires_tm2", &test_pdcch_td_requires_tm2},
         std::pair{"pdcch_layout_excludes_crs_and_reserved_res",
                   &test_pdcch_layout_excludes_crs_and_reserved_res},
         std::pair{"pbch_layout_matches_lte_center_72_subcarriers",

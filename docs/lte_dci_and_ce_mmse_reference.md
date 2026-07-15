@@ -159,6 +159,8 @@ CE/MMSE 阶段的公共输出本质上是两类信息：
    - `sinr`
 
 其中 `PDCCH / PBCH / PCFICH` 还会额外输出 `re_grid_indices`，用于把结果重新映射回 LTE 网格位置。
+对 `2Tx` 发射分集入口，输出改为一对 `re_grid_indices0 / re_grid_indices1`：每两个连续
+软符号共享同一对来源 RE。
 
 ### 3.3 运行时参数分层
 
@@ -179,8 +181,8 @@ CE/MMSE 阶段的公共输出本质上是两类信息：
 | --------------------- | --------------------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `run_pbch(...)`       | `PbchMmseInput`                         | `PbchMmseOutputView + PbchMmseResult`       | `240 RE`                                                                                     |
 | `run_pcfich(...)`     | `PcfichMmseInput`                       | `PcfichMmseOutputView + PcfichMmseResult`   | `16 RE`                                                                                      |
-| `run_pdcch(...)`      | `PdcchMmseInput`                        | `PdcchMmseOutputView + PdcchMmseResult`     | `3400 RE` 上界；带 `PCFICH/PHICH` helper 的常见路径为 `3228 RE`                              |
-| `run_pdcch_td(...)`   | `PdcchMmseInput`                        | `PdcchTdMmseOutputView + PdcchTdMmseResult` | 当前测试路径为 `3200` 个源 `RE / soft symbols`                                               |
+| `run_pdcch(...)`      | `PdcchMmseInput`                        | `PdcchMmseOutputView + PdcchMmseResult`     | `20 MHz / CFI=3` 默认 CCE 对齐布局为 `3168 RE`；保留资源会按完整 CCE 组重新截断              |
+| `run_pdcch_td(...)`   | `PdcchMmseInput`                        | `PdcchTdMmseOutputView + PdcchTdMmseResult` | `3168` 个 CCE 对齐源 `RE / soft symbols`                                                     |
 | `run(...)`（`PDSCH`） | `PlanarGridViewF32 + ExtractDescriptor` | `EqualizerOutputView`                       | 与 `start_symbol / PRB bitmap / layers` 有关；当前 full-band benchmark 为 `14400 RE / layer` |
 
 补充说明：
@@ -191,6 +193,10 @@ CE/MMSE 阶段的公共输出本质上是两类信息：
 - `run_pdcch_cpu_si_rnti_geometry_search(...)` 的主要输入是 `PdcchSiRntiGeometrySearchRequest + PdcchSiRntiGeometrySearchCache`
 - 主要输出是 `PdcchCommonSearchDecodeResult`、`PdcchSiRntiSearchResult`、`PdcchUeSpecificSearchResult` 或 `PdcchSiRntiGeometrySearchResult`
 - 当前正式 helper 覆盖 common-search 与 UE-specific `DCI 1A`，默认使用内建尾咬卷积码译码
+
+`PDSCH + 2Tx + 1 layer + TM2` 不使用通用 `run(...)`；应调用
+`run_pdsch_td(PlanarGridViewF32, ExtractDescriptor, PdschTdMmseOutputView, PdschTdMmseResult)`。
+它输出的连续单层软符号数等于 CRS 排除后的源 RE 数。
 
 ### 4.2 `PBCH`
 
@@ -275,24 +281,19 @@ CE/MMSE 阶段的公共输出本质上是两类信息：
 - `sigma2`
 - `chain`
 
-关于数据长度，需要区分两种口径：
+当前 RE 布局会在 REG 交织后只保留完整的 `9 REG / CCE` 组。对 `20 MHz + normal CP +
+3 control symbols + 1Tx` 的默认 `CFI=3` 测试布局，输出为：
 
-1. **布局上界口径**  
-   对 `20 MHz + normal CP + 3 control symbols + 1Tx` 的当前 PDCCH per-RE 接口，
-   若只排除 `CRS`，测试中可得到：
-   - `3400 RE`
+- `3168 RE`
 
-2. **当前常见 helper 路径口径**  
-   如果像仓库 benchmark 那样自动排除 `PCFICH + PHICH` 占用 RE，则常见值是：
-   - `3228 RE`
+额外的 `PCFICH / PHICH` 保留 RE 会先从物理 REG 中排除，随后再做 CCE 对齐；因此最终数值
+应以本次 `PdcchMmseResult::n_re` 为准。
 
-按 `3400 RE` 估算直接输出 payload：
+按 `3168 RE` 估算直接输出 payload：
 
-- 软符号与 `SINR`：`3400 × 3 × 4 = 40,800 bytes`
-- `re_grid_indices`：`3400 × 2 = 6,800 bytes`
-- 合计约 `47,600 bytes`
-
-按 `3228 RE` 估算则约为 `45,192 bytes`。
+- 软符号与 `SINR`：`3168 × 3 × 4 = 38,016 bytes`
+- `re_grid_indices`：`3168 × 2 = 6,336 bytes`
+- 合计约 `44,352 bytes`
 
 ### 4.5 `PDCCH 2 Tx port` transmit-diversity
 
@@ -314,14 +315,14 @@ run_pdcch_td(...)
 
 当前测试路径下：
 
-- `n_source_re == 3200`
-- `n_symbols == 3200`
+- `n_source_re == 3168`
+- `n_symbols == 3168`
 
 按直接输出 payload 估算：
 
-- 软符号与 `SINR`：`3200 × 3 × 4 = 38,400 bytes`
-- 两组索引：`3200 × 2 × 2 = 12,800 bytes`
-- 合计约 `51,200 bytes`
+- 软符号与 `SINR`：`3168 × 3 × 4 = 38,016 bytes`
+- 两组索引：`3168 × 2 × 2 = 12,672 bytes`
+- 合计约 `50,688 bytes`
 
 ### 4.5a `PDCCH DCI 1A` CPU 入口
 
@@ -354,9 +355,9 @@ run_pdcch_cpu_si_rnti_geometry_search(...)
 
 如果你需要其它 `DCI` 格式、未知 UE RNTI 的通用搜索策略或 GPU 版完整解码阶段，仍应由仓库外模块完成。
 
-### 4.6 `PDSCH`
+### 4.6 `PDSCH` 空间复用
 
-`PDSCH` 入口不是专用 DTO，而是通用：
+`1Tx` 单层和 `2Tx + 2 layer` 空间复用的 `PDSCH` 入口是通用：
 
 ```cpp
 run(const PlanarGridViewF32& grid,
@@ -400,6 +401,37 @@ run(const PlanarGridViewF32& grid,
 
 - `14400 RE/layer × 2 layers × 3 planes × 4 bytes = 345,600 bytes`
 
+### 4.7 `PDSCH 2 Tx port` transmit-diversity
+
+当 `ExtractDescriptor` 表示下面的组合时，不能调用通用 `run(...)`：
+
+- `channel_type == MmseChannelType::kPdsch`
+- `n_tx_ports == 2`
+- `n_layers == 1`
+- `tx_mode == 2`
+- `pmi == -1`
+
+必须调用：
+
+```cpp
+run_pdsch_td(grid, desc, out, meta)
+```
+
+该入口在同一份 `PlanarGridViewF32` 中利用 port 0/1 的 CRS 分别估计两个发送端口到每个
+接收天线的信道。`build_data_re_layout(...)` 先按 symbol、PRB、tone 顺序排除两组 CRS RE，
+然后将相邻、同一 OFDM symbol 内的数据 RE 两两配对；每对通过联合 Alamouti MMSE 去分集恢复
+两个软符号。
+
+输出重点字段：
+
+- `PdschTdMmseOutputView::x_hat_re / x_hat_im / sinr`
+- `PdschTdMmseOutputView::re_grid_indices0 / re_grid_indices1`
+- `PdschTdMmseResult::n_symbols / n_source_re / start_symbol / prb_bitmap / sigma2`
+
+`n_symbols == n_source_re`。输出在逻辑上是单层连续软符号矩阵；第 `2k` 和 `2k+1` 个元素
+对应同一对来源 RE，且共享 `re_grid_indices0[2k] / re_grid_indices1[2k]`。调用方可构造
+`n_layers == 1` 的 `EqualizerOutputView` 适配器，再复用现有 `mmse::pdsch` LLR / 解扰 helper。
+
 ## 5. `10 ms` 内最大调用次数怎么解释
 
 ### 5.1 先看接口粒度
@@ -427,6 +459,7 @@ run(const PlanarGridViewF32& grid,
 | `PDCCH` / `run_pdcch(...)`       | `10`                   | 每个 downlink 子帧最多一次。`1Tx` 与 `2Tx TD` 是二选一，不会在同一条真实链路上同时都算一次。                                                              |
 | `PDCCH TD` / `run_pdcch_td(...)` | `10`                   | 仅当系统实际使用 `2 Tx port` PDCCH 发射分集时成立。                                                                                                       |
 | `PDSCH` / `run(...)`             | **无单一固定常数**     | 如果集成层按“一子帧一个 `ExtractDescriptor`”建模，则名义上可按 `10` 理解；但如果按 grant、码字或不同 PRB 分块拆成多个 descriptor，调用次数可以大于 `10`。 |
+| `PDSCH TD` / `run_pdsch_td(...)` | **无单一固定常数**     | 仅适用于 `2Tx + 1 layer + TM2`；与通用 `PDSCH run(...)` 互斥，按实际 TD grant 数量计数。                                                                  |
 
 ### 5.3 当前仓库已出现过的典型 `10 ms` 调用拓扑
 
