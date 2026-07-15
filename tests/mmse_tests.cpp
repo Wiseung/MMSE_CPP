@@ -19,6 +19,7 @@
 #include "mmse/pdcch_chain_dto.h"
 #include "mmse/pdcch_chain_sdk.h"
 #include "mmse/pdcch_module_api.h"
+#include "mmse/pdcch_pdsch_handoff.h"
 #include "mmse/pcfich_chain_dto.h"
 #include "mmse/pcfich_module_api.h"
 #include "internal/mmse_cuda_runtime.h"
@@ -3152,6 +3153,137 @@ void test_pdcch_dci_format1a_fdd_si_rnti_parse() {
                 "FDD SI-RNTI DCI 1A parsed grant fields");
 }
 
+void test_pdcch_dci_format1a_fdd_c_rnti_parse() {
+    constexpr std::uint16_t kRnti = 0x1234U;
+    const mmse::pdcch::PdcchDciFormat1AConfig config{};
+    const std::uint16_t riv = reference_type2_riv(100U, 10U, 20U);
+    std::vector<std::uint8_t> payload{};
+    append_bits(payload, 1U, 1U);
+    append_bits(payload, 0U, 1U);
+    append_bits(payload, riv, mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
+    append_bits(payload, 10U, 5U);
+    append_bits(payload, 5U, 3U);
+    append_bits(payload, 1U, 1U);
+    append_bits(payload, 2U, 2U);
+    append_bits(payload, 3U, 2U);
+    const std::vector<std::uint8_t> decoded = append_pdcch_crc_rnti_mask(payload, kRnti);
+
+    mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+    expect_true(mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
+                    decoded.data(), static_cast<std::uint32_t>(decoded.size()), kRnti, 17U, 19U, {},
+                    config, result) == MmseStatus::kOk,
+                "FDD C-RNTI DCI 1A decode should succeed");
+    expect_true(
+        result.matched && result.dci.rnti_type == mmse::pdcch::PdcchDciFormat1ARntiType::kCRnti &&
+            result.dci.downlink_bandwidth_prb == 100U &&
+            result.dci.modulation_and_coding_scheme_valid &&
+            result.dci.transport_block_size_index_valid &&
+            result.dci.transport_block_size_index == 9U && result.dci.new_data_indicator_valid &&
+            result.dci.new_data_indicator == 1U && result.dci.transmit_power_control_valid &&
+            result.dci.transmit_power_control == 3U && !result.dci.n_prb_1a_valid,
+        "FDD C-RNTI DCI 1A must expose MCS, NDI and TPC semantics");
+}
+
+void test_pdcch_pdsch_handoff_v1_grants_and_boundaries() {
+    const auto decode = [](std::uint16_t rnti, std::uint8_t mcs_or_tbs, std::uint8_t ndi_or_ngap,
+                           std::uint8_t tpc_or_nprb) {
+        const mmse::pdcch::PdcchDciFormat1AConfig config{};
+        std::vector<std::uint8_t> payload{};
+        append_bits(payload, 1U, 1U);
+        append_bits(payload, 0U, 1U);
+        append_bits(payload, reference_type2_riv(100U, 10U, 20U),
+                    mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
+        append_bits(payload, mcs_or_tbs, 5U);
+        append_bits(payload, 5U, 3U);
+        append_bits(payload, ndi_or_ngap, 1U);
+        append_bits(payload, 2U, 2U);
+        append_bits(payload, tpc_or_nprb, 2U);
+        const std::vector<std::uint8_t> bits = append_pdcch_crc_rnti_mask(payload, rnti);
+        mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+        expect_true(
+            mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
+                bits.data(), static_cast<std::uint32_t>(bits.size()), rnti, 1234U, 19U,
+                {.request_id = 77U, .candidate_id = 2U, .first_cce = 8U, .aggregation_level = 4U},
+                config, result) == MmseStatus::kOk,
+            "handoff fixture DCI parse");
+        return result;
+    };
+
+    const mmse::handoff::PdcchPdschHandoffConfigV1 config{
+        .start_symbol = 3U,
+        .n_tx_ports = 1U,
+        .n_layers = 1U,
+        .transmission_mode = 1U,
+    };
+    const auto c_rnti = decode(0x1234U, 10U, 1U, 3U);
+    mmse::handoff::PdschGrantV1 grant{};
+    expect_true(mmse::handoff::make_pdsch_grant_v1(c_rnti, config, grant) == MmseStatus::kOk,
+                "C-RNTI localized DCI 1A handoff should succeed");
+    expect_true(
+        grant.schema_version == 1U && grant.sfn == 123U && grant.subframe == 4U &&
+            grant.physical_cell_id == 19U && grant.rnti == 0x1234U &&
+            grant.pdcch_chain.first_cce == 8U && grant.start_prb == 10U && grant.n_prb == 20U &&
+            grant.physical_prb_bitmap[0] == 0xFC00U && grant.physical_prb_bitmap[1] == 0x3FFFU &&
+            grant.mcs_valid && grant.mcs == 10U && grant.modulation_order == 4U &&
+            grant.transport_block_size_index == 9U && grant.transport_block_size_bits == 3112U &&
+            grant.new_data_indicator_valid && grant.new_data_indicator == 1U &&
+            grant.transmit_power_control_valid && grant.transmit_power_control == 3U &&
+            grant.raw_payload_bits == c_rnti.dci.raw_payload_bits,
+        "C-RNTI handoff fields, physical PRB bitmap and TBS");
+
+    ExtractDescriptor descriptor{};
+    expect_true(mmse::handoff::make_pdsch_extract_descriptor_v1(grant, 2U, descriptor) ==
+                        MmseStatus::kOk &&
+                    descriptor.channel_type == MmseChannelType::kPdsch &&
+                    descriptor.sfn_subframe == grant.sfn_subframe && descriptor.n_rx_ant == 2U &&
+                    descriptor.start_symbol == 3U && descriptor.control_symbol_count == 3U &&
+                    descriptor.mod_order == 4U && descriptor.n_prb == 20U &&
+                    descriptor.prb_bitmap == grant.physical_prb_bitmap,
+                "PDSCH grant must adapt to the existing equalizer descriptor");
+
+    const auto si_rnti = decode(mmse::pdcch::kSiRnti, 7U, 0U, 1U);
+    expect_true(mmse::handoff::make_pdsch_grant_v1(si_rnti, config, grant) == MmseStatus::kOk &&
+                    !grant.mcs_valid && grant.modulation_order == 2U &&
+                    grant.transport_block_size_index == 7U &&
+                    grant.transport_block_size_bits == 328U && !grant.new_data_indicator_valid &&
+                    !grant.transmit_power_control_valid,
+                "SI-RNTI handoff must use I_TBS, N_PRB^1A and fixed QPSK");
+
+    const auto expect_failure_and_clear = [&](mmse::pdcch::PdcchDciFormat1ADecodeResult input,
+                                              const mmse::handoff::PdcchPdschHandoffConfigV1& cfg,
+                                              MmseStatus expected, const std::string& label) {
+        grant.schema_version = 99U;
+        grant.raw_payload_bits = {1U};
+        expect_true(mmse::handoff::make_pdsch_grant_v1(input, cfg, grant) == expected &&
+                        grant.schema_version == 0U && grant.raw_payload_bits.empty() &&
+                        grant.transport_block_size_bits == 0U,
+                    label);
+    };
+
+    auto invalid = c_rnti;
+    invalid.matched = false;
+    expect_failure_and_clear(invalid, config, MmseStatus::kInvalidArgument,
+                             "handoff must reject unmatched DCI and clear output");
+    invalid = c_rnti;
+    invalid.dci.is_pdcch_order = true;
+    expect_failure_and_clear(invalid, config, MmseStatus::kUnsupportedConfig,
+                             "handoff must reject PDCCH order and clear output");
+    invalid = c_rnti;
+    invalid.dci.distributed_vrb_assignment = true;
+    expect_failure_and_clear(invalid, config, MmseStatus::kUnsupportedConfig,
+                             "handoff must reject distributed VRB and clear output");
+    invalid = c_rnti;
+    invalid.dci.mcs_tbs_index = 29U;
+    invalid.dci.modulation_and_coding_scheme_valid = false;
+    invalid.dci.transport_block_size_index_valid = false;
+    expect_failure_and_clear(invalid, config, MmseStatus::kUnsupportedConfig,
+                             "handoff must reject reserved MCS and clear output");
+    auto unsupported_config = config;
+    unsupported_config.transmission_mode = 3U;
+    expect_failure_and_clear(c_rnti, unsupported_config, MmseStatus::kUnsupportedConfig,
+                             "handoff must reject unsupported PHY config and clear output");
+}
+
 void test_pdcch_dci_format1a_tdd_distributed_parse() {
     mmse::pdcch::PdcchDciFormat1AConfig config{};
     config.duplex_mode = mmse::pdcch::PhichDuplexMode::kTdd;
@@ -4969,6 +5101,23 @@ void test_pdcch_gpu_common_search_decode_matches_cpu_and_rejects_callbacks() {
                         actual.dci.mcs_tbs_index == expected.dci.mcs_tbs_index &&
                         actual.dci.redundancy_version == expected.dci.redundancy_version,
                     "GPU common-search DCI and CRC equivalence");
+        const mmse::handoff::PdcchPdschHandoffConfigV1 handoff_config{
+            .start_symbol = input.control_symbol_count,
+            .n_tx_ports = input.n_tx_ports,
+            .n_layers = 1U,
+            .transmission_mode = input.tx_mode,
+        };
+        mmse::handoff::PdschGrantV1 cpu_grant{};
+        mmse::handoff::PdschGrantV1 gpu_grant{};
+        expect_true(mmse::handoff::make_pdsch_grant_v1(expected, handoff_config, cpu_grant) ==
+                            MmseStatus::kOk &&
+                        mmse::handoff::make_pdsch_grant_v1(actual, handoff_config, gpu_grant) ==
+                            MmseStatus::kOk &&
+                        gpu_grant.physical_prb_bitmap == cpu_grant.physical_prb_bitmap &&
+                        gpu_grant.transport_block_size_bits ==
+                            cpu_grant.transport_block_size_bits &&
+                        gpu_grant.raw_payload_bits == cpu_grant.raw_payload_bits,
+                    "GPU common-search host handoff Grant equivalence");
     }
 
     PdcchMmseInput single_rx_input = input;
@@ -5160,6 +5309,22 @@ void test_pdcch_gpu_common_search_two_tx_matches_cpu() {
                     actual.dci.n_prb_1a == expected.dci.n_prb_1a &&
                     actual.dci.n_prb_1a_is_three == expected.dci.n_prb_1a_is_three,
                 "two-tx GPU common-search DCI and CRC equivalence");
+    const mmse::handoff::PdcchPdschHandoffConfigV1 handoff_config{
+        .start_symbol = input.control_symbol_count,
+        .n_tx_ports = input.n_tx_ports,
+        .n_layers = 1U,
+        .transmission_mode = input.tx_mode,
+    };
+    mmse::handoff::PdschGrantV1 cpu_grant{};
+    mmse::handoff::PdschGrantV1 gpu_grant{};
+    expect_true(mmse::handoff::make_pdsch_grant_v1(expected, handoff_config, cpu_grant) ==
+                        MmseStatus::kOk &&
+                    mmse::handoff::make_pdsch_grant_v1(actual, handoff_config, gpu_grant) ==
+                        MmseStatus::kOk &&
+                    gpu_grant.n_tx_ports == 2U && gpu_grant.transmission_mode == 2U &&
+                    gpu_grant.physical_prb_bitmap == cpu_grant.physical_prb_bitmap &&
+                    gpu_grant.transport_block_size_bits == cpu_grant.transport_block_size_bits,
+                "two-tx GPU common-search host handoff Grant equivalence");
     const std::uint64_t expected_h2d_bytes =
         2U * static_cast<std::uint64_t>(input.grid.n_rx_ant) * mmse::detail::kCudaMaxGridRe *
             sizeof(float) +
@@ -6624,6 +6789,9 @@ int main() {
         std::pair{"pdcch_crc16_and_rnti_mask_check", &test_pdcch_crc16_and_rnti_mask_check},
         std::pair{"pdcch_dci_format1a_fdd_si_rnti_parse",
                   &test_pdcch_dci_format1a_fdd_si_rnti_parse},
+        std::pair{"pdcch_dci_format1a_fdd_c_rnti_parse", &test_pdcch_dci_format1a_fdd_c_rnti_parse},
+        std::pair{"pdcch_pdsch_handoff_v1_grants_and_boundaries",
+                  &test_pdcch_pdsch_handoff_v1_grants_and_boundaries},
         std::pair{"pdcch_dci_format1a_tdd_distributed_parse",
                   &test_pdcch_dci_format1a_tdd_distributed_parse},
         std::pair{"pdcch_dci_format1a_pdcch_order_and_crc_miss",

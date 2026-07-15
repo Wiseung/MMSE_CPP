@@ -1,0 +1,6 @@
+@PACKAGE_INIT@
+
+# Import the installed MMSE_CPP::mmse_cpp target.
+include("${CMAKE_CURRENT_LIST_DIR}/MMSE_CPPTargets.cmake")
+
+check_required_components(MMSE_CPP)
