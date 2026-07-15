@@ -4,12 +4,15 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "pdcch_benchmark_fixture.h"
+#include "internal/mmse_cuda_runtime.h"
 #include "mmse/pdcch_chain_sdk.h"
 
 using namespace mmse;
@@ -19,6 +22,64 @@ namespace {
 
 constexpr std::uint32_t kWarmupIterations = 4U;
 constexpr std::uint32_t kMeasuredIterations = 20U;
+constexpr std::uint32_t kMemoryReportStreamCount = 2U;
+constexpr std::uint32_t kMemoryReportBatchSize = 2U;
+
+struct DeviceMemoryAccounting {
+    std::size_t grid_bytes_per_slot = 0U;
+    std::size_t metadata_bytes_per_slot = 0U;
+    std::size_t channel_estimate_bytes_per_slot = 0U;
+    std::size_t equalizer_output_bytes_per_slot = 0U;
+    std::size_t control_bytes_per_slot = 0U;
+    std::size_t pdcch_llr_bytes_per_slot = 0U;
+    std::size_t pdcch_gold_bytes_per_slot = 0U;
+    std::size_t pdcch_candidate_bytes_per_slot = 0U;
+    std::size_t pdcch_rate_recovery_bytes_per_slot = 0U;
+    std::size_t pdcch_viterbi_bytes_per_slot = 0U;
+    std::size_t pdcch_result_bytes_per_slot = 0U;
+    std::size_t total_bytes_per_slot = 0U;
+    std::size_t total_bytes = 0U;
+};
+
+DeviceMemoryAccounting build_device_memory_accounting(std::uint32_t stream_count) {
+    DeviceMemoryAccounting accounting{};
+    accounting.grid_bytes_per_slot = 4U * detail::kCudaMaxGridRe * sizeof(float);
+    accounting.metadata_bytes_per_slot = sizeof(detail::CudaGridMeta);
+    accounting.channel_estimate_bytes_per_slot =
+        detail::kCudaEstimateStubFloatCount * sizeof(float);
+    accounting.equalizer_output_bytes_per_slot = 3U * 2U * detail::kCudaMaxDataRe * sizeof(float);
+    accounting.control_bytes_per_slot = sizeof(float) +
+                                        detail::kCudaScratchHeaderFloatCount * sizeof(float) +
+                                        sizeof(std::uint32_t);
+    accounting.pdcch_llr_bytes_per_slot = 2U * detail::kCudaMaxDataRe * sizeof(float);
+    accounting.pdcch_gold_bytes_per_slot = detail::kCudaPdcchGoldWordCount * sizeof(std::uint32_t);
+    accounting.pdcch_candidate_bytes_per_slot =
+        detail::kCudaPdcchMaxCandidates * sizeof(detail::CudaPdcchCandidateDescriptor);
+    accounting.pdcch_rate_recovery_bytes_per_slot =
+        detail::kCudaPdcchMaxCandidates * detail::kCudaPdcchRecoveredLlrCount * sizeof(float);
+    accounting.pdcch_viterbi_bytes_per_slot =
+        static_cast<std::size_t>(detail::kCudaPdcchMaxCandidates) * 64U *
+        (detail::kCudaPdcchCodewordBitCount * sizeof(std::uint64_t) + sizeof(double));
+    accounting.pdcch_result_bytes_per_slot =
+        2U * detail::kCudaPdcchMaxCandidates * sizeof(detail::CudaPdcchCandidateResult) +
+        sizeof(std::uint32_t);
+    accounting.total_bytes_per_slot =
+        accounting.grid_bytes_per_slot + accounting.metadata_bytes_per_slot +
+        accounting.channel_estimate_bytes_per_slot + accounting.equalizer_output_bytes_per_slot +
+        accounting.control_bytes_per_slot + accounting.pdcch_llr_bytes_per_slot +
+        accounting.pdcch_gold_bytes_per_slot + accounting.pdcch_candidate_bytes_per_slot +
+        accounting.pdcch_rate_recovery_bytes_per_slot + accounting.pdcch_viterbi_bytes_per_slot +
+        accounting.pdcch_result_bytes_per_slot;
+    accounting.total_bytes = accounting.total_bytes_per_slot * stream_count;
+    return accounting;
+}
+
+std::int64_t memory_delta(std::size_t before_free_bytes, std::size_t after_free_bytes) {
+    if (before_free_bytes >= after_free_bytes) {
+        return static_cast<std::int64_t>(before_free_bytes - after_free_bytes);
+    }
+    return -static_cast<std::int64_t>(after_free_bytes - before_free_bytes);
+}
 
 struct GridBuffers {
     std::array<std::vector<float>, 2> re;
@@ -223,14 +284,195 @@ void run_batch(MmseEqualizerGpuContext& context, const PlanarGridViewF32& grid,
     std::cout << "pdcch_gpu_decode_bench.l8_hits=" << hit_distribution.l8_hits << '\n';
 }
 
+bool query_memory(std::size_t& free_bytes, std::size_t& total_bytes) {
+    if (detail::cuda_query_current_memory_info(free_bytes, total_bytes) != MmseStatus::kOk) {
+        std::cerr << "pdcch_gpu_decode_bench CUDA memory query failed\n";
+        return false;
+    }
+    return true;
+}
+
+bool run_memory_workload(MmseEqualizerGpuContext& context,
+                         const fixture::MixedWorkload& mixed_workload,
+                         std::size_t& free_after_warmup_bytes,
+                         std::size_t& min_observed_free_bytes) {
+    std::vector<pdcch::PdcchGpuCommonSearchDecodeRequest> requests(kMemoryReportBatchSize);
+    std::vector<pdcch::PdcchGpuCommonSearchDecodeResult> results(kMemoryReportBatchSize);
+    const auto run_phase = [&](std::uint32_t phase) {
+        for (std::uint32_t index = 0U; index < kMemoryReportBatchSize; ++index) {
+            const fixture::Case& benchmark_case =
+                mixed_workload
+                    .cases[(static_cast<std::size_t>(phase) * kMemoryReportBatchSize + index) %
+                           mixed_workload.cases.size()];
+            requests[index] = benchmark_case.request;
+            requests[index].input.chain.request_id =
+                static_cast<std::uint64_t>(phase) * kMemoryReportBatchSize + index;
+        }
+        return pdcch::run_pdcch_gpu_common_search_decode_batch(context, requests, results);
+    };
+
+    for (std::uint32_t warmup = 0U; warmup < kWarmupIterations; ++warmup) {
+        if (run_phase(warmup) != MmseStatus::kOk) {
+            std::cerr << "pdcch_gpu_decode_bench memory warmup failed\n";
+            return false;
+        }
+    }
+    std::size_t total_bytes = 0U;
+    if (!query_memory(free_after_warmup_bytes, total_bytes)) {
+        return false;
+    }
+    min_observed_free_bytes = free_after_warmup_bytes;
+    for (std::uint32_t iteration = 0U; iteration < kMeasuredIterations; ++iteration) {
+        if (run_phase(1000U + iteration) != MmseStatus::kOk) {
+            std::cerr << "pdcch_gpu_decode_bench memory measurement failed\n";
+            return false;
+        }
+        std::size_t current_free_bytes = 0U;
+        if (!query_memory(current_free_bytes, total_bytes)) {
+            return false;
+        }
+        min_observed_free_bytes = std::min(min_observed_free_bytes, current_free_bytes);
+    }
+    return true;
+}
+
+bool run_memory_report_case(std::uint8_t n_tx_ports, std::uint8_t tx_mode) {
+    std::size_t free_before_init_bytes = 0U;
+    std::size_t total_bytes = 0U;
+    if (!query_memory(free_before_init_bytes, total_bytes)) {
+        return false;
+    }
+
+    std::size_t free_after_init_bytes = 0U;
+    std::size_t free_after_warmup_bytes = 0U;
+    std::size_t min_observed_free_bytes = std::numeric_limits<std::size_t>::max();
+    {
+        MmseEqualizerGpuContext context;
+        MmseEqualizerGpuConfig config{};
+        config.backend = MmseGpuBackend::kCuda;
+        config.stream_count = kMemoryReportStreamCount;
+        if (context.init(config) != MmseStatus::kOk) {
+            std::cerr << "pdcch_gpu_decode_bench memory context initialization failed\n";
+            return false;
+        }
+        std::size_t total_after_init_bytes = 0U;
+        if (!query_memory(free_after_init_bytes, total_after_init_bytes) ||
+            total_after_init_bytes != total_bytes) {
+            return false;
+        }
+        fixture::MixedWorkload mixed_workload{};
+        if (!fixture::make_mixed_workload(kLteNumPrb20MHz, n_tx_ports, mixed_workload)) {
+            std::cerr << "pdcch_gpu_decode_bench memory workload construction failed\n";
+            return false;
+        }
+        if (!run_memory_workload(context, mixed_workload, free_after_warmup_bytes,
+                                 min_observed_free_bytes)) {
+            return false;
+        }
+    }
+
+    std::size_t free_after_release_bytes = 0U;
+    std::size_t total_after_release_bytes = 0U;
+    if (!query_memory(free_after_release_bytes, total_after_release_bytes) ||
+        total_after_release_bytes != total_bytes) {
+        return false;
+    }
+
+    const DeviceMemoryAccounting accounting =
+        build_device_memory_accounting(kMemoryReportStreamCount);
+    std::cout << "pdcch_gpu_memory.schema=mmse.pdcch.memory.v1\n";
+    std::cout << "pdcch_gpu_memory.workload=mixed\n";
+    std::cout << "pdcch_gpu_memory.n_tx_ports=" << static_cast<unsigned>(n_tx_ports) << '\n';
+    std::cout << "pdcch_gpu_memory.tx_mode=" << static_cast<unsigned>(tx_mode) << '\n';
+    std::cout << "pdcch_gpu_memory.stream_count=" << kMemoryReportStreamCount << '\n';
+    std::cout << "pdcch_gpu_memory.batch=" << kMemoryReportBatchSize << '\n';
+    std::cout << "pdcch_gpu_memory.observed.baseline_scope=post_cuda_runtime_prime\n";
+    std::cout << "pdcch_gpu_memory.accounting.grid_bytes_per_slot="
+              << accounting.grid_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.metadata_bytes_per_slot="
+              << accounting.metadata_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.channel_estimate_bytes_per_slot="
+              << accounting.channel_estimate_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.equalizer_output_bytes_per_slot="
+              << accounting.equalizer_output_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.control_bytes_per_slot="
+              << accounting.control_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.pdcch_llr_bytes_per_slot="
+              << accounting.pdcch_llr_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.pdcch_gold_bytes_per_slot="
+              << accounting.pdcch_gold_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.pdcch_candidate_bytes_per_slot="
+              << accounting.pdcch_candidate_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.pdcch_rate_recovery_bytes_per_slot="
+              << accounting.pdcch_rate_recovery_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.pdcch_viterbi_bytes_per_slot="
+              << accounting.pdcch_viterbi_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.pdcch_result_bytes_per_slot="
+              << accounting.pdcch_result_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.total_bytes_per_slot="
+              << accounting.total_bytes_per_slot << '\n';
+    std::cout << "pdcch_gpu_memory.accounting.total_bytes=" << accounting.total_bytes << '\n';
+    std::cout << "pdcch_gpu_memory.observed.total_bytes=" << total_bytes << '\n';
+    std::cout << "pdcch_gpu_memory.observed.free_before_init_bytes=" << free_before_init_bytes
+              << '\n';
+    std::cout << "pdcch_gpu_memory.observed.free_after_init_bytes=" << free_after_init_bytes
+              << '\n';
+    std::cout << "pdcch_gpu_memory.observed.free_after_warmup_bytes=" << free_after_warmup_bytes
+              << '\n';
+    std::cout << "pdcch_gpu_memory.observed.min_free_bytes=" << min_observed_free_bytes << '\n';
+    std::cout << "pdcch_gpu_memory.observed.free_after_release_bytes=" << free_after_release_bytes
+              << '\n';
+    std::cout << "pdcch_gpu_memory.observed.init_delta_bytes="
+              << memory_delta(free_before_init_bytes, free_after_init_bytes) << '\n';
+    std::cout << "pdcch_gpu_memory.observed.run_peak_delta_after_init_bytes="
+              << memory_delta(free_after_init_bytes, min_observed_free_bytes) << '\n';
+    std::cout << "pdcch_gpu_memory.observed.peak_delta_from_baseline_bytes="
+              << memory_delta(free_before_init_bytes, min_observed_free_bytes) << '\n';
+    std::cout << "pdcch_gpu_memory.observed.unreleased_delta_bytes="
+              << memory_delta(free_before_init_bytes, free_after_release_bytes) << '\n';
+    return true;
+}
+
+int run_memory_report() {
+    bool runtime_available = false;
+    if (detail::cuda_select_device(0U, runtime_available) != MmseStatus::kOk ||
+        !runtime_available) {
+        std::cerr << "pdcch_gpu_decode_bench failed to select CUDA device 0\n";
+        return 1;
+    }
+    {
+        MmseEqualizerGpuContext context;
+        MmseEqualizerGpuConfig config{};
+        config.backend = MmseGpuBackend::kCuda;
+        config.stream_count = kMemoryReportStreamCount;
+        fixture::MixedWorkload mixed_workload{};
+        std::size_t free_after_warmup_bytes = 0U;
+        std::size_t min_observed_free_bytes = 0U;
+        if (context.init(config) != MmseStatus::kOk ||
+            !fixture::make_mixed_workload(kLteNumPrb20MHz, 1U, mixed_workload) ||
+            !run_memory_workload(context, mixed_workload, free_after_warmup_bytes,
+                                 min_observed_free_bytes)) {
+            std::cerr << "pdcch_gpu_decode_bench CUDA runtime prime failed\n";
+            return 1;
+        }
+    }
+    if (!run_memory_report_case(1U, 1U) || !run_memory_report_case(2U, 2U)) {
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--memory-report") {
+        return run_memory_report();
+    }
     fixture::Workload workload = fixture::Workload::kMixed;
     if (argc == 3 && std::string_view(argv[1]) == "--workload" &&
         fixture::parse_workload(argv[2], workload)) {
     } else if (argc != 1) {
-        std::cerr << "usage: pdcch_gpu_decode_bench [--workload mixed|random]\n";
+        std::cerr << "usage: pdcch_gpu_decode_bench [--workload mixed|random] | --memory-report\n";
         return 2;
     }
     const GridBuffers grid_buffers = make_random_grid(42U);
