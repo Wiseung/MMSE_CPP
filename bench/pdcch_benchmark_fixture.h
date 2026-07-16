@@ -17,6 +17,8 @@ namespace mmse::benchmark::pdcch_fixture {
 
 constexpr std::uint32_t kDefaultCellId = 1U;
 constexpr float kQpskAxis = 0.7071067811865475F;
+constexpr mmse::detail::Complex32 kSingleRxPort0Channel{1.0F, 0.0F};
+constexpr mmse::detail::Complex32 kSingleRxPort1Channel{0.5F, 0.25F};
 
 enum class Workload {
     kRandom,
@@ -110,8 +112,8 @@ constexpr std::uint16_t kFixedFirstCce = 4U;
 inline PlanarGridViewF32 make_grid_view(const GridBuffers& buffers, std::uint32_t n_rx_ant,
                                         std::uint64_t generation) noexcept {
     return {
-        .re = {buffers.re[0].data(), buffers.re[1].data()},
-        .im = {buffers.im[0].data(), buffers.im[1].data()},
+        .re = {buffers.re[0].data(), n_rx_ant > 1U ? buffers.re[1].data() : nullptr},
+        .im = {buffers.im[0].data(), n_rx_ant > 1U ? buffers.im[1].data() : nullptr},
         .n_rx_ant = n_rx_ant,
         .n_symbols = kLteNumSymbolsNormalCp,
         .n_subcarriers = static_cast<std::uint32_t>(buffers.re[0].size() / kLteNumSymbolsNormalCp),
@@ -303,8 +305,11 @@ inline void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor&
                                    mmse::detail::kCrsSymbols.end(), symbol) -
                          mmse::detail::kCrsSymbols.begin())},
                     pilot);
-                buffers.re[0][index] = crs.re;
-                buffers.im[0][index] = crs.im;
+                const auto sample = desc.n_rx_ant == 1U && desc.n_tx_ports == 2U
+                                        ? mmse::detail::cmul(kSingleRxPort0Channel, crs)
+                                        : crs;
+                buffers.re[0][index] = sample.re;
+                buffers.im[0][index] = sample.im;
             } else if (is_port1_crs) {
                 const std::uint32_t pilot =
                     (sc - mmse::detail::crs_frequency_offset(desc.cell_id, 1U,
@@ -319,15 +324,34 @@ inline void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor&
                                    mmse::detail::kCrsSymbols.end(), symbol) -
                          mmse::detail::kCrsSymbols.begin())},
                     pilot);
-                buffers.re[1][index] = crs.re;
-                buffers.im[1][index] = crs.im;
+                if (desc.n_rx_ant == 1U) {
+                    const auto sample = mmse::detail::cmul(kSingleRxPort1Channel, crs);
+                    buffers.re[0][index] = sample.re;
+                    buffers.im[0][index] = sample.im;
+                } else {
+                    buffers.re[1][index] = crs.re;
+                    buffers.im[1][index] = crs.im;
+                }
             }
         }
     }
 }
 
-inline void fill_td_pair(GridBuffers& buffers, std::uint16_t grid0, std::uint16_t grid1,
-                         mmse::detail::Complex32 s0, mmse::detail::Complex32 s1) noexcept {
+inline void fill_td_pair(GridBuffers& buffers, std::uint32_t n_rx_ant, std::uint16_t grid0,
+                         std::uint16_t grid1, mmse::detail::Complex32 s0,
+                         mmse::detail::Complex32 s1) noexcept {
+    if (n_rx_ant == 1U) {
+        const auto y0 = mmse::detail::cadd(mmse::detail::cmul(kSingleRxPort0Channel, s0),
+                                           mmse::detail::cmul(kSingleRxPort1Channel, s1));
+        const auto y1 =
+            mmse::detail::csub(mmse::detail::cmul(kSingleRxPort0Channel, mmse::detail::cconj(s1)),
+                               mmse::detail::cmul(kSingleRxPort1Channel, mmse::detail::cconj(s0)));
+        buffers.re[0][grid0] = y0.re;
+        buffers.im[0][grid0] = y0.im;
+        buffers.re[0][grid1] = y1.re;
+        buffers.im[0][grid1] = y1.im;
+        return;
+    }
     buffers.re[0][grid0] = s0.re;
     buffers.im[0][grid0] = s0.im;
     buffers.re[1][grid0] = s1.re;
@@ -446,17 +470,19 @@ inline bool add_symbols(Case& benchmark_case, const pdcch::PdcchCommonSearchCand
     return true;
 }
 
-inline bool make_case(std::uint16_t n_prb, std::uint8_t n_tx_ports, std::uint32_t sfn_subframe,
-                      std::uint64_t generation,
+inline bool make_case(std::uint16_t n_prb, std::uint8_t n_tx_ports, std::uint8_t n_rx_ant,
+                      std::uint32_t sfn_subframe, std::uint64_t generation,
                       const std::vector<std::pair<std::uint8_t, std::uint16_t>>& candidates_to_fill,
                       Case& benchmark_case) {
+    if ((n_rx_ant != 1U && n_rx_ant != 2U) || (n_tx_ports == 4U && n_rx_ant != 1U)) {
+        return false;
+    }
     benchmark_case = {};
     const std::uint32_t n_subcarriers = lte_downlink_subcarrier_count(n_prb);
     for (std::uint32_t rx = 0U; rx < kMmseV1MaxNumRxAntennas; ++rx) {
         benchmark_case.buffers.re[rx].assign(kLteNumSymbolsNormalCp * n_subcarriers, 0.0F);
         benchmark_case.buffers.im[rx].assign(kLteNumSymbolsNormalCp * n_subcarriers, 0.0F);
     }
-    const std::uint32_t n_rx_ant = n_tx_ports == 4U ? 1U : kMmseV1MaxNumRxAntennas;
     const PlanarGridViewF32 grid = make_grid_view(benchmark_case.buffers, n_rx_ant, generation);
     benchmark_case.request =
         make_request(grid, sfn_subframe, kDefaultCellId, n_prb, n_tx_ports, generation);
@@ -508,15 +534,17 @@ inline bool make_case(std::uint16_t n_prb, std::uint8_t n_tx_ports, std::uint32_
         for (std::uint32_t re = 0U; re < layout.n_re; ++re) {
             benchmark_case.buffers.re[0][layout.grid_indices[re]] = symbols[re].re;
             benchmark_case.buffers.im[0][layout.grid_indices[re]] = symbols[re].im;
-            benchmark_case.buffers.re[1][layout.grid_indices[re]] = symbols[re].re;
-            benchmark_case.buffers.im[1][layout.grid_indices[re]] = symbols[re].im;
+            if (input.grid.n_rx_ant > 1U) {
+                benchmark_case.buffers.re[1][layout.grid_indices[re]] = symbols[re].re;
+                benchmark_case.buffers.im[1][layout.grid_indices[re]] = symbols[re].im;
+            }
         }
     } else if (input.n_tx_ports == 2U) {
         if ((layout.n_re & 1U) != 0U) {
             return false;
         }
         for (std::uint32_t re = 0U; re < layout.n_re; re += 2U) {
-            fill_td_pair(benchmark_case.buffers, layout.grid_indices[re],
+            fill_td_pair(benchmark_case.buffers, input.grid.n_rx_ant, layout.grid_indices[re],
                          layout.grid_indices[re + 1U], symbols[re], symbols[re + 1U]);
         }
     } else if (input.n_tx_ports == 4U) {
@@ -535,7 +563,7 @@ inline bool make_case(std::uint16_t n_prb, std::uint8_t n_tx_ports, std::uint32_
     return true;
 }
 
-inline bool make_mixed_workload(std::uint16_t n_prb, std::uint8_t n_tx_ports,
+inline bool make_mixed_workload(std::uint16_t n_prb, std::uint8_t n_tx_ports, std::uint8_t n_rx_ant,
                                 MixedWorkload& workload) {
     workload = {};
     workload.cases.reserve(4U);
@@ -551,7 +579,7 @@ inline bool make_mixed_workload(std::uint16_t n_prb, std::uint8_t n_tx_ports,
     };
     for (std::size_t index = 0U; index < case_candidates.size(); ++index) {
         Case benchmark_case{};
-        if (!make_case(n_prb, n_tx_ports, static_cast<std::uint32_t>(index), index + 1U,
+        if (!make_case(n_prb, n_tx_ports, n_rx_ant, static_cast<std::uint32_t>(index), index + 1U,
                        case_candidates[index], benchmark_case)) {
             workload = {};
             return false;

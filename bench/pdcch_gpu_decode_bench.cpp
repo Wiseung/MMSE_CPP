@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
@@ -103,8 +104,8 @@ GridBuffers make_random_grid(std::uint32_t seed) {
 
 PlanarGridViewF32 make_grid_view(const GridBuffers& buffers, std::uint32_t n_rx_ant) {
     return {
-        .re = {buffers.re[0].data(), buffers.re[1].data()},
-        .im = {buffers.im[0].data(), buffers.im[1].data()},
+        .re = {buffers.re[0].data(), n_rx_ant > 1U ? buffers.re[1].data() : nullptr},
+        .im = {buffers.im[0].data(), n_rx_ant > 1U ? buffers.im[1].data() : nullptr},
         .n_rx_ant = n_rx_ant,
         .n_symbols = kLteNumSymbolsNormalCp,
         .n_subcarriers = kLteNumSubcarriers20MHz,
@@ -505,7 +506,7 @@ bool run_memory_report_case(std::uint8_t n_tx_ports, std::uint8_t tx_mode) {
             return false;
         }
         fixture::MixedWorkload mixed_workload{};
-        if (!fixture::make_mixed_workload(kLteNumPrb20MHz, n_tx_ports, mixed_workload)) {
+        if (!fixture::make_mixed_workload(kLteNumPrb20MHz, n_tx_ports, 2U, mixed_workload)) {
             std::cerr << "pdcch_gpu_decode_bench memory workload construction failed\n";
             return false;
         }
@@ -593,7 +594,7 @@ int run_memory_report() {
         std::size_t free_after_warmup_bytes = 0U;
         std::size_t min_observed_free_bytes = 0U;
         if (context.init(config) != MmseStatus::kOk ||
-            !fixture::make_mixed_workload(kLteNumPrb20MHz, 1U, mixed_workload) ||
+            !fixture::make_mixed_workload(kLteNumPrb20MHz, 1U, 2U, mixed_workload) ||
             !run_memory_workload(context, mixed_workload, free_after_warmup_bytes,
                                  min_observed_free_bytes)) {
             std::cerr << "pdcch_gpu_decode_bench CUDA runtime prime failed\n";
@@ -613,17 +614,41 @@ int main(int argc, char** argv) {
         return run_memory_report();
     }
     fixture::Workload workload = fixture::Workload::kMixed;
-    if (argc == 3 && std::string_view(argv[1]) == "--workload" &&
-        fixture::parse_workload(argv[2], workload)) {
-    } else if (argc != 1) {
-        std::cerr << "usage: pdcch_gpu_decode_bench [--workload fixed|mixed|random] | "
-                     "--memory-report\n";
+    std::uint8_t n_rx_ant = 1U;
+    bool n_rx_ant_explicit = false;
+    bool valid_arguments = (argc & 1) != 0;
+    for (int index = 1; valid_arguments && index + 1 < argc; index += 2) {
+        const std::string_view option(argv[index]);
+        if (option == "--workload") {
+            valid_arguments = fixture::parse_workload(argv[index + 1], workload);
+        } else if (option == "--n-rx-ant") {
+            unsigned int value = 0U;
+            const char* const text = argv[index + 1];
+            const auto [end, error] =
+                std::from_chars(text, text + std::char_traits<char>::length(text), value);
+            valid_arguments = error == std::errc{} && *end == '\0' && (value == 1U || value == 2U);
+            if (valid_arguments) {
+                n_rx_ant = static_cast<std::uint8_t>(value);
+                n_rx_ant_explicit = true;
+            }
+        } else {
+            valid_arguments = false;
+        }
+    }
+    if (!n_rx_ant_explicit && workload == fixture::Workload::kFixed) {
+        n_rx_ant = 2U;
+    }
+    if (!valid_arguments || (workload == fixture::Workload::kFixed && n_rx_ant != 2U)) {
+        std::cerr << "usage: pdcch_gpu_decode_bench [--workload fixed|mixed|random] "
+                     "[--n-rx-ant 1|2] | --memory-report\n"
+                     "       defaults to 1Rx; fixed and memory-report retain their historical "
+                     "2Rx scope\n";
         return 2;
     }
     const GridBuffers grid_buffers = make_random_grid(42U);
     fixture::MixedWorkload fixed_workload{};
     if (workload == fixture::Workload::kFixed &&
-        !fixture::make_mixed_workload(kLteNumPrb20MHz, 1U, fixed_workload)) {
+        !fixture::make_mixed_workload(kLteNumPrb20MHz, 1U, 2U, fixed_workload)) {
         std::cerr << "pdcch_gpu_decode_bench fixed workload construction failed\n";
         return 1;
     }
@@ -670,11 +695,12 @@ int main(int argc, char** argv) {
         }
         for (const auto [n_tx_ports, tx_mode] :
              {std::pair<std::uint8_t, std::uint8_t>{1U, 1U}, {2U, 2U}, {4U, 2U}}) {
-            const PlanarGridViewF32 grid =
-                make_grid_view(grid_buffers, n_tx_ports == 4U ? 1U : kMmseV1MaxNumRxAntennas);
+            const std::uint8_t case_n_rx_ant = n_tx_ports == 4U ? 1U : n_rx_ant;
+            const PlanarGridViewF32 grid = make_grid_view(grid_buffers, case_n_rx_ant);
             fixture::MixedWorkload mixed_workload{};
             if (workload == fixture::Workload::kMixed &&
-                !fixture::make_mixed_workload(kLteNumPrb20MHz, n_tx_ports, mixed_workload)) {
+                !fixture::make_mixed_workload(kLteNumPrb20MHz, n_tx_ports, case_n_rx_ant,
+                                              mixed_workload)) {
                 std::cerr << "pdcch_gpu_decode_bench mixed workload construction failed\n";
                 return 1;
             }

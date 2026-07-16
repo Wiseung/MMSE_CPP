@@ -4292,7 +4292,14 @@ GpuPdcchDecodeCase make_gpu_pdcch_decode_case(std::uint8_t control_symbol_count,
 
     GpuPdcchDecodeCase test_case{};
     test_case.buffers = make_zero_grid();
-    fill_identity_channel(test_case.buffers, desc, 0.0F, 0.0F);
+    const Complex32 h00{1.0F, 0.0F};
+    const Complex32 h01 =
+        n_tx_ports == 2U && n_rx_ant == 1U ? Complex32{0.5F, 0.25F} : Complex32{0.0F, 0.0F};
+    if (n_tx_ports == 2U && n_rx_ant == 1U) {
+        fill_constant_mimo_channel(test_case.buffers, desc, h00, h01, {}, {}, {}, {});
+    } else {
+        fill_identity_channel(test_case.buffers, desc, 0.0F, 0.0F);
+    }
     mmse::detail::ReLayout layout{};
     const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
     mmse::pdcch::PdcchControlRegion control_region{};
@@ -4324,8 +4331,9 @@ GpuPdcchDecodeCase make_gpu_pdcch_decode_case(std::uint8_t control_symbol_count,
         } else {
             for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
                 fill_td_pair(test_case.buffers, layout.grid_indices[re],
-                             layout.grid_indices[re + 1U], {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
-                             {1.0F, 0.0F}, symbols[re], symbols[re + 1U]);
+                             layout.grid_indices[re + 1U], h00, h01, {0.0F, 0.0F},
+                             n_rx_ant == 1U ? Complex32{} : Complex32{1.0F, 0.0F}, symbols[re],
+                             symbols[re + 1U]);
             }
         }
     }
@@ -4849,23 +4857,25 @@ void test_pdcch_cpu_si_rnti_search_runs_full_two_tx_chain() {
     expect_true(context.init(cpu_config) == MmseStatus::kOk, "native SI two-tx cpu init");
 
     auto desc = make_pdcch_desc();
+    desc.n_rx_ant = 1U;
     desc.n_tx_ports = 2U;
     desc.tx_mode = 2U;
     GridBuffers buffers = make_zero_grid();
-    fill_identity_channel(buffers, desc, 0.0F, 0.0F);
+    const Complex32 h0{1.0F, 0.0F};
+    const Complex32 h1{0.5F, 0.25F};
+    fill_constant_mimo_channel(buffers, desc, h0, h1, {}, {}, {}, {});
     mmse::detail::ReLayout layout{};
     const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
     const auto symbols = make_native_si_rnti_qpsk_symbols(
         n_source_re, 4U, 4U, make_si_rnti_dci_format1a_bits(), desc.cell_id, desc.sfn_subframe);
     expect_true((n_source_re & 1U) == 0U, "native SI two-tx source RE count must be even");
     for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
-        fill_pdcch_td_pair(buffers, desc, layout.grid_indices[re], layout.grid_indices[re + 1U],
-                           {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F}, {1.0F, 0.0F}, symbols[re],
-                           symbols[re + 1U]);
+        fill_pdcch_td_pair(buffers, desc, layout.grid_indices[re], layout.grid_indices[re + 1U], h0,
+                           h1, {}, {}, symbols[re], symbols[re + 1U]);
     }
 
     PdcchMmseInput input{};
-    input.grid = make_grid_view(buffers);
+    input.grid = make_single_rx_grid_view(buffers);
     input.sfn_subframe = desc.sfn_subframe;
     input.cell_id = desc.cell_id;
     input.n_tx_ports = desc.n_tx_ports;
