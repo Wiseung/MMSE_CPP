@@ -15,6 +15,7 @@
 - [LTE DCI 输出语义与 CE/MMSE 接口说明](G:\MMSE_CPP\docs\lte_dci_and_ce_mmse_reference.md)
 - [PBCH 快速开始](G:\MMSE_CPP\docs\pbch_chain_sdk_quick_start.md)
 - [PCFICH 快速开始与 API 参考](G:\MMSE_CPP\docs\pcfich_chain_sdk_quick_start_api_reference.md)
+  两页均包含 `4Tx x 1Rx` Td4 raw equalized output、固定容量和最终译码边界。
 - [PDSCH 下游 LLR / 解扰接口面快速开始与 API 参考](G:\MMSE_CPP\docs\pdsch_llr_downstream_quick_start_api_reference.md)
   包含通用空间复用与 `2Tx` transmit-diversity 均衡输出接入下游 `LLR` helper 的方式。
 
@@ -22,6 +23,7 @@
 
 - [PDCCH Chain SDK 文档首页](G:\MMSE_CPP\docs\pdcch_chain_sdk_interface.md)
 - [PDCCH Chain SDK 快速开始](G:\MMSE_CPP\docs\pdcch_chain_sdk_quick_start.md)
+  包含 Td4 四源 RE、CCE 归一化、CPU dispatcher 和 CPU/GPU 4Tx benchmark 命令。
 - [PDCCH Chain SDK API 参考](G:\MMSE_CPP\docs\pdcch_chain_sdk_api_reference.md)
 - [PDCCH Chain SDK 版本策略](G:\MMSE_CPP\docs\pdcch_chain_sdk_versioning_policy.md)
 - [PDCCH Module API 集成示例](G:\MMSE_CPP\docs\pdcch_module_api_example.md)

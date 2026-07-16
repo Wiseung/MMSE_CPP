@@ -73,7 +73,7 @@ __device__ inline CudaComplex32 load_grid_sample(const float* re_plane, const fl
 __device__ inline CudaComplex32 ls_at(const float* re_plane, const float* im_plane,
                                       const CudaGridMeta* grid_meta, std::uint32_t tx,
                                       std::uint32_t rx, std::uint32_t cs, std::uint32_t pilot) {
-    const std::uint32_t symbol = grid_meta->crs_symbols[cs];
+    const std::uint32_t symbol = grid_meta->crs_symbols[tx][cs];
     const std::uint32_t sc = 6U * pilot + grid_meta->crs_freq_offsets[tx][cs];
     const std::uint32_t grid_idx = symbol * grid_meta->n_subcarriers + sc;
     // CRS reference has unit magnitude, so multiplying by its conjugate is the
@@ -118,17 +118,21 @@ __device__ inline CudaComplex32 estimate_h_at(const float* re_plane, const float
                                               std::uint32_t sc) {
     // Frequency interpolation is performed independently at the two enclosing
     // CRS symbols; a second linear interpolation then fills the target symbol.
+    const std::uint32_t crs_count = min_u32(grid_meta->crs_symbol_counts[tx], kLteNumCrsSymbols);
+    if (crs_count < 2U) {
+        return {};
+    }
     std::uint32_t upper = 0U;
-    while (upper < kLteNumCrsSymbols && grid_meta->crs_symbols[upper] < symbol) {
+    while (upper < crs_count && grid_meta->crs_symbols[tx][upper] < symbol) {
         ++upper;
     }
     std::uint32_t lower = (upper == 0U) ? 0U : upper - 1U;
-    if (upper >= kLteNumCrsSymbols) {
-        lower = kLteNumCrsSymbols - 2U;
-        upper = kLteNumCrsSymbols - 1U;
+    if (upper >= crs_count) {
+        lower = crs_count - 2U;
+        upper = crs_count - 1U;
     }
-    const std::uint32_t left_symbol = grid_meta->crs_symbols[lower];
-    const std::uint32_t right_symbol = grid_meta->crs_symbols[upper];
+    const std::uint32_t left_symbol = grid_meta->crs_symbols[tx][lower];
+    const std::uint32_t right_symbol = grid_meta->crs_symbols[tx][upper];
     const CudaComplex32 left = interpolate_freq(re_plane, im_plane, grid_meta, tx, rx, lower, sc);
     const CudaComplex32 right = interpolate_freq(re_plane, im_plane, grid_meta, tx, rx, upper, sc);
     if (left_symbol != right_symbol) {
@@ -198,9 +202,12 @@ __global__ void estimate_residual_kernel(const float* grid_re0, const float* gri
     }
 
     const std::uint32_t tx_count = min_u32(grid_meta->n_tx_ports, kMmseV1MaxNumCrsTxPorts);
-    const std::uint32_t total_items = tx_count *
-                                      min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas) *
-                                      kLteNumCrsSymbols * (kLteNumPilotTonesPerCrsSymbol - 2U);
+    const std::uint32_t rx_count = min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas);
+    std::uint32_t total_items = 0U;
+    for (std::uint32_t tx = 0U; tx < tx_count; ++tx) {
+        total_items += min_u32(grid_meta->crs_symbol_counts[tx], kLteNumCrsSymbols) * rx_count *
+                       (kLteNumPilotTonesPerCrsSymbol - 2U);
+    }
 
     // Stride over pilot residuals so the fixed grid can be processed with any
     // launch size. Block-local sums are reduced with two global atomics only
@@ -210,14 +217,25 @@ __global__ void estimate_residual_kernel(const float* grid_re0, const float* gri
     const std::uint32_t stride = blockDim.x * gridDim.x;
     for (std::uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < total_items;
          item += stride) {
-        std::uint32_t index = item;
-        const std::uint32_t pilot = (index % (kLteNumPilotTonesPerCrsSymbol - 2U)) + 1U;
-        index /= (kLteNumPilotTonesPerCrsSymbol - 2U);
-        const std::uint32_t cs = index % kLteNumCrsSymbols;
-        index /= kLteNumCrsSymbols;
-        const std::uint32_t rx = index % min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas);
-        index /= min_u32(grid_meta->n_rx_ant, kMmseV1MaxNumRxAntennas);
-        const std::uint32_t tx = index;
+        const std::uint32_t pilot =
+            (item % (kLteNumPilotTonesPerCrsSymbol - 2U)) + 1U;
+        std::uint32_t port_symbol_rx = item / (kLteNumPilotTonesPerCrsSymbol - 2U);
+        const std::uint32_t rx = port_symbol_rx % rx_count;
+        port_symbol_rx /= rx_count;
+        std::uint32_t tx = 0U;
+        std::uint32_t cs = 0U;
+        for (; tx < tx_count; ++tx) {
+            const std::uint32_t count =
+                min_u32(grid_meta->crs_symbol_counts[tx], kLteNumCrsSymbols);
+            if (port_symbol_rx < count) {
+                cs = port_symbol_rx;
+                break;
+            }
+            port_symbol_rx -= count;
+        }
+        if (tx >= tx_count) {
+            continue;
+        }
 
         const float* re_plane = (rx == 0U) ? grid_re0 : grid_re1;
         const float* im_plane = (rx == 0U) ? grid_im0 : grid_im1;
@@ -318,6 +336,65 @@ __global__ void zero_estimate_accumulators_kernel(float* sigma2_accum_out,
     }
 }
 
+struct CudaTransmitDiversityPairResult {
+    CudaComplex32 symbol0{};
+    CudaComplex32 symbol1{};
+    float gamma0 = 0.0F;
+    float gamma1 = 0.0F;
+};
+
+__device__ inline CudaTransmitDiversityPairResult demap_transmit_diversity_pair(
+    CudaComplex32 h00, CudaComplex32 h01, CudaComplex32 h10, CudaComplex32 h11,
+    CudaComplex32 h00n, CudaComplex32 h01n, CudaComplex32 h10n, CudaComplex32 h11n,
+    CudaComplex32 y0, CudaComplex32 y1, CudaComplex32 y0n, CudaComplex32 y1n, float sigma2,
+    float det_floor, float g_min, float gamma_max) {
+    const CudaComplex32 a00[] = {h00, h10, cscale(cconj(h01n), -1.0F),
+                                 cscale(cconj(h11n), -1.0F)};
+    const CudaComplex32 a01[] = {h01, h11, cconj(h00n), cconj(h10n)};
+    const CudaComplex32 observations[] = {y0, y1, cconj(y0n), cconj(y1n)};
+    float gram00 = sigma2 > 0.0F ? sigma2 : 0.0F;
+    float gram11 = gram00;
+    CudaComplex32 gram01{};
+    CudaComplex32 z0{};
+    CudaComplex32 z1{};
+    for (std::uint32_t row = 0U; row < 4U; ++row) {
+        gram00 += cnorm2(a00[row]);
+        gram11 += cnorm2(a01[row]);
+        gram01 = cadd(gram01, cmul(cconj(a00[row]), a01[row]));
+        z0 = cadd(z0, cmul(cconj(a00[row]), observations[row]));
+        z1 = cadd(z1, cmul(cconj(a01[row]), observations[row]));
+    }
+    float det = gram00 * gram11 - cnorm2(gram01);
+    det = det < det_floor ? det_floor : det;
+    const float inv_det = 1.0F / det;
+    const float inv00 = gram11 * inv_det;
+    const float inv11 = gram00 * inv_det;
+    const CudaComplex32 inv01 = cscale(gram01, -inv_det);
+    const CudaComplex32 inv10 = cconj(inv01);
+    const CudaComplex32 x0 = cadd(cscale(z0, inv00), cmul(inv01, z1));
+    const CudaComplex32 x1 = cadd(cmul(inv10, z0), cscale(z1, inv11));
+    float g0 = 1.0F - (sigma2 > 0.0F ? sigma2 : 0.0F) * inv00;
+    float g1 = 1.0F - (sigma2 > 0.0F ? sigma2 : 0.0F) * inv11;
+    g0 = clampf(g0, g_min, 1.0F - g_min);
+    g1 = clampf(g1, g_min, 1.0F - g_min);
+    return {
+        .symbol0 = cscale(x0, 1.0F / g0),
+        .symbol1 = cscale(x1, 1.0F / g1),
+        .gamma0 = clampf(g0 / (1.0F - g0), g_min, gamma_max),
+        .gamma1 = clampf(g1 / (1.0F - g1), g_min, gamma_max),
+    };
+}
+
+__device__ inline CudaComplex32 load_h_estimate(const float* h_estimate, std::uint32_t tx,
+                                                 std::uint32_t rx, std::uint32_t symbol,
+                                                 std::uint32_t sc) {
+    const std::uint32_t base =
+        2U * (((tx * kMmseV1MaxNumRxAntennas + rx) * kLteNumSymbolsNormalCp + symbol) *
+                  kLteNumSubcarriers20MHz +
+              sc);
+    return {h_estimate[base], h_estimate[base + 1U]};
+}
+
 __global__ void equalize_stub_kernel(const float* grid_re0, const float* grid_re1,
                                      const float* grid_im0, const float* grid_im1,
                                      const float* h_estimate, const float* sigma2_in,
@@ -348,9 +425,12 @@ __global__ void equalize_stub_kernel(const float* grid_re0, const float* grid_re
         const float g_min = grid_meta->g_min;
         const float gamma_max = grid_meta->gamma_max;
         const bool td_mode = grid_meta->td_pair_count != 0U;
-        const std::uint32_t grid_idx = td_mode && re < grid_meta->td_pair_count
-                                           ? grid_meta->td_pair_grid_indices0[re]
-                                           : grid_meta->grid_indices[re];
+        const bool td_quad_mode = grid_meta->td_quad_count != 0U;
+        const std::uint32_t grid_idx =
+            td_quad_mode && re < grid_meta->td_quad_count
+                ? grid_meta->td_quad_grid_indices0[re]
+                : (td_mode && re < grid_meta->td_pair_count ? grid_meta->td_pair_grid_indices0[re]
+                                                            : grid_meta->grid_indices[re]);
         const std::uint32_t out_slot =
             grid_meta->channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
                     grid_meta->n_tx_ports == 1U && grid_meta->td_pair_count == 0U
@@ -387,7 +467,47 @@ __global__ void equalize_stub_kernel(const float* grid_re0, const float* grid_re
         const float h10_re = has_rx1 ? h_estimate[h10_base] : 0.0F;
         const float h10_im = has_rx1 ? h_estimate[h10_base + 1U] : 0.0F;
 
-        if (td_mode && re < grid_meta->td_pair_count) {
+        if (td_quad_mode && re < grid_meta->td_quad_count) {
+            const std::uint32_t grid_idx1 = grid_meta->td_quad_grid_indices1[re];
+            const std::uint32_t grid_idx2 = grid_meta->td_quad_grid_indices2[re];
+            const std::uint32_t grid_idx3 = grid_meta->td_quad_grid_indices3[re];
+            const std::uint32_t symbol1 = grid_idx1 / grid_meta->n_subcarriers;
+            const std::uint32_t sc1 = grid_idx1 % grid_meta->n_subcarriers;
+            const std::uint32_t symbol2 = grid_idx2 / grid_meta->n_subcarriers;
+            const std::uint32_t sc2 = grid_idx2 % grid_meta->n_subcarriers;
+            const std::uint32_t symbol3 = grid_idx3 / grid_meta->n_subcarriers;
+            const std::uint32_t sc3 = grid_idx3 % grid_meta->n_subcarriers;
+            const CudaTransmitDiversityPairResult first = demap_transmit_diversity_pair(
+                load_h_estimate(h_estimate, 0U, 0U, symbol, sc),
+                load_h_estimate(h_estimate, 1U, 0U, symbol, sc), {}, {},
+                load_h_estimate(h_estimate, 0U, 0U, symbol1, sc1),
+                load_h_estimate(h_estimate, 1U, 0U, symbol1, sc1), {}, {}, {y0_re, y0_im}, {},
+                load_grid_sample(grid_re0, grid_im0, grid_idx1), {}, sigma2, det_floor, g_min,
+                gamma_max);
+            const CudaTransmitDiversityPairResult second = demap_transmit_diversity_pair(
+                load_h_estimate(h_estimate, 2U, 0U, symbol2, sc2),
+                load_h_estimate(h_estimate, 3U, 0U, symbol2, sc2), {}, {},
+                load_h_estimate(h_estimate, 2U, 0U, symbol3, sc3),
+                load_h_estimate(h_estimate, 3U, 0U, symbol3, sc3), {}, {},
+                load_grid_sample(grid_re0, grid_im0, grid_idx2), {},
+                load_grid_sample(grid_re0, grid_im0, grid_idx3), {}, sigma2, det_floor, g_min,
+                gamma_max);
+            const std::uint32_t out0 = re * 4U;
+            xhat_re[out0] = first.symbol0.re;
+            xhat_im[out0] = first.symbol0.im;
+            sinr[out0] = first.gamma0;
+            xhat_re[out0 + 1U] = first.symbol1.re;
+            xhat_im[out0 + 1U] = first.symbol1.im;
+            sinr[out0 + 1U] = first.gamma1;
+            xhat_re[out0 + 2U] = second.symbol0.re;
+            xhat_im[out0 + 2U] = second.symbol0.im;
+            sinr[out0 + 2U] = second.gamma0;
+            xhat_re[out0 + 3U] = second.symbol1.re;
+            xhat_im[out0 + 3U] = second.symbol1.im;
+            sinr[out0 + 3U] = second.gamma1;
+        } else if (td_quad_mode) {
+            // One CUDA thread processes a complete explicit TD4 quartet.
+        } else if (td_mode && re < grid_meta->td_pair_count) {
             // Alamouti pair: combine two grid positions as four virtual rows,
             // then apply the same regularized 2x2 solve used by the CPU path.
             const std::uint32_t next_grid_idx = grid_meta->td_pair_grid_indices1[re];
@@ -1120,6 +1240,38 @@ MmseStatus cuda_copy_grid_meta_dynamic_h2d_async(const CudaDeviceBuffers& buffer
     }
     if (const cudaError_t status = cudaMemcpyAsync(
             reinterpret_cast<std::byte*>(buffers.grid_meta) +
+                offsetof(CudaGridMeta, td_quad_grid_indices0),
+            grid_meta.td_quad_grid_indices0, sizeof(grid_meta.td_quad_grid_indices0),
+            cudaMemcpyHostToDevice, stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    if (const cudaError_t status = cudaMemcpyAsync(
+            reinterpret_cast<std::byte*>(buffers.grid_meta) +
+                offsetof(CudaGridMeta, td_quad_grid_indices1),
+            grid_meta.td_quad_grid_indices1, sizeof(grid_meta.td_quad_grid_indices1),
+            cudaMemcpyHostToDevice, stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    if (const cudaError_t status = cudaMemcpyAsync(
+            reinterpret_cast<std::byte*>(buffers.grid_meta) +
+                offsetof(CudaGridMeta, td_quad_grid_indices2),
+            grid_meta.td_quad_grid_indices2, sizeof(grid_meta.td_quad_grid_indices2),
+            cudaMemcpyHostToDevice, stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    if (const cudaError_t status = cudaMemcpyAsync(
+            reinterpret_cast<std::byte*>(buffers.grid_meta) +
+                offsetof(CudaGridMeta, td_quad_grid_indices3),
+            grid_meta.td_quad_grid_indices3, sizeof(grid_meta.td_quad_grid_indices3),
+            cudaMemcpyHostToDevice, stream);
+        status != cudaSuccess) {
+        return map_cuda_error(status);
+    }
+    if (const cudaError_t status = cudaMemcpyAsync(
+            reinterpret_cast<std::byte*>(buffers.grid_meta) +
                 offsetof(CudaGridMeta, output_slot_by_grid_re),
             grid_meta.output_slot_by_grid_re, sizeof(grid_meta.output_slot_by_grid_re),
             cudaMemcpyHostToDevice, stream);
@@ -1370,26 +1522,37 @@ MmseStatus cuda_launch_pdcch_viterbi(const CudaDeviceBuffers& buffers,
     return map_cuda_error(cudaGetLastError());
 }
 
-MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers& buffers,
-                                         std::uint32_t candidate_count, std::uint16_t expected_rnti,
-                                         std::uintptr_t stream_handle) {
+MmseStatus cuda_launch_pdcch_crc(const CudaDeviceBuffers& buffers,
+                                 std::uint32_t candidate_count, std::uint16_t expected_rnti,
+                                 std::uintptr_t stream_handle) {
     if (buffers.pdcch_candidates == nullptr || buffers.pdcch_survivors == nullptr ||
         buffers.pdcch_terminal_metrics == nullptr || buffers.pdcch_candidate_results == nullptr ||
-        buffers.pdcch_results == nullptr || buffers.pdcch_hit_count == nullptr ||
         candidate_count == 0U || candidate_count > kCudaPdcchMaxCandidates) {
         return MmseStatus::kInvalidArgument;
     }
-    // CRC validation and hit compaction are ordered in the same stream; the
-    // following D2H copy therefore observes a compact, fully populated prefix.
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    pdcch_crc_kernel<<<candidate_count, 1U, 0, stream>>>(
+    pdcch_crc_kernel<<<candidate_count, 1U, 0,
+                       reinterpret_cast<cudaStream_t>(stream_handle)>>>(
         reinterpret_cast<const CudaPdcchCandidateDescriptor*>(buffers.pdcch_candidates),
         candidate_count, reinterpret_cast<const std::uint64_t*>(buffers.pdcch_survivors),
         reinterpret_cast<const double*>(buffers.pdcch_terminal_metrics), expected_rnti,
         reinterpret_cast<CudaPdcchCandidateResult*>(buffers.pdcch_candidate_results));
-    if (const cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
-        return map_cuda_error(status);
+    return map_cuda_error(cudaGetLastError());
+}
+
+MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers& buffers,
+                                         std::uint32_t candidate_count, std::uint16_t expected_rnti,
+                                         std::uintptr_t stream_handle) {
+    if (buffers.pdcch_results == nullptr || buffers.pdcch_hit_count == nullptr) {
+        return MmseStatus::kInvalidArgument;
     }
+    // CRC validation and hit compaction are ordered in the same stream; the
+    // following D2H copy therefore observes a compact, fully populated prefix.
+    if (const MmseStatus status = cuda_launch_pdcch_crc(
+            buffers, candidate_count, expected_rnti, stream_handle);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     pdcch_compact_hits_kernel<<<1U, 1U, 0, stream>>>(
         reinterpret_cast<const CudaPdcchCandidateResult*>(buffers.pdcch_candidate_results),
         candidate_count, reinterpret_cast<CudaPdcchCandidateResult*>(buffers.pdcch_results),
@@ -1415,6 +1578,17 @@ MmseStatus cuda_copy_pdcch_results_d2h_async(const CudaDeviceBuffers& buffers,
                                           static_cast<std::size_t>(kCudaPdcchMaxCandidates) *
                                               sizeof(CudaPdcchCandidateResult),
                                           cudaMemcpyDeviceToHost, stream));
+}
+
+MmseStatus cuda_copy_pdcch_candidate_result_d2h_async(
+    const CudaDeviceBuffers& buffers, CudaPdcchCandidateResult& result,
+    std::uintptr_t stream_handle) {
+    if (buffers.pdcch_candidate_results == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+    return map_cuda_error(cudaMemcpyAsync(
+        &result, buffers.pdcch_candidate_results, sizeof(result), cudaMemcpyDeviceToHost,
+        reinterpret_cast<cudaStream_t>(stream_handle)));
 }
 
 MmseStatus cuda_stream_synchronize(std::uintptr_t stream_handle) {

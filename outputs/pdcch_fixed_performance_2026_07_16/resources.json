@@ -1,0 +1,72 @@
+{
+  "timestamp": "2026-07-16T21:56:44.244396",
+  "os": {
+    "system": "Windows",
+    "release": "11",
+    "version": "10.0.26200",
+    "machine": "AMD64",
+    "python_version": "3.14.2"
+  },
+  "cpu": {
+    "physical_cores": 14,
+    "logical_cores": 20,
+    "max_frequency_mhz": 2600.0,
+    "architecture": "AMD64",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "current_frequency_mhz": 1496.0
+  },
+  "memory": {
+    "total_gb": 23.73,
+    "available_gb": 10.24,
+    "used_gb": 13.49,
+    "percent_used": 56.8,
+    "swap_total_gb": 14.5,
+    "swap_available_gb": 14.4
+  },
+  "disk": {
+    "path": "G:\\MMSE_CPP",
+    "total_gb": 905.5,
+    "available_gb": 722.4,
+    "used_gb": 183.11,
+    "percent_used": 20.2
+  },
+  "gpu": {
+    "nvidia_gpus": [
+      {
+        "index": 0,
+        "name": "NVIDIA GeForce RTX 4060 Laptop GPU",
+        "memory_total_mb": 8188.0,
+        "memory_free_mb": 7956.0,
+        "driver_version": "560.94",
+        "compute_capability": "8.9",
+        "type": "NVIDIA",
+        "backend": "CUDA"
+      }
+    ],
+    "amd_gpus": [],
+    "apple_silicon": null,
+    "total_gpus": 1,
+    "available_backends": ["CUDA"]
+  },
+  "recommendations": {
+    "parallel_processing": {
+      "strategy": "high_parallelism",
+      "suggested_workers": 18,
+      "libraries": ["joblib", "multiprocessing", "dask"]
+    },
+    "memory_strategy": {
+      "strategy": "moderate_memory",
+      "libraries": ["dask", "zarr"],
+      "note": "Consider chunking for datasets > 2GB"
+    },
+    "gpu_acceleration": {
+      "available": true,
+      "backends": ["CUDA"],
+      "suggested_libraries": ["pytorch", "tensorflow", "jax", "cupy", "rapids"]
+    },
+    "large_data_handling": {
+      "strategy": "disk_abundant",
+      "note": "Sufficient space for large intermediate files"
+    }
+  }
+}

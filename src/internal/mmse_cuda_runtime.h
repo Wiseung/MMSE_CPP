@@ -49,6 +49,8 @@ struct CudaPdcchCandidateResult {
     std::uint64_t decoded_bits = 0U;
 };
 
+static_assert(sizeof(CudaPdcchCandidateResult) == 24U);
+
 // Per-staging-slot device allocations. Pointers are intentionally untyped here
 // so the CUDA and no-CUDA runtime implementations share the same ABI.
 struct CudaDeviceBuffers {
@@ -88,6 +90,7 @@ struct CudaGridMeta {
     std::uint32_t n_tx_ports = 0;
     std::uint32_t channel_type = 0;
     std::uint32_t td_pair_count = 0;
+    std::uint32_t td_quad_count = 0;
     std::uint32_t n_segments = 0;
     std::uint32_t spot_check_sample_count = 0;
     std::uint32_t trace_sample_count = 0;
@@ -99,13 +102,18 @@ struct CudaGridMeta {
     float gamma_max = 0.0F;
     std::uint16_t spot_check_re_slots[kCudaValidationSampleCount]{};
     std::uint16_t prb_bitmap[7]{};
-    std::uint8_t crs_symbols[kLteNumCrsSymbols]{};
+    std::uint8_t crs_symbol_counts[kMmseV1MaxNumCrsTxPorts]{};
+    std::uint8_t crs_symbols[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols]{};
     std::uint8_t crs_freq_offsets[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols]{};
     float crs_pilot_re[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols][kLteNumPilotTonesPerCrsSymbol]{};
     float crs_pilot_im[kMmseV1MaxNumCrsTxPorts][kLteNumCrsSymbols][kLteNumPilotTonesPerCrsSymbol]{};
     std::uint16_t grid_indices[kCudaMaxDataRe]{};
     std::uint16_t td_pair_grid_indices0[kCudaMaxDataRe / 2U]{};
     std::uint16_t td_pair_grid_indices1[kCudaMaxDataRe / 2U]{};
+    std::uint16_t td_quad_grid_indices0[kCudaMaxDataRe / 4U]{};
+    std::uint16_t td_quad_grid_indices1[kCudaMaxDataRe / 4U]{};
+    std::uint16_t td_quad_grid_indices2[kCudaMaxDataRe / 4U]{};
+    std::uint16_t td_quad_grid_indices3[kCudaMaxDataRe / 4U]{};
     std::uint32_t output_slot_by_grid_re[kCudaMaxGridRe]{};
     std::uint32_t prb_segment_offsets[kCudaMaxDataRe + 1]{};
 };
@@ -114,7 +122,8 @@ struct CudaGridMeta {
 // other modes must copy the additional TD/reverse-map arrays as well.
 inline bool cuda_uses_compact_pdcch_grid_meta(const CudaGridMeta& grid_meta) noexcept {
     return grid_meta.channel_type == static_cast<std::uint32_t>(MmseChannelType::kPdcch) &&
-           grid_meta.n_tx_ports == 1U && grid_meta.td_pair_count == 0U;
+           grid_meta.n_tx_ports == 1U && grid_meta.td_pair_count == 0U &&
+           grid_meta.td_quad_count == 0U;
 }
 
 inline std::size_t cuda_grid_meta_h2d_bytes(const CudaGridMeta& grid_meta) noexcept {
@@ -241,6 +250,8 @@ MmseStatus cuda_launch_pdcch_rate_recovery(const CudaDeviceBuffers& buffers,
                                            std::uintptr_t stream_handle);
 MmseStatus cuda_launch_pdcch_viterbi(const CudaDeviceBuffers& buffers,
                                      std::uint32_t candidate_count, std::uintptr_t stream_handle);
+MmseStatus cuda_launch_pdcch_crc(const CudaDeviceBuffers& buffers, std::uint32_t candidate_count,
+                                 std::uint16_t expected_rnti, std::uintptr_t stream_handle);
 MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers& buffers,
                                          std::uint32_t candidate_count, std::uint16_t expected_rnti,
                                          std::uintptr_t stream_handle);
@@ -248,6 +259,9 @@ MmseStatus cuda_copy_pdcch_results_d2h_async(const CudaDeviceBuffers& buffers,
                                              CudaPdcchCandidateResult* results,
                                              std::uint32_t& hit_count,
                                              std::uintptr_t stream_handle);
+MmseStatus cuda_copy_pdcch_candidate_result_d2h_async(const CudaDeviceBuffers& buffers,
+                                                      CudaPdcchCandidateResult& result,
+                                                      std::uintptr_t stream_handle);
 
 MmseStatus cuda_stream_synchronize(std::uintptr_t stream_handle);
 

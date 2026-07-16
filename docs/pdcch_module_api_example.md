@@ -10,6 +10,7 @@
 - `REG / CCE` 恢复 helper
 - common-search 与 UE-specific 候选构造、速率恢复、`CRC-RNTI` 和 `DCI 1A` 解析 helper
 - 当前 `20 MHz / FDD` 边界内的 SI-RNTI 未知控制区几何搜索与缓存锁定
+- `4Tx x 1Rx` Td4 raw equalized output、四源 RE 归一化和 CPU dispatcher
 
 该模块不负责：
 
@@ -19,6 +20,7 @@
 
 对于 `2 Tx port` 的 LTE PDCCH 发射分集场景，请使用新增 TD 调用面
 `run_pdcch_td(...)`，而不是下面展示的传统单 RE `run_pdcch(...)` 接口面。
+对于 `4Tx x 1Rx` 使用 `run_pdcch_td4(...)`；该入口固定为单层、`tx_mode == 2`、QPSK。
 
 ## 1. 上游：如何填充 `control_re_exclusion_masks`
 
@@ -106,6 +108,24 @@ mmse::PdcchTdMmseResult td_meta{};
 const mmse::MmseStatus td_status = ctx.run_pdcch_td(in, td_out, td_meta);
 ```
 
+对于 `4Tx x 1Rx`，分配四组索引并归一化到标准 CCE 顺序：
+
+```cpp
+std::vector<std::uint16_t> re0(capacity_symbols), re1(capacity_symbols);
+std::vector<std::uint16_t> re2(capacity_symbols), re3(capacity_symbols);
+mmse::PdcchTd4MmseOutputView td4_out{xhat_re.data(), xhat_im.data(), sinr.data(),
+                                     re0.data(), re1.data(), re2.data(), re3.data(),
+                                     static_cast<std::uint32_t>(capacity_symbols)};
+mmse::PdcchTd4MmseResult td4_meta{};
+const mmse::MmseStatus td4_status = ctx.run_pdcch_td4(in, td4_out, td4_meta);
+
+const auto td4_backend =
+    mmse::pdcch::make_backend_pdcch_td4_equalized_indication(td4_meta, td4_out);
+mmse::pdcch::BackendPdcchEqualizedIndication cce_ordered{};
+const mmse::MmseStatus normalize_status =
+    mmse::pdcch::normalize_pdcch_td4_cce_order(td4_backend, cce_ordered);
+```
+
 ## 3. 下游：如何消费 `re_grid_indices`
 
 下游应先把模块输出打包成正式的 backend DTO，再消费该 DTO。
@@ -115,7 +135,8 @@ mmse::pdcch::BackendPdcchEqualizedIndication backend =
     mmse::pdcch::make_backend_pdcch_equalized_indication(meta, out);
 
 for (std::size_t i = 0; i < backend.re_grid_indices.size(); ++i) {
-    const auto coord = mmse::pdcch::decode_re_grid_index(backend.re_grid_indices[i]);
+    const auto coord =
+        mmse::pdcch::decode_re_grid_index(backend.re_grid_indices[i], backend.n_prb);
 
     DownstreamSoftRe item{};
     item.xhat_re = backend.x_hat_re[i];
@@ -141,8 +162,10 @@ mmse::pdcch::BackendPdcchTdEqualizedIndication td_backend =
     mmse::pdcch::make_backend_pdcch_td_equalized_indication(td_meta, td_out);
 
 for (std::size_t i = 0; i < td_backend.x_hat_re.size(); ++i) {
-    const auto coord0 = mmse::pdcch::decode_re_grid_index(td_backend.re_grid_indices0[i]);
-    const auto coord1 = mmse::pdcch::decode_re_grid_index(td_backend.re_grid_indices1[i]);
+    const auto coord0 =
+        mmse::pdcch::decode_re_grid_index(td_backend.re_grid_indices0[i], td_backend.n_prb);
+    const auto coord1 =
+        mmse::pdcch::decode_re_grid_index(td_backend.re_grid_indices1[i], td_backend.n_prb);
 
     DownstreamTdSoftSymbol item{};
     item.xhat_re = td_backend.x_hat_re[i];
@@ -163,6 +186,8 @@ for (std::size_t i = 0; i < td_backend.x_hat_re.size(); ++i) {
 - backend DTO 持有均衡后的软符号、按 RE 的 SINR，以及 `re_grid_indices`
 - 下游使用 `re_grid_indices` 恢复 REG/CCE 或其它所需顺序
 - 链路元数据通过 `PdcchChainMetadata` 端到端透传
+- Td4 每四个连续槽位重复同一组 `re_grid_indices0..3`；四个槽位对应两个 Alamouti 对
+- `normalize_pdcch_td4_cce_order(...)` 保留软符号/SINR，只重建标准 CCE source-RE 顺序
 
 ## 4. 实用规则
 
@@ -179,6 +204,8 @@ for (std::size_t i = 0; i < td_backend.x_hat_re.size(); ++i) {
 - `run_pdcch(...)` 仍然是 `1 Tx port` 的 per-RE 接口面
 - `run_pdcch_td(...)` 是新增的 `2 Tx port` 发射分集接口面，并通过
   `re_grid_indices0/re_grid_indices1` 提供 RE 对映射
+- `run_pdcch_td4(...)` 是 `4Tx x 1Rx` 发射分集接口面，并通过
+  `re_grid_indices0..3` 提供四源 RE 映射
 
 ## 5. 正式 CPU `DCI 1A` 验收入口
 
@@ -212,15 +239,16 @@ for (const auto& hit : result.hits) {
 
 这条入口当前会在仓库内顺序完成：
 
-1. `run_pdcch(...)` 或 `run_pdcch_td(...)`
+1. CPU dispatcher 按 `n_tx_ports` 调用 `run_pdcch(...)`、`run_pdcch_td(...)` 或
+   `run_pdcch_td4(...)`
 2. `REG / CCE` 恢复与 `common search` 候选构造
 3. `QPSK LLR + descrambling`
 4. 速率恢复
 5. 内建尾咬 Viterbi；外部回调可选覆盖
 6. `CRC-RNTI` 校验与 `DCI 1A` 解析
 
-对 `2 Tx port` 场景，这条入口会先把 `run_pdcch_td(...)` 的输出归一化为与 `1Tx` 一致的
-连续 CCE 顺序，再进入候选链路。
+对 `2 Tx port` 和 `4Tx x 1Rx` 场景，这条入口会先用对应 normalize helper 把 TD 输出
+归一化为与 `1Tx` 一致的连续 CCE 顺序，再进入候选链路。
 
 ## 6. UE-specific `DCI 1A` 入口
 
@@ -246,7 +274,7 @@ for (const auto& hit : ue_result.hits) {
 ```
 
 `rntis` 必须非空、唯一且不含 `0` 或 `kSiRnti`。该入口支持 `L=1/2/4/8`，并同时接受
-传统 1Tx 与 2Tx transmit-diversity 输入；非匹配 CRC 是正常 miss，不返回错误。
+1Tx、2Tx transmit-diversity 与 `4Tx x 1Rx` Td4 输入；非匹配 CRC 是正常 miss，不返回错误。
 
 ## 7. SI-RNTI 未知控制区几何入口
 

@@ -14,6 +14,22 @@
 namespace mmse::detail {
 
 inline constexpr std::array<std::uint8_t, kLteNumCrsSymbols> kCrsSymbols = {0, 4, 7, 11};
+
+struct CrsPortPattern {
+    std::uint8_t count = 0U;
+    std::array<std::uint8_t, kLteNumCrsSymbols> symbols{};
+};
+
+inline constexpr std::array<CrsPortPattern, kMmseV1MaxNumCrsTxPorts> kCrsPortPatterns = {
+    CrsPortPattern{4U, {0U, 4U, 7U, 11U}},
+    CrsPortPattern{4U, {0U, 4U, 7U, 11U}},
+    CrsPortPattern{2U, {1U, 8U, 0U, 0U}},
+    CrsPortPattern{2U, {1U, 8U, 0U, 0U}},
+};
+
+inline constexpr const CrsPortPattern& crs_port_pattern(std::uint8_t port) noexcept {
+    return kCrsPortPatterns[port];
+}
 inline constexpr std::uint32_t kMaxGridRe = kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz;
 inline constexpr std::uint32_t kMaxDataRe = kMaxGridRe;
 inline constexpr std::uint32_t kMaxThreadWorkers = 64;
@@ -63,8 +79,8 @@ struct TransmitDiversityEqualizePair {
 
 // Full channel grid in [tx][rx][symbol][subcarrier] order. The helper h_index
 // in the implementation converts this logical order to the flat array offset.
-using HGridStorage =
-    std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>;
+using HGridStorage = std::array<Complex32, kMmseV1MaxNumCrsTxPorts * kMmseV1MaxNumRxAntennas *
+                                               kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>;
 
 // Structure-of-arrays staging format used by both scalar workers and AVX2;
 // one index corresponds to one extracted RE across every field below.
@@ -180,10 +196,8 @@ float cnorm2(Complex32 a);
 
 Complex32 linear_interp(Complex32 left, Complex32 right, float t);
 
-void estimate_channel(
-    const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
-    std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>& h_full,
-    float& sigma2_estimate);
+void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& desc,
+                      HGridStorage& h_full, float& sigma2_estimate);
 
 float update_sigma2_state(Sigma2State& state, float sigma2_estimate,
                           const MmseEqualizerCpuConfig& config);
@@ -191,10 +205,8 @@ float peek_sigma2_state(const Sigma2State& state, float sigma2_min);
 void debug_reset_estimate_channel_call_count();
 std::uint64_t debug_get_estimate_channel_call_count();
 
-void pack_equalizer_inputs(
-    const PlanarGridViewF32& grid,
-    const std::array<Complex32, 2 * 2 * kLteNumSymbolsNormalCp * kLteNumSubcarriers20MHz>& h_full,
-    const ReLayout& layout, PackedEqualizerInputs& packed);
+void pack_equalizer_inputs(const PlanarGridViewF32& grid, const HGridStorage& h_full,
+                           const ReLayout& layout, PackedEqualizerInputs& packed);
 
 EqualizedSymbol equalize_2x2_scalar(Complex32 h00, Complex32 h01, Complex32 h10, Complex32 h11,
                                     Complex32 y0, Complex32 y1, float sigma2, float det_floor,

@@ -19,7 +19,6 @@
 #include "mmse/pdcch_chain_dto.h"
 #include "mmse/pdcch_chain_sdk.h"
 #include "mmse/pdcch_module_api.h"
-#include "mmse/pdcch_pdsch_handoff.h"
 #include "mmse/pcfich_chain_dto.h"
 #include "mmse/pcfich_module_api.h"
 #include "internal/mmse_cuda_runtime.h"
@@ -776,6 +775,69 @@ void fill_pdcch_td_layout(GridBuffers& buffers, const ExtractDescriptor& desc,
     }
 }
 
+void fill_td4_crs(GridBuffers& buffers, const ExtractDescriptor& desc,
+                  const std::array<Complex32, 4>& channel) {
+    mmse::detail::ensure_crs_tables();
+    const std::uint32_t n_subcarriers =
+        static_cast<std::uint32_t>(buffers.re[0].size() / kLteNumSymbolsNormalCp);
+    const std::uint32_t pilot_count = n_subcarriers / 6U;
+    const std::uint8_t subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U);
+    for (std::uint32_t port = 0U; port < channel.size(); ++port) {
+        const auto& pattern = mmse::detail::crs_port_pattern(static_cast<std::uint8_t>(port));
+        for (std::uint32_t cs = 0U; cs < pattern.count; ++cs) {
+            const std::uint8_t symbol = pattern.symbols[cs];
+            for (std::uint32_t pilot = 0U; pilot < pilot_count; ++pilot) {
+                const std::uint32_t sc = mmse::detail::crs_subcarrier(
+                    desc.cell_id, static_cast<std::uint8_t>(port), symbol, pilot);
+                const Complex32 y = mmse::detail::cmul(
+                    channel[port],
+                    mmse::detail::crs_value({.cell_id = desc.cell_id,
+                                             .subframe = subframe,
+                                             .port = static_cast<std::uint8_t>(port),
+                                             .crs_symbol_index = static_cast<std::uint8_t>(cs)},
+                                            pilot));
+                const std::size_t index = static_cast<std::size_t>(symbol) * n_subcarriers + sc;
+                buffers.re[0][index] = y.re;
+                buffers.im[0][index] = y.im;
+            }
+        }
+    }
+}
+
+void fill_td4_quad(GridBuffers& buffers, std::uint16_t grid0, std::uint16_t grid1,
+                   std::uint16_t grid2, std::uint16_t grid3,
+                   const std::array<Complex32, 4>& channel, Complex32 s0, Complex32 s1,
+                   Complex32 s2, Complex32 s3) {
+    const Complex32 y0 =
+        mmse::detail::cadd(mmse::detail::cmul(channel[0], s0), mmse::detail::cmul(channel[1], s1));
+    const Complex32 y1 =
+        mmse::detail::csub(mmse::detail::cmul(channel[0], mmse::detail::cconj(s1)),
+                           mmse::detail::cmul(channel[1], mmse::detail::cconj(s0)));
+    const Complex32 y2 =
+        mmse::detail::cadd(mmse::detail::cmul(channel[2], s2), mmse::detail::cmul(channel[3], s3));
+    const Complex32 y3 =
+        mmse::detail::csub(mmse::detail::cmul(channel[2], mmse::detail::cconj(s3)),
+                           mmse::detail::cmul(channel[3], mmse::detail::cconj(s2)));
+    const std::array<Complex32, 4> samples = {y0, y1, y2, y3};
+    const std::array<std::uint16_t, 4> indices = {grid0, grid1, grid2, grid3};
+    for (std::uint32_t i = 0U; i < samples.size(); ++i) {
+        buffers.re[0][indices[i]] = samples[i].re;
+        buffers.im[0][indices[i]] = samples[i].im;
+    }
+}
+
+void fill_td4_layout(GridBuffers& buffers, const mmse::detail::ReLayout& layout,
+                     const std::array<Complex32, 4>& channel,
+                     const std::vector<Complex32>& symbols) {
+    expect_true((layout.n_re & 3U) == 0U && symbols.size() == layout.n_re,
+                "td4 layout must have one four-RE block per four symbols");
+    for (std::uint32_t re = 0U; re < layout.n_re; re += 4U) {
+        fill_td4_quad(buffers, layout.grid_indices[re], layout.grid_indices[re + 1U],
+                      layout.grid_indices[re + 2U], layout.grid_indices[re + 3U], channel,
+                      symbols[re], symbols[re + 1U], symbols[re + 2U], symbols[re + 3U]);
+    }
+}
+
 void test_reject_invalid_descriptor() {
     MmseEqualizerCpuContext ctx;
     MmseEqualizerCpuConfig config{};
@@ -821,9 +883,7 @@ void test_single_layer_identity_channel_equalization() {
 
     GridBuffers buffers = make_zero_grid();
     auto desc = make_fullband_desc();
-    desc.n_tx_ports = 1U;
-    desc.n_layers = 1U;
-    desc.tx_mode = 1U;
+    desc.n_layers = 1;
     fill_identity_channel(buffers, desc, 1.0F, 0.0F);
     auto grid = make_grid_view(buffers);
 
@@ -834,7 +894,7 @@ void test_single_layer_identity_channel_equalization() {
     EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
     expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "run must succeed");
     expect_true(out.n_re_per_layer > 0U, "must output REs");
-    expect_true(out.n_re_per_layer == 15000U, "full-band RE count");
+    expect_true(out.n_re_per_layer == 14400U, "full-band RE count");
     expect_near(out.x_hat_re[0], 1.0F, 1.0e-3F, "layer0 xhat");
     expect_near(out.x_hat_im[0], 0.0F, 1.0e-5F, "layer0 imag");
     if (!(out.sinr[0] > 10.0F)) {
@@ -1006,7 +1066,7 @@ void test_two_layer_constant_channel_matches_golden() {
         mmse::detail::cadd(mmse::detail::cmul(c.h00, c.x0), mmse::detail::cmul(c.h01, c.x1));
     const Complex32 y1 =
         mmse::detail::cadd(mmse::detail::cmul(c.h10, c.x0), mmse::detail::cmul(c.h11, c.x1));
-    mmse::detail::HGridStorage h_full{};
+    static mmse::detail::HGridStorage h_full{};
     float sigma2_estimate = 0.0F;
     mmse::detail::estimate_channel(grid, desc, h_full, sigma2_estimate);
     mmse::detail::Sigma2State sigma2_state{};
@@ -1256,9 +1316,7 @@ void test_single_layer_path() {
     expect_true(ctx.init(config) == MmseStatus::kOk, "init must succeed");
 
     auto desc = make_fullband_desc();
-    desc.n_tx_ports = 1U;
-    desc.n_layers = 1U;
-    desc.tx_mode = 1U;
+    desc.n_layers = 1;
     GridBuffers buffers = make_zero_grid();
     fill_identity_channel(buffers, desc, 0.75F, 0.0F);
     auto grid = make_grid_view(buffers);
@@ -1270,168 +1328,6 @@ void test_single_layer_path() {
     EqualizerOutputView out{xre.data(), xim.data(), sinr.data(), cap};
     expect_true(ctx.run(grid, desc, out) == MmseStatus::kOk, "single-layer run");
     expect_near(out.x_hat_re[0], 0.75F, 1.0e-3F, "single-layer xhat");
-}
-
-void test_pdsch_td_two_crs_joint_equalization_and_contract() {
-    MmseEqualizerCpuContext cpu;
-    MmseEqualizerCpuConfig cpu_config{};
-    cpu_config.worker_count = 1U;
-    cpu_config.backend = MmseCpuBackend::kScalar;
-    cpu_config.sigma2_min = 1.0e-5F;
-    cpu_config.det_floor = 1.0e-6F;
-    cpu_config.g_min = 1.0e-4F;
-    cpu_config.gamma_max = 1.0e4F;
-    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "pdsch td cpu init");
-
-    auto desc = make_fullband_desc();
-    desc.n_rx_ant = 1U;
-    desc.n_layers = 1U;
-    desc.start_symbol = 4U;
-    desc.mod_order = 2U;
-    desc.n_prb = 3U;
-    desc.prb_bitmap.fill(0U);
-    desc.prb_bitmap[0] = 0x0094U;
-
-    const Complex32 h00{0.90F, 0.15F};
-    const Complex32 h01{-0.30F, 0.45F};
-    const Complex32 s0{0.70710678F, 0.70710678F};
-    const Complex32 s1{-0.70710678F, 0.70710678F};
-    GridBuffers buffers = make_zero_grid();
-    fill_constant_mimo_channel(buffers, desc, h00, h01, {}, {}, s0, s1);
-
-    mmse::detail::ReLayout layout{};
-    const std::uint32_t n_source_re = mmse::detail::build_data_re_layout(desc, layout);
-    expect_true(n_source_re == 324U && (n_source_re & 1U) == 0U,
-                "pdsch td sparse layout count must be even");
-    for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
-        expect_true(layout.grid_indices[re] / kLteNumSubcarriers20MHz ==
-                        layout.grid_indices[re + 1U] / kLteNumSubcarriers20MHz,
-                    "pdsch td pair must stay in one OFDM symbol");
-    }
-    fill_td_layout(buffers, layout, h00, h01, {}, {}, s0, s1);
-    PlanarGridViewF32 grid = make_single_rx_grid_view(buffers);
-    grid.generation = 101U;
-
-    std::vector<float> xre(n_source_re), xim(n_source_re), sinr(n_source_re);
-    std::vector<std::uint16_t> grid0(n_source_re), grid1(n_source_re);
-    PdschTdMmseOutputView out{xre.data(),   xim.data(),   sinr.data(),
-                              grid0.data(), grid1.data(), n_source_re};
-    PdschTdMmseResult meta{};
-
-    std::vector<float> generic_re(n_source_re), generic_im(n_source_re), generic_sinr(n_source_re);
-    EqualizerOutputView generic_out{generic_re.data(), generic_im.data(), generic_sinr.data(),
-                                    n_source_re};
-    expect_true(cpu.run(grid, desc, generic_out) == MmseStatus::kUnsupportedConfig,
-                "generic PDSCH run must reject transmit diversity");
-    expect_true(cpu.run_pdsch_td(grid, desc, out, meta) == MmseStatus::kOk, "pdsch td cpu run");
-    expect_true(meta.n_symbols == n_source_re && meta.n_source_re == n_source_re &&
-                    meta.n_tx_ports == 2U && meta.n_layers == 1U && meta.tx_mode == 2U &&
-                    meta.start_symbol == desc.start_symbol && meta.prb_bitmap == desc.prb_bitmap,
-                "pdsch td metadata");
-    for (std::uint32_t re = 0U; re < meta.n_symbols; re += 2U) {
-        expect_true(grid0[re] == layout.grid_indices[re] &&
-                        grid1[re] == layout.grid_indices[re + 1U] && grid0[re + 1U] == grid0[re] &&
-                        grid1[re + 1U] == grid1[re],
-                    "pdsch td source pair metadata");
-        expect_near(xre[re], s0.re, 1.0e-3F, "pdsch td symbol zero real");
-        expect_near(xim[re], s0.im, 1.0e-3F, "pdsch td symbol zero imag");
-        expect_near(xre[re + 1U], s1.re, 1.0e-3F, "pdsch td symbol one real");
-        expect_near(xim[re + 1U], s1.im, 1.0e-3F, "pdsch td symbol one imag");
-        expect_true(sinr[re] > 10.0F && sinr[re + 1U] > 10.0F, "pdsch td SINR");
-    }
-
-    auto invalid = desc;
-    invalid.tx_mode = 1U;
-    expect_true(cpu.run_pdsch_td(grid, invalid, out, meta) == MmseStatus::kUnsupportedConfig,
-                "pdsch td must require TM2");
-    invalid = desc;
-    invalid.n_layers = 2U;
-    expect_true(cpu.run_pdsch_td(grid, invalid, out, meta) == MmseStatus::kUnsupportedConfig,
-                "pdsch td must require one output layer");
-    PdschTdMmseOutputView small_out = out;
-    small_out.capacity_symbols = n_source_re - 1U;
-    expect_true(cpu.run_pdsch_td(grid, desc, small_out, meta) == MmseStatus::kBufferTooSmall,
-                "pdsch td must reject a small output matrix");
-
-    MmseEqualizerGpuContext gpu;
-    MmseEqualizerGpuConfig gpu_config{};
-    gpu_config.backend = MmseGpuBackend::kAuto;
-    gpu_config.sigma2_min = cpu_config.sigma2_min;
-    gpu_config.det_floor = cpu_config.det_floor;
-    gpu_config.g_min = cpu_config.g_min;
-    gpu_config.gamma_max = cpu_config.gamma_max;
-    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "pdsch td gpu auto init");
-    std::vector<float> gpu_re(n_source_re), gpu_im(n_source_re), gpu_sinr(n_source_re);
-    std::vector<std::uint16_t> gpu_grid0(n_source_re), gpu_grid1(n_source_re);
-    PdschTdMmseOutputView gpu_out{gpu_re.data(),    gpu_im.data(),    gpu_sinr.data(),
-                                  gpu_grid0.data(), gpu_grid1.data(), n_source_re};
-    PdschTdMmseResult gpu_meta{};
-    expect_true(gpu.run_pdsch_td(grid, desc, gpu_out, gpu_meta) == MmseStatus::kOk,
-                "pdsch td gpu auto run");
-    for (std::uint32_t re = 0U; re < n_source_re; ++re) {
-        expect_near(gpu_re[re], xre[re], 1.0e-5F, "pdsch td gpu auto real");
-        expect_near(gpu_im[re], xim[re], 1.0e-5F, "pdsch td gpu auto imag");
-        expect_near(gpu_sinr[re], sinr[re], 1.0e-5F, "pdsch td gpu auto sinr");
-        expect_true(gpu_grid0[re] == grid0[re] && gpu_grid1[re] == grid1[re],
-                    "pdsch td gpu auto source pair");
-    }
-
-#if MMSE_CUDA_ENABLED
-    MmseEqualizerGpuContext cuda;
-    MmseEqualizerGpuConfig cuda_config = gpu_config;
-    cuda_config.backend = MmseGpuBackend::kCuda;
-    cuda_config.validation_policy = MmseGpuValidationPolicy::kTestDeepTrace;
-    expect_true(cuda.init(cuda_config) == MmseStatus::kOk, "pdsch td cuda init");
-    std::vector<float> cuda_re(n_source_re), cuda_im(n_source_re), cuda_sinr(n_source_re);
-    std::vector<std::uint16_t> cuda_grid0(n_source_re), cuda_grid1(n_source_re);
-    PdschTdMmseOutputView cuda_out{cuda_re.data(),    cuda_im.data(),    cuda_sinr.data(),
-                                   cuda_grid0.data(), cuda_grid1.data(), n_source_re};
-    PdschTdMmseResult cuda_meta{};
-    expect_true(cuda.run_pdsch_td(grid, desc, cuda_out, cuda_meta) == MmseStatus::kOk,
-                "pdsch td cuda run");
-    expect_true(cuda_meta.n_symbols == meta.n_symbols && cuda_meta.sigma2 == meta.sigma2,
-                "pdsch td cuda metadata");
-    for (std::uint32_t re = 0U; re < n_source_re; ++re) {
-        expect_near(cuda_re[re], xre[re], 1.0e-4F, "pdsch td cuda real");
-        expect_near(cuda_im[re], xim[re], 1.0e-4F, "pdsch td cuda imag");
-        expect_near(cuda_sinr[re], sinr[re], 1.0e-4F, "pdsch td cuda sinr");
-        expect_true(cuda_grid0[re] == grid0[re] && cuda_grid1[re] == grid1[re],
-                    "pdsch td cuda source pair");
-    }
-#endif
-}
-
-void test_pdcch_td_requires_tm2() {
-    GridBuffers buffers = make_zero_grid();
-    const auto desc = make_pdcch_desc();
-    PdcchMmseInput in{};
-    in.grid = make_grid_view(buffers);
-    in.sfn_subframe = desc.sfn_subframe;
-    in.cell_id = desc.cell_id;
-    in.n_tx_ports = 2U;
-    in.tx_mode = 1U;
-    in.control_symbol_count = desc.control_symbol_count;
-    in.n_prb = desc.n_prb;
-    in.prb_bitmap = desc.prb_bitmap;
-    in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
-                           .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
-                           .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
-
-    MmseEqualizerCpuContext cpu;
-    MmseEqualizerCpuConfig cpu_config{};
-    cpu_config.worker_count = 1U;
-    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "pdcch td TM2 cpu init");
-    PdcchTdMmseOutputView out{};
-    PdcchTdMmseResult meta{};
-    expect_true(cpu.run_pdcch_td(in, out, meta) == MmseStatus::kUnsupportedConfig,
-                "cpu pdcch td must reject TM1");
-
-    MmseEqualizerGpuContext gpu;
-    MmseEqualizerGpuConfig gpu_config{};
-    gpu_config.backend = MmseGpuBackend::kAuto;
-    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "pdcch td TM2 gpu init");
-    expect_true(gpu.run_pdcch_td(in, out, meta) == MmseStatus::kUnsupportedConfig,
-                "gpu pdcch td must reject TM1");
 }
 
 void test_pdcch_layout_excludes_crs_and_reserved_res() {
@@ -1926,12 +1822,11 @@ void test_pbch_and_pcfich_td_cpu_golden_and_dto() {
     pbch_desc.n_rx_ant = 1U;
     pbch_desc.tx_mode = 2U;
     GridBuffers pbch_buffers = make_zero_grid();
-    const Complex32 pbch_h00{0.85F, 0.10F};
-    const Complex32 pbch_h01{-0.20F, 0.35F};
-    fill_constant_mimo_channel(pbch_buffers, pbch_desc, pbch_h00, pbch_h01, {}, {}, s0, s1);
+    fill_identity_channel(pbch_buffers, pbch_desc, 0.0F, 0.0F);
     mmse::detail::ReLayout pbch_layout{};
     const std::uint32_t pbch_re = mmse::detail::build_pbch_re_layout(pbch_desc, pbch_layout);
-    fill_td_layout(pbch_buffers, pbch_layout, pbch_h00, pbch_h01, {}, {}, s0, s1);
+    fill_td_layout(pbch_buffers, pbch_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                   {0.0F, 0.0F}, s0, s1);
     PbchMmseInput pbch_in{.grid = make_single_rx_grid_view(pbch_buffers),
                           .sfn_subframe = pbch_desc.sfn_subframe,
                           .cell_id = pbch_desc.cell_id,
@@ -1962,17 +1857,12 @@ void test_pbch_and_pcfich_td_cpu_golden_and_dto() {
     pcfich_desc.n_tx_ports = 2U;
     pcfich_desc.tx_mode = 2U;
     GridBuffers pcfich_buffers = make_zero_grid();
-    const Complex32 pcfich_h00{0.90F, 0.10F};
-    const Complex32 pcfich_h01{-0.25F, 0.30F};
-    const Complex32 pcfich_h10{0.20F, -0.15F};
-    const Complex32 pcfich_h11{0.80F, -0.20F};
-    fill_constant_mimo_channel(pcfich_buffers, pcfich_desc, pcfich_h00, pcfich_h01, pcfich_h10,
-                               pcfich_h11, s0, s1);
+    fill_identity_channel(pcfich_buffers, pcfich_desc, 0.0F, 0.0F);
     mmse::detail::ReLayout pcfich_layout{};
     const std::uint32_t pcfich_re =
         mmse::detail::build_pcfich_re_layout(pcfich_desc, pcfich_layout);
-    fill_td_layout(pcfich_buffers, pcfich_layout, pcfich_h00, pcfich_h01, pcfich_h10, pcfich_h11,
-                   s0, s1);
+    fill_td_layout(pcfich_buffers, pcfich_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                   {1.0F, 0.0F}, s0, s1);
     PcfichMmseInput pcfich_in{.grid = make_grid_view(pcfich_buffers),
                               .sfn_subframe = pcfich_desc.sfn_subframe,
                               .cell_id = pcfich_desc.cell_id,
@@ -2001,6 +1891,227 @@ void test_pbch_and_pcfich_td_cpu_golden_and_dto() {
                 "pcfich td LLR DTO");
 }
 
+void test_four_port_control_channels_cpu_and_pdcch_decode() {
+    MmseEqualizerCpuContext context;
+    MmseEqualizerCpuConfig config{};
+    config.worker_count = 1U;
+    config.sigma2_min = 1.0e-5F;
+    expect_true(context.init(config) == MmseStatus::kOk, "four-port CPU init");
+
+    const std::array<Complex32, 4> channel = {
+        Complex32{1.0F, 0.0F},
+        Complex32{0.0F, 0.0F},
+        Complex32{1.0F, 0.0F},
+        Complex32{0.0F, 0.0F},
+    };
+    const std::array<Complex32, 4> quad_symbols = {
+        Complex32{0.70710678F, 0.70710678F},
+        Complex32{-0.70710678F, 0.70710678F},
+        Complex32{0.70710678F, -0.70710678F},
+        Complex32{-0.70710678F, -0.70710678F},
+    };
+
+    auto pbch_desc = make_pbch_desc();
+    pbch_desc.n_tx_ports = 4U;
+    pbch_desc.n_rx_ant = 1U;
+    pbch_desc.tx_mode = 2U;
+    GridBuffers pbch_buffers = make_zero_grid();
+    fill_td4_crs(pbch_buffers, pbch_desc, channel);
+    mmse::detail::ReLayout pbch_layout{};
+    const std::uint32_t pbch_re = mmse::detail::build_pbch_re_layout(pbch_desc, pbch_layout);
+    expect_true(pbch_re == 240U, "four-port PBCH keeps 240 RE");
+    std::vector<Complex32> pbch_symbols(pbch_re);
+    for (std::uint32_t re = 0U; re < pbch_re; ++re) {
+        pbch_symbols[re] = quad_symbols[re & 3U];
+    }
+    fill_td4_layout(pbch_buffers, pbch_layout, channel, pbch_symbols);
+    PbchMmseInput pbch_in{.grid = make_single_rx_grid_view(pbch_buffers),
+                          .sfn_subframe = pbch_desc.sfn_subframe,
+                          .cell_id = pbch_desc.cell_id,
+                          .n_tx_ports = 4U,
+                          .tx_mode = 2U};
+    std::vector<float> pbch_xre(pbch_re), pbch_xim(pbch_re), pbch_sinr(pbch_re);
+    std::vector<std::uint16_t> pbch_i0(pbch_re), pbch_i1(pbch_re), pbch_i2(pbch_re),
+        pbch_i3(pbch_re);
+    PbchTd4MmseOutputView pbch_out{pbch_xre.data(), pbch_xim.data(), pbch_sinr.data(),
+                                   pbch_i0.data(),  pbch_i1.data(),  pbch_i2.data(),
+                                   pbch_i3.data(),  pbch_re};
+    PbchTd4MmseResult pbch_meta{};
+    expect_true(context.run_pbch_td4(pbch_in, pbch_out, pbch_meta) == MmseStatus::kOk,
+                "four-port PBCH run");
+    expect_true(pbch_meta.n_symbols == pbch_re && pbch_meta.n_source_re == pbch_re,
+                "four-port PBCH metadata");
+    for (std::uint32_t re = 0U; re < 4U; ++re) {
+        expect_near(pbch_xre[re], quad_symbols[re].re, 1.0e-3F, "four-port PBCH real");
+        expect_near(pbch_xim[re], quad_symbols[re].im, 1.0e-3F, "four-port PBCH imag");
+        expect_true(pbch_i0[re] == pbch_layout.grid_indices[0] &&
+                        pbch_i1[re] == pbch_layout.grid_indices[1] &&
+                        pbch_i2[re] == pbch_layout.grid_indices[2] &&
+                        pbch_i3[re] == pbch_layout.grid_indices[3],
+                    "four-port PBCH source quartet");
+    }
+
+    auto pcfich_desc = make_pcfich_desc();
+    pcfich_desc.n_tx_ports = 4U;
+    pcfich_desc.n_rx_ant = 1U;
+    pcfich_desc.tx_mode = 2U;
+    GridBuffers pcfich_buffers = make_zero_grid();
+    fill_td4_crs(pcfich_buffers, pcfich_desc, channel);
+    mmse::detail::ReLayout pcfich_layout{};
+    const std::uint32_t pcfich_re =
+        mmse::detail::build_pcfich_re_layout(pcfich_desc, pcfich_layout);
+    expect_true(pcfich_re == 16U, "four-port PCFICH keeps 16 RE");
+    std::vector<Complex32> pcfich_symbols(pcfich_re);
+    for (std::uint32_t re = 0U; re < pcfich_re; ++re) {
+        pcfich_symbols[re] = quad_symbols[re & 3U];
+    }
+    fill_td4_layout(pcfich_buffers, pcfich_layout, channel, pcfich_symbols);
+    PcfichMmseInput pcfich_in{.grid = make_single_rx_grid_view(pcfich_buffers),
+                              .sfn_subframe = pcfich_desc.sfn_subframe,
+                              .cell_id = pcfich_desc.cell_id,
+                              .n_tx_ports = 4U,
+                              .tx_mode = 2U};
+    std::vector<float> pcfich_xre(pcfich_re), pcfich_xim(pcfich_re), pcfich_sinr(pcfich_re);
+    std::vector<std::uint16_t> pcfich_i0(pcfich_re), pcfich_i1(pcfich_re), pcfich_i2(pcfich_re),
+        pcfich_i3(pcfich_re);
+    PcfichTd4MmseOutputView pcfich_out{pcfich_xre.data(), pcfich_xim.data(), pcfich_sinr.data(),
+                                       pcfich_i0.data(),  pcfich_i1.data(),  pcfich_i2.data(),
+                                       pcfich_i3.data(),  pcfich_re};
+    PcfichTd4MmseResult pcfich_meta{};
+    expect_true(context.run_pcfich_td4(pcfich_in, pcfich_out, pcfich_meta) == MmseStatus::kOk,
+                "four-port PCFICH run");
+    for (std::uint32_t re = 0U; re < 4U; ++re) {
+        expect_near(pcfich_xre[re], quad_symbols[re].re, 1.0e-3F, "four-port PCFICH real");
+        expect_near(pcfich_xim[re], quad_symbols[re].im, 1.0e-3F, "four-port PCFICH imag");
+    }
+
+    auto pdcch_desc = make_pdcch_desc();
+    pdcch_desc.n_tx_ports = 4U;
+    pdcch_desc.n_rx_ant = 1U;
+    pdcch_desc.tx_mode = 2U;
+    GridBuffers pdcch_buffers = make_zero_grid();
+    fill_td4_crs(pdcch_buffers, pdcch_desc, channel);
+    mmse::detail::ReLayout pdcch_layout{};
+    const std::uint32_t pdcch_re = mmse::detail::build_pdcch_re_layout(pdcch_desc, pdcch_layout);
+    expect_true(pdcch_re != 0U && (pdcch_re & 3U) == 0U, "four-port PDCCH RE grouping");
+    std::vector<Complex32> pdcch_symbols(pdcch_re);
+    for (std::uint32_t re = 0U; re < pdcch_re; ++re) {
+        pdcch_symbols[re] = quad_symbols[re & 3U];
+    }
+    fill_td4_layout(pdcch_buffers, pdcch_layout, channel, pdcch_symbols);
+    PdcchMmseInput pdcch_in{};
+    pdcch_in.grid = make_single_rx_grid_view(pdcch_buffers);
+    pdcch_in.sfn_subframe = pdcch_desc.sfn_subframe;
+    pdcch_in.cell_id = pdcch_desc.cell_id;
+    pdcch_in.n_tx_ports = 4U;
+    pdcch_in.tx_mode = 2U;
+    pdcch_in.control_symbol_count = pdcch_desc.control_symbol_count;
+    pdcch_in.n_prb = pdcch_desc.n_prb;
+    pdcch_in.prb_bitmap = pdcch_desc.prb_bitmap;
+    pdcch_in.control_re_exclusion_masks = pdcch_desc.control_re_exclusion_masks;
+    pdcch_in.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                                 .subframe =
+                                     static_cast<std::uint8_t>(pdcch_desc.sfn_subframe % 10U),
+                                 .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    std::vector<float> pdcch_xre(pdcch_re), pdcch_xim(pdcch_re), pdcch_sinr(pdcch_re);
+    std::vector<std::uint16_t> pdcch_i0(pdcch_re), pdcch_i1(pdcch_re), pdcch_i2(pdcch_re),
+        pdcch_i3(pdcch_re);
+    PdcchTd4MmseOutputView pdcch_out{pdcch_xre.data(), pdcch_xim.data(), pdcch_sinr.data(),
+                                     pdcch_i0.data(),  pdcch_i1.data(),  pdcch_i2.data(),
+                                     pdcch_i3.data(),  pdcch_re};
+    PdcchTd4MmseResult pdcch_meta{};
+    expect_true(context.run_pdcch_td4(pdcch_in, pdcch_out, pdcch_meta) == MmseStatus::kOk,
+                "four-port PDCCH run");
+    for (std::uint32_t re = 0U; re < 4U; ++re) {
+        expect_near(pdcch_xre[re], quad_symbols[re].re, 1.0e-3F, "four-port PDCCH real");
+        expect_near(pdcch_xim[re], quad_symbols[re].im, 1.0e-3F, "four-port PDCCH imag");
+        expect_true(pdcch_i0[re] == pdcch_layout.grid_indices[0] &&
+                        pdcch_i3[re] == pdcch_layout.grid_indices[3],
+                    "four-port PDCCH source quartet");
+    }
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kCuda;
+    gpu_config.sigma2_min = config.sigma2_min;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "four-port CUDA init");
+
+    std::vector<float> pbch_gpu_re(pbch_re), pbch_gpu_im(pbch_re), pbch_gpu_sinr(pbch_re);
+    std::vector<std::uint16_t> pbch_gpu_i0(pbch_re), pbch_gpu_i1(pbch_re), pbch_gpu_i2(pbch_re),
+        pbch_gpu_i3(pbch_re);
+    PbchTd4MmseOutputView pbch_gpu_out{
+        pbch_gpu_re.data(), pbch_gpu_im.data(), pbch_gpu_sinr.data(), pbch_gpu_i0.data(),
+        pbch_gpu_i1.data(), pbch_gpu_i2.data(), pbch_gpu_i3.data(),   pbch_re};
+    PbchTd4MmseResult pbch_gpu_meta{};
+    expect_true(gpu.run_pbch_td4(pbch_in, pbch_gpu_out, pbch_gpu_meta) == MmseStatus::kOk,
+                "four-port CUDA PBCH run");
+    for (std::uint32_t re = 0U; re < pbch_re; ++re) {
+        expect_near(pbch_gpu_re[re], pbch_xre[re], 1.0e-4F, "four-port CUDA PBCH real");
+        expect_near(pbch_gpu_im[re], pbch_xim[re], 1.0e-4F, "four-port CUDA PBCH imag");
+        expect_near(pbch_gpu_sinr[re], pbch_sinr[re], 1.0e-3F, "four-port CUDA PBCH SINR");
+        expect_true(pbch_gpu_i0[re] == pbch_i0[re] && pbch_gpu_i1[re] == pbch_i1[re] &&
+                        pbch_gpu_i2[re] == pbch_i2[re] && pbch_gpu_i3[re] == pbch_i3[re],
+                    "four-port CUDA PBCH source quartet");
+    }
+
+    std::vector<float> pcfich_gpu_re(pcfich_re), pcfich_gpu_im(pcfich_re),
+        pcfich_gpu_sinr(pcfich_re);
+    std::vector<std::uint16_t> pcfich_gpu_i0(pcfich_re), pcfich_gpu_i1(pcfich_re),
+        pcfich_gpu_i2(pcfich_re), pcfich_gpu_i3(pcfich_re);
+    PcfichTd4MmseOutputView pcfich_gpu_out{
+        pcfich_gpu_re.data(), pcfich_gpu_im.data(), pcfich_gpu_sinr.data(), pcfich_gpu_i0.data(),
+        pcfich_gpu_i1.data(), pcfich_gpu_i2.data(), pcfich_gpu_i3.data(),   pcfich_re};
+    PcfichTd4MmseResult pcfich_gpu_meta{};
+    expect_true(gpu.run_pcfich_td4(pcfich_in, pcfich_gpu_out, pcfich_gpu_meta) == MmseStatus::kOk,
+                "four-port CUDA PCFICH run");
+    for (std::uint32_t re = 0U; re < pcfich_re; ++re) {
+        expect_near(pcfich_gpu_re[re], pcfich_xre[re], 1.0e-4F, "four-port CUDA PCFICH real");
+        expect_near(pcfich_gpu_im[re], pcfich_xim[re], 1.0e-4F, "four-port CUDA PCFICH imag");
+        expect_near(pcfich_gpu_sinr[re], pcfich_sinr[re], 1.0e-3F, "four-port CUDA PCFICH SINR");
+    }
+
+    std::vector<float> pdcch_gpu_re(pdcch_re), pdcch_gpu_im(pdcch_re), pdcch_gpu_sinr(pdcch_re);
+    std::vector<std::uint16_t> pdcch_gpu_i0(pdcch_re), pdcch_gpu_i1(pdcch_re),
+        pdcch_gpu_i2(pdcch_re), pdcch_gpu_i3(pdcch_re);
+    PdcchTd4MmseOutputView pdcch_gpu_out{
+        pdcch_gpu_re.data(), pdcch_gpu_im.data(), pdcch_gpu_sinr.data(), pdcch_gpu_i0.data(),
+        pdcch_gpu_i1.data(), pdcch_gpu_i2.data(), pdcch_gpu_i3.data(),   pdcch_re};
+    PdcchTd4MmseResult pdcch_gpu_meta{};
+    expect_true(gpu.run_pdcch_td4(pdcch_in, pdcch_gpu_out, pdcch_gpu_meta) == MmseStatus::kOk,
+                "four-port CUDA PDCCH run");
+    for (std::uint32_t re = 0U; re < pdcch_re; ++re) {
+        expect_near(pdcch_gpu_re[re], pdcch_xre[re], 1.0e-4F, "four-port CUDA PDCCH real");
+        expect_near(pdcch_gpu_im[re], pdcch_xim[re], 1.0e-4F, "four-port CUDA PDCCH imag");
+        expect_near(pdcch_gpu_sinr[re], pdcch_sinr[re], 1.0e-3F, "four-port CUDA PDCCH SINR");
+        expect_true(pdcch_gpu_i0[re] == pdcch_i0[re] && pdcch_gpu_i1[re] == pdcch_i1[re] &&
+                        pdcch_gpu_i2[re] == pdcch_i2[re] && pdcch_gpu_i3[re] == pdcch_i3[re],
+                    "four-port CUDA PDCCH source quartet");
+    }
+#endif
+    const auto td4_backend =
+        mmse::pdcch::make_backend_pdcch_td4_equalized_indication(pdcch_meta, pdcch_out);
+    mmse::pdcch::BackendPdcchEqualizedIndication normalized{};
+    expect_true(mmse::pdcch::normalize_pdcch_td4_cce_order(td4_backend, normalized) ==
+                        MmseStatus::kOk &&
+                    normalized.re_grid_indices ==
+                        std::vector<std::uint16_t>(pdcch_layout.grid_indices.begin(),
+                                                   pdcch_layout.grid_indices.begin() + pdcch_re),
+                "four-port PDCCH CCE normalization");
+
+    mmse::pdcch::PdcchCommonSearchDecodeConfig decode_config{};
+    mmse::pdcch::PdcchCommonSearchDecodeResult decode_result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_common_search_decode(context, pdcch_in, decode_config,
+                                                                decode_result) == MmseStatus::kOk &&
+                    decode_result.candidate_count == 6U,
+                "four-port PDCCH must enter the existing CPU decode chain");
+
+    PdcchMmseInput unsupported = pdcch_in;
+    unsupported.grid = make_grid_view(pdcch_buffers);
+    expect_true(context.run_pdcch_td4(unsupported, pdcch_out, pdcch_meta) ==
+                    MmseStatus::kUnsupportedConfig,
+                "four-port two-rx PDCCH must be rejected");
+}
+
 void test_gpu_cuda_pbch_and_pcfich_td_match_cpu() {
 #if MMSE_CUDA_ENABLED
     MmseEqualizerCpuContext cpu;
@@ -2021,12 +2132,11 @@ void test_gpu_cuda_pbch_and_pcfich_td_match_cpu() {
     pbch_desc.n_rx_ant = 1U;
     pbch_desc.tx_mode = 2U;
     GridBuffers pbch_buffers = make_zero_grid();
-    const Complex32 pbch_h00{0.85F, 0.10F};
-    const Complex32 pbch_h01{-0.20F, 0.35F};
-    fill_constant_mimo_channel(pbch_buffers, pbch_desc, pbch_h00, pbch_h01, {}, {}, s0, s1);
+    fill_identity_channel(pbch_buffers, pbch_desc, 0.0F, 0.0F);
     mmse::detail::ReLayout pbch_layout{};
     const std::uint32_t pbch_count = mmse::detail::build_pbch_re_layout(pbch_desc, pbch_layout);
-    fill_td_layout(pbch_buffers, pbch_layout, pbch_h00, pbch_h01, {}, {}, s0, s1);
+    fill_td_layout(pbch_buffers, pbch_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                   {0.0F, 0.0F}, s0, s1);
     PbchMmseInput pbch_in{.grid = make_single_rx_grid_view(pbch_buffers),
                           .sfn_subframe = pbch_desc.sfn_subframe,
                           .cell_id = pbch_desc.cell_id,
@@ -2060,17 +2170,12 @@ void test_gpu_cuda_pbch_and_pcfich_td_match_cpu() {
     pcfich_desc.n_tx_ports = 2U;
     pcfich_desc.tx_mode = 2U;
     GridBuffers pcfich_buffers = make_zero_grid();
-    const Complex32 pcfich_h00{0.90F, 0.10F};
-    const Complex32 pcfich_h01{-0.25F, 0.30F};
-    const Complex32 pcfich_h10{0.20F, -0.15F};
-    const Complex32 pcfich_h11{0.80F, -0.20F};
-    fill_constant_mimo_channel(pcfich_buffers, pcfich_desc, pcfich_h00, pcfich_h01, pcfich_h10,
-                               pcfich_h11, s0, s1);
+    fill_identity_channel(pcfich_buffers, pcfich_desc, 0.0F, 0.0F);
     mmse::detail::ReLayout pcfich_layout{};
     const std::uint32_t pcfich_count =
         mmse::detail::build_pcfich_re_layout(pcfich_desc, pcfich_layout);
-    fill_td_layout(pcfich_buffers, pcfich_layout, pcfich_h00, pcfich_h01, pcfich_h10, pcfich_h11,
-                   s0, s1);
+    fill_td_layout(pcfich_buffers, pcfich_layout, {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                   {1.0F, 0.0F}, s0, s1);
     PcfichMmseInput pcfich_in{.grid = make_grid_view(pcfich_buffers),
                               .sfn_subframe = pcfich_desc.sfn_subframe,
                               .cell_id = pcfich_desc.cell_id,
@@ -3151,137 +3256,6 @@ void test_pdcch_dci_format1a_fdd_si_rnti_parse() {
                     result.dci.n_prb_1a_is_three && result.dci.n_prb_1a == 3U &&
                     result.dci.chain.request_id == chain.request_id,
                 "FDD SI-RNTI DCI 1A parsed grant fields");
-}
-
-void test_pdcch_dci_format1a_fdd_c_rnti_parse() {
-    constexpr std::uint16_t kRnti = 0x1234U;
-    const mmse::pdcch::PdcchDciFormat1AConfig config{};
-    const std::uint16_t riv = reference_type2_riv(100U, 10U, 20U);
-    std::vector<std::uint8_t> payload{};
-    append_bits(payload, 1U, 1U);
-    append_bits(payload, 0U, 1U);
-    append_bits(payload, riv, mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
-    append_bits(payload, 10U, 5U);
-    append_bits(payload, 5U, 3U);
-    append_bits(payload, 1U, 1U);
-    append_bits(payload, 2U, 2U);
-    append_bits(payload, 3U, 2U);
-    const std::vector<std::uint8_t> decoded = append_pdcch_crc_rnti_mask(payload, kRnti);
-
-    mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
-    expect_true(mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
-                    decoded.data(), static_cast<std::uint32_t>(decoded.size()), kRnti, 17U, 19U, {},
-                    config, result) == MmseStatus::kOk,
-                "FDD C-RNTI DCI 1A decode should succeed");
-    expect_true(
-        result.matched && result.dci.rnti_type == mmse::pdcch::PdcchDciFormat1ARntiType::kCRnti &&
-            result.dci.downlink_bandwidth_prb == 100U &&
-            result.dci.modulation_and_coding_scheme_valid &&
-            result.dci.transport_block_size_index_valid &&
-            result.dci.transport_block_size_index == 9U && result.dci.new_data_indicator_valid &&
-            result.dci.new_data_indicator == 1U && result.dci.transmit_power_control_valid &&
-            result.dci.transmit_power_control == 3U && !result.dci.n_prb_1a_valid,
-        "FDD C-RNTI DCI 1A must expose MCS, NDI and TPC semantics");
-}
-
-void test_pdcch_pdsch_handoff_v1_grants_and_boundaries() {
-    const auto decode = [](std::uint16_t rnti, std::uint8_t mcs_or_tbs, std::uint8_t ndi_or_ngap,
-                           std::uint8_t tpc_or_nprb) {
-        const mmse::pdcch::PdcchDciFormat1AConfig config{};
-        std::vector<std::uint8_t> payload{};
-        append_bits(payload, 1U, 1U);
-        append_bits(payload, 0U, 1U);
-        append_bits(payload, reference_type2_riv(100U, 10U, 20U),
-                    mmse::pdcch::pdcch_dci_riv_bit_count(config.n_prb));
-        append_bits(payload, mcs_or_tbs, 5U);
-        append_bits(payload, 5U, 3U);
-        append_bits(payload, ndi_or_ngap, 1U);
-        append_bits(payload, 2U, 2U);
-        append_bits(payload, tpc_or_nprb, 2U);
-        const std::vector<std::uint8_t> bits = append_pdcch_crc_rnti_mask(payload, rnti);
-        mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
-        expect_true(
-            mmse::pdcch::validate_and_parse_pdcch_dci_format1a(
-                bits.data(), static_cast<std::uint32_t>(bits.size()), rnti, 1234U, 19U,
-                {.request_id = 77U, .candidate_id = 2U, .first_cce = 8U, .aggregation_level = 4U},
-                config, result) == MmseStatus::kOk,
-            "handoff fixture DCI parse");
-        return result;
-    };
-
-    const mmse::handoff::PdcchPdschHandoffConfigV1 config{
-        .start_symbol = 3U,
-        .n_tx_ports = 1U,
-        .n_layers = 1U,
-        .transmission_mode = 1U,
-    };
-    const auto c_rnti = decode(0x1234U, 10U, 1U, 3U);
-    mmse::handoff::PdschGrantV1 grant{};
-    expect_true(mmse::handoff::make_pdsch_grant_v1(c_rnti, config, grant) == MmseStatus::kOk,
-                "C-RNTI localized DCI 1A handoff should succeed");
-    expect_true(
-        grant.schema_version == 1U && grant.sfn == 123U && grant.subframe == 4U &&
-            grant.physical_cell_id == 19U && grant.rnti == 0x1234U &&
-            grant.pdcch_chain.first_cce == 8U && grant.start_prb == 10U && grant.n_prb == 20U &&
-            grant.physical_prb_bitmap[0] == 0xFC00U && grant.physical_prb_bitmap[1] == 0x3FFFU &&
-            grant.mcs_valid && grant.mcs == 10U && grant.modulation_order == 4U &&
-            grant.transport_block_size_index == 9U && grant.transport_block_size_bits == 3112U &&
-            grant.new_data_indicator_valid && grant.new_data_indicator == 1U &&
-            grant.transmit_power_control_valid && grant.transmit_power_control == 3U &&
-            grant.raw_payload_bits == c_rnti.dci.raw_payload_bits,
-        "C-RNTI handoff fields, physical PRB bitmap and TBS");
-
-    ExtractDescriptor descriptor{};
-    expect_true(mmse::handoff::make_pdsch_extract_descriptor_v1(grant, 2U, descriptor) ==
-                        MmseStatus::kOk &&
-                    descriptor.channel_type == MmseChannelType::kPdsch &&
-                    descriptor.sfn_subframe == grant.sfn_subframe && descriptor.n_rx_ant == 2U &&
-                    descriptor.start_symbol == 3U && descriptor.control_symbol_count == 3U &&
-                    descriptor.mod_order == 4U && descriptor.n_prb == 20U &&
-                    descriptor.prb_bitmap == grant.physical_prb_bitmap,
-                "PDSCH grant must adapt to the existing equalizer descriptor");
-
-    const auto si_rnti = decode(mmse::pdcch::kSiRnti, 7U, 0U, 1U);
-    expect_true(mmse::handoff::make_pdsch_grant_v1(si_rnti, config, grant) == MmseStatus::kOk &&
-                    !grant.mcs_valid && grant.modulation_order == 2U &&
-                    grant.transport_block_size_index == 7U &&
-                    grant.transport_block_size_bits == 328U && !grant.new_data_indicator_valid &&
-                    !grant.transmit_power_control_valid,
-                "SI-RNTI handoff must use I_TBS, N_PRB^1A and fixed QPSK");
-
-    const auto expect_failure_and_clear = [&](mmse::pdcch::PdcchDciFormat1ADecodeResult input,
-                                              const mmse::handoff::PdcchPdschHandoffConfigV1& cfg,
-                                              MmseStatus expected, const std::string& label) {
-        grant.schema_version = 99U;
-        grant.raw_payload_bits = {1U};
-        expect_true(mmse::handoff::make_pdsch_grant_v1(input, cfg, grant) == expected &&
-                        grant.schema_version == 0U && grant.raw_payload_bits.empty() &&
-                        grant.transport_block_size_bits == 0U,
-                    label);
-    };
-
-    auto invalid = c_rnti;
-    invalid.matched = false;
-    expect_failure_and_clear(invalid, config, MmseStatus::kInvalidArgument,
-                             "handoff must reject unmatched DCI and clear output");
-    invalid = c_rnti;
-    invalid.dci.is_pdcch_order = true;
-    expect_failure_and_clear(invalid, config, MmseStatus::kUnsupportedConfig,
-                             "handoff must reject PDCCH order and clear output");
-    invalid = c_rnti;
-    invalid.dci.distributed_vrb_assignment = true;
-    expect_failure_and_clear(invalid, config, MmseStatus::kUnsupportedConfig,
-                             "handoff must reject distributed VRB and clear output");
-    invalid = c_rnti;
-    invalid.dci.mcs_tbs_index = 29U;
-    invalid.dci.modulation_and_coding_scheme_valid = false;
-    invalid.dci.transport_block_size_index_valid = false;
-    expect_failure_and_clear(invalid, config, MmseStatus::kUnsupportedConfig,
-                             "handoff must reject reserved MCS and clear output");
-    auto unsupported_config = config;
-    unsupported_config.transmission_mode = 3U;
-    expect_failure_and_clear(c_rnti, unsupported_config, MmseStatus::kUnsupportedConfig,
-                             "handoff must reject unsupported PHY config and clear output");
 }
 
 void test_pdcch_dci_format1a_tdd_distributed_parse() {
@@ -4379,6 +4353,140 @@ GpuPdcchDecodeCase make_gpu_pdcch_decode_case(std::uint8_t control_symbol_count,
     return test_case;
 }
 
+struct GpuPdcchFixedDecodeCase {
+    GridBuffers buffers{};
+    mmse::pdcch::PdcchGpuFixedCandidateDecodeRequest request{};
+    bool expected_hit = false;
+};
+
+GpuPdcchFixedDecodeCase make_gpu_pdcch_fixed_decode_case(
+    std::uint8_t control_symbol_count, std::uint8_t n_rx_ant, std::uint8_t n_tx_ports,
+    std::uint8_t aggregation_level, bool use_last_cce, std::uint16_t cell_id,
+    std::uint32_t sfn_subframe, std::uint64_t request_id, bool hit, std::uint64_t generation) {
+    auto desc = make_pdcch_desc(kLteNumPrb20MHz, control_symbol_count);
+    desc.cell_id = cell_id;
+    desc.sfn_subframe = sfn_subframe;
+    desc.n_rx_ant = n_rx_ant;
+    desc.n_tx_ports = n_tx_ports;
+    desc.tx_mode = n_tx_ports == 1U ? 1U : 2U;
+
+    GpuPdcchFixedDecodeCase test_case{};
+    test_case.buffers = make_zero_grid();
+    const std::array<Complex32, 4> td4_channel = {
+        Complex32{1.0F, 0.0F},
+        Complex32{0.0F, 0.0F},
+        Complex32{1.0F, 0.0F},
+        Complex32{0.0F, 0.0F},
+    };
+    if (n_tx_ports == 4U) {
+        fill_td4_crs(test_case.buffers, desc, td4_channel);
+    } else {
+        fill_identity_channel(test_case.buffers, desc, 0.0F, 0.0F);
+    }
+
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    mmse::pdcch::PdcchControlRegion control_region{};
+    expect_true(mmse::pdcch::build_pdcch_control_region(desc.cell_id, desc.control_symbol_count,
+                                                        layout.grid_indices.data(), n_source_re,
+                                                        control_region) == MmseStatus::kOk,
+                "GPU fixed control-region build");
+    expect_true(control_region.cces.size() >= aggregation_level,
+                "GPU fixed candidate must fit in control region");
+    const std::uint16_t first_cce =
+        use_last_cce ? static_cast<std::uint16_t>(control_region.cces.size() - aggregation_level)
+                     : 0U;
+
+    if (hit) {
+        const auto symbols = make_native_si_rnti_qpsk_symbols(
+            n_source_re, first_cce, aggregation_level, make_si_rnti_dci_format1a_bits(),
+            desc.cell_id, desc.sfn_subframe);
+        if (n_tx_ports == 1U) {
+            for (std::uint32_t re = 0U; re < n_source_re; ++re) {
+                test_case.buffers.re[0][layout.grid_indices[re]] = symbols[re].re;
+                test_case.buffers.im[0][layout.grid_indices[re]] = symbols[re].im;
+                if (n_rx_ant == 2U) {
+                    test_case.buffers.re[1][layout.grid_indices[re]] = symbols[re].re;
+                    test_case.buffers.im[1][layout.grid_indices[re]] = symbols[re].im;
+                }
+            }
+        } else if (n_tx_ports == 2U) {
+            for (std::uint32_t re = 0U; re < n_source_re; re += 2U) {
+                fill_td_pair(test_case.buffers, layout.grid_indices[re],
+                             layout.grid_indices[re + 1U], {1.0F, 0.0F}, {0.0F, 0.0F}, {0.0F, 0.0F},
+                             {1.0F, 0.0F}, symbols[re], symbols[re + 1U]);
+            }
+        } else {
+            fill_td4_layout(test_case.buffers, layout, td4_channel, symbols);
+        }
+    }
+
+    PdcchMmseInput input{};
+    input.grid = n_rx_ant == 1U ? make_single_rx_grid_view(test_case.buffers)
+                                : make_grid_view(test_case.buffers);
+    input.grid.generation = generation;
+    input.sfn_subframe = desc.sfn_subframe;
+    input.cell_id = desc.cell_id;
+    input.n_tx_ports = desc.n_tx_ports;
+    input.tx_mode = desc.tx_mode;
+    input.control_symbol_count = desc.control_symbol_count;
+    input.n_prb = desc.n_prb;
+    input.prb_bitmap = desc.prb_bitmap;
+    input.control_re_exclusion_masks = desc.control_re_exclusion_masks;
+    input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                              .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                              .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    input.chain.request_id = request_id;
+    test_case.request.input = input;
+    test_case.request.config.aggregation_level = aggregation_level;
+    test_case.request.config.first_cce = first_cce;
+    test_case.request.config.expected_rnti = mmse::pdcch::kSiRnti;
+    test_case.expected_hit = hit;
+    return test_case;
+}
+
+void expect_pdcch_fixed_results_equal(const mmse::pdcch::PdcchDciFormat1ADecodeResult& actual,
+                                      const mmse::pdcch::PdcchDciFormat1ADecodeResult& expected,
+                                      const std::string& context) {
+    const auto& lhs = actual.dci;
+    const auto& rhs = expected.dci;
+    expect_true(
+        actual.matched == expected.matched &&
+            actual.crc.transmitted_crc == expected.crc.transmitted_crc &&
+            actual.crc.calculated_crc == expected.crc.calculated_crc &&
+            actual.crc.unmasked_rnti == expected.crc.unmasked_rnti &&
+            actual.crc.matches_expected_rnti == expected.crc.matches_expected_rnti &&
+            lhs.sfn_subframe == rhs.sfn_subframe && lhs.cell_id == rhs.cell_id &&
+            lhs.rnti == rhs.rnti && lhs.downlink_bandwidth_prb == rhs.downlink_bandwidth_prb &&
+            lhs.rnti_type == rhs.rnti_type && lhs.chain.request_id == rhs.chain.request_id &&
+            lhs.chain.candidate_id == rhs.chain.candidate_id &&
+            lhs.chain.first_cce == rhs.chain.first_cce &&
+            lhs.chain.aggregation_level == rhs.chain.aggregation_level &&
+            lhs.cif_present == rhs.cif_present && lhs.carrier_indicator == rhs.carrier_indicator &&
+            lhs.is_pdcch_order == rhs.is_pdcch_order && lhs.preamble_index == rhs.preamble_index &&
+            lhs.prach_mask_index == rhs.prach_mask_index &&
+            lhs.distributed_vrb_assignment == rhs.distributed_vrb_assignment &&
+            lhs.n_gap_is_two == rhs.n_gap_is_two &&
+            lhs.n_prb_1a_is_three == rhs.n_prb_1a_is_three && lhs.n_prb_1a == rhs.n_prb_1a &&
+            lhs.resource_indication_value == rhs.resource_indication_value &&
+            lhs.start_prb == rhs.start_prb && lhs.n_prb == rhs.n_prb &&
+            lhs.mcs_tbs_index == rhs.mcs_tbs_index &&
+            lhs.transport_block_size_index == rhs.transport_block_size_index &&
+            lhs.modulation_and_coding_scheme_valid == rhs.modulation_and_coding_scheme_valid &&
+            lhs.transport_block_size_index_valid == rhs.transport_block_size_index_valid &&
+            lhs.harq_process == rhs.harq_process &&
+            lhs.new_data_indicator == rhs.new_data_indicator &&
+            lhs.new_data_indicator_valid == rhs.new_data_indicator_valid &&
+            lhs.redundancy_version == rhs.redundancy_version &&
+            lhs.transmit_power_control == rhs.transmit_power_control &&
+            lhs.transmit_power_control_valid == rhs.transmit_power_control_valid &&
+            lhs.n_prb_1a_valid == rhs.n_prb_1a_valid &&
+            lhs.downlink_assignment_index == rhs.downlink_assignment_index &&
+            lhs.downlink_assignment_index_valid == rhs.downlink_assignment_index_valid &&
+            lhs.raw_payload_bits == rhs.raw_payload_bits,
+        context);
+}
+
 void test_pdcch_native_si_rnti_search_returns_only_target_candidate() {
     const auto backend = make_native_si_rnti_backend(4U, 4U, make_si_rnti_dci_format1a_bits());
     mmse::pdcch::PdcchSiRntiSearchResult result{};
@@ -4906,6 +5014,249 @@ void test_pdcch_common_search_decode_returns_all_hits() {
                 "common-search hit must preserve CCE metadata and parsed DCI");
 }
 
+void test_pdcch_fixed_candidate_decode_validates_and_decodes_once() {
+    constexpr std::uint32_t kCceCount = 16U;
+    constexpr std::uint32_t kReCount =
+        kCceCount * mmse::pdcch::kPdcchRegsPerCce * mmse::pdcch::kPdcchRePerReg;
+    mmse::pdcch::BackendPdcchEqualizedIndication backend{};
+    backend.sfn_subframe = 6U;
+    backend.cell_id = 23U;
+    backend.n_tx_ports = 1U;
+    backend.n_rx_ant = 1U;
+    backend.n_layers = 1U;
+    backend.tx_mode = 1U;
+    backend.control_symbol_count = 1U;
+    backend.mod_order = 2U;
+    backend.chain.request_id = 881U;
+    backend.x_hat_re.assign(kReCount, 0.5F);
+    backend.x_hat_im.assign(kReCount, -0.5F);
+    backend.sinr.assign(kReCount, 1.0F);
+    backend.re_grid_indices.resize(kReCount);
+    for (std::uint32_t re = 0U; re < kReCount; ++re) {
+        backend.re_grid_indices[re] = static_cast<std::uint16_t>(re);
+    }
+
+    for (const std::uint8_t aggregation_level : {1U, 2U, 4U, 8U}) {
+        FixedTailBitingDecoder decoder{.decoded_bits = make_si_rnti_dci_format1a_bits()};
+        const std::uint16_t first_cce = static_cast<std::uint16_t>(kCceCount - aggregation_level);
+        const mmse::pdcch::PdcchFixedCandidateDecodeConfig config{
+            .aggregation_level = aggregation_level,
+            .first_cce = first_cce,
+            .expected_rnti = mmse::pdcch::kSiRnti,
+            .decoder = {.context = &decoder, .decode = fixed_tail_biting_decoder},
+        };
+        mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+        expect_true(mmse::pdcch::decode_pdcch_fixed_candidate_dci_format1a(
+                        backend, config, result) == MmseStatus::kOk &&
+                        decoder.call_count == 1U && result.matched &&
+                        result.dci.chain.request_id == backend.chain.request_id &&
+                        result.dci.chain.first_cce == first_cce &&
+                        result.dci.chain.aggregation_level == aggregation_level,
+                    "fixed-candidate decode must accept each LTE AL and decode exactly once");
+    }
+
+    FixedTailBitingDecoder rejected_decoder{.decoded_bits = make_si_rnti_dci_format1a_bits()};
+    for (const std::uint8_t aggregation_level : {0U, 3U, 16U}) {
+        const mmse::pdcch::PdcchFixedCandidateDecodeConfig config{
+            .aggregation_level = aggregation_level,
+            .expected_rnti = mmse::pdcch::kSiRnti,
+            .decoder = {.context = &rejected_decoder, .decode = fixed_tail_biting_decoder},
+        };
+        mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+        expect_true(mmse::pdcch::decode_pdcch_fixed_candidate_dci_format1a(
+                        backend, config, result) == MmseStatus::kInvalidArgument &&
+                        rejected_decoder.call_count == 0U,
+                    "fixed-candidate decode must reject invalid AL before decoding");
+    }
+
+    const mmse::pdcch::PdcchFixedCandidateDecodeConfig out_of_range_config{
+        .aggregation_level = 8U,
+        .first_cce = 9U,
+        .expected_rnti = mmse::pdcch::kSiRnti,
+        .decoder = {.context = &rejected_decoder, .decode = fixed_tail_biting_decoder},
+    };
+    mmse::pdcch::PdcchDciFormat1ADecodeResult out_of_range_result{};
+    expect_true(mmse::pdcch::decode_pdcch_fixed_candidate_dci_format1a(backend, out_of_range_config,
+                                                                       out_of_range_result) ==
+                        MmseStatus::kInvalidArgument &&
+                    rejected_decoder.call_count == 0U,
+                "fixed-candidate decode must reject CCE ranges outside the control region");
+
+    FixedTailBitingDecoder miss_decoder{.decoded_bits = make_si_rnti_dci_format1a_bits()};
+    const mmse::pdcch::PdcchFixedCandidateDecodeConfig miss_config{
+        .aggregation_level = 4U,
+        .first_cce = 0U,
+        .expected_rnti = 0x1234U,
+        .decoder = {.context = &miss_decoder, .decode = fixed_tail_biting_decoder},
+    };
+    mmse::pdcch::PdcchDciFormat1ADecodeResult miss_result{};
+    expect_true(mmse::pdcch::decode_pdcch_fixed_candidate_dci_format1a(
+                    backend, miss_config, miss_result) == MmseStatus::kOk &&
+                    miss_decoder.call_count == 1U && !miss_result.matched &&
+                    !miss_result.crc.matches_expected_rnti,
+                "fixed-candidate CRC miss must return success without another decode");
+}
+
+void test_pdcch_cpu_fixed_candidate_decode_runs_full_chain_once() {
+    MmseEqualizerCpuContext context;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(context.init(cpu_config) == MmseStatus::kOk, "cpu fixed-candidate init");
+
+    const auto desc = make_pdcch_desc();
+    GridBuffers buffers = make_zero_grid();
+    fill_identity_channel(buffers, desc, 1.0F, 0.0F);
+    PdcchMmseInput input{};
+    input.grid = make_grid_view(buffers);
+    input.sfn_subframe = desc.sfn_subframe;
+    input.cell_id = desc.cell_id;
+    input.n_tx_ports = desc.n_tx_ports;
+    input.tx_mode = desc.tx_mode;
+    input.control_symbol_count = desc.control_symbol_count;
+    input.n_prb = desc.n_prb;
+    input.prb_bitmap = desc.prb_bitmap;
+    input.control_re_exclusion_masks = desc.control_re_exclusion_masks;
+    input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                              .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                              .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    input.chain.request_id = 90209U;
+
+    FixedTailBitingDecoder decoder{.decoded_bits = make_si_rnti_dci_format1a_bits()};
+    const mmse::pdcch::PdcchFixedCandidateDecodeConfig config{
+        .aggregation_level = 1U,
+        .first_cce = 2U,
+        .expected_rnti = mmse::pdcch::kSiRnti,
+        .decoder = {.context = &decoder, .decode = fixed_tail_biting_decoder},
+    };
+    mmse::pdcch::PdcchDciFormat1ADecodeResult result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_fixed_candidate_decode(context, input, config, result) ==
+                        MmseStatus::kOk &&
+                    decoder.call_count == 1U && result.matched &&
+                    result.dci.chain.request_id == input.chain.request_id &&
+                    result.dci.chain.first_cce == config.first_cce &&
+                    result.dci.chain.aggregation_level == config.aggregation_level,
+                "CPU fixed-candidate entry must run the selected candidate exactly once");
+}
+
+void test_pdcch_gpu_fixed_candidate_decode_matches_cpu_matrix() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "GPU fixed CPU oracle init");
+
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kCuda;
+    gpu_config.stream_count = 2U;
+    gpu_config.sigma2_min = cpu_config.sigma2_min;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "GPU fixed CUDA init");
+
+    const std::array<std::pair<std::uint8_t, std::uint8_t>, 5> antenna_modes = {{
+        {1U, 1U},
+        {1U, 2U},
+        {2U, 1U},
+        {2U, 2U},
+        {4U, 1U},
+    }};
+    std::uint64_t request_id = 92000U;
+    for (const std::uint8_t control_symbol_count : {1U, 2U, 3U}) {
+        for (const std::uint8_t aggregation_level : {1U, 2U, 4U, 8U}) {
+            for (const auto [n_tx_ports, n_rx_ant] : antenna_modes) {
+                for (const bool use_last_cce : {false, true}) {
+                    for (const bool hit : {false, true}) {
+                        auto test_case = make_gpu_pdcch_fixed_decode_case(
+                            control_symbol_count, n_rx_ant, n_tx_ports, aggregation_level,
+                            use_last_cce, static_cast<std::uint16_t>(10U + request_id % 400U),
+                            static_cast<std::uint32_t>(request_id), request_id, hit, request_id);
+                        mmse::pdcch::PdcchDciFormat1ADecodeResult cpu_result{};
+                        mmse::pdcch::PdcchGpuFixedCandidateDecodeResult gpu_result{};
+                        expect_true(mmse::pdcch::run_pdcch_cpu_fixed_candidate_decode(
+                                        cpu, test_case.request.input, test_case.request.config,
+                                        cpu_result) == MmseStatus::kOk,
+                                    "GPU fixed matrix CPU oracle");
+                        expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(
+                                        gpu, test_case.request, gpu_result) == MmseStatus::kOk,
+                                    "GPU fixed matrix CUDA decode");
+                        expect_pdcch_fixed_results_equal(gpu_result.decoded, cpu_result,
+                                                         "GPU fixed matrix field equivalence");
+                        expect_true(gpu_result.decoded.matched == hit &&
+                                        gpu_result.profile.d2h_bytes ==
+                                            sizeof(mmse::detail::CudaPdcchCandidateResult) &&
+                                        gpu_result.profile.crc_hit_count == (hit ? 1U : 0U) &&
+                                        gpu_result.profile.crc_miss_count == (hit ? 0U : 1U),
+                                    "GPU fixed matrix raw D2H and CRC accounting");
+                        ++request_id;
+                    }
+                }
+            }
+        }
+    }
+
+    auto valid =
+        make_gpu_pdcch_fixed_decode_case(3U, 1U, 1U, 4U, false, 77U, 7U, request_id++, true, 1U);
+    mmse::pdcch::PdcchGpuFixedCandidateDecodeResult result{};
+    for (const std::uint8_t invalid_level : {0U, 3U, 16U}) {
+        auto invalid = valid.request;
+        invalid.config.aggregation_level = invalid_level;
+        expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(gpu, invalid, result) ==
+                        MmseStatus::kInvalidArgument,
+                    "GPU fixed must reject invalid aggregation level");
+    }
+    auto invalid = valid.request;
+    invalid.config.expected_rnti = 0U;
+    expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(gpu, invalid, result) ==
+                    MmseStatus::kInvalidArgument,
+                "GPU fixed must reject zero RNTI");
+    invalid = valid.request;
+    invalid.config.first_cce = std::numeric_limits<std::uint16_t>::max();
+    expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(gpu, invalid, result) ==
+                    MmseStatus::kInvalidArgument,
+                "GPU fixed must reject out-of-range CCE before submission");
+    invalid = valid.request;
+    invalid.config.dci_format1a.n_prb = kLteNumPrb20MHz - 1U;
+    expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(gpu, invalid, result) ==
+                    MmseStatus::kUnsupportedConfig,
+                "GPU fixed must reject unsupported DCI bandwidth");
+    invalid = valid.request;
+    invalid.config.dci_format1a.cif_enabled = true;
+    expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(gpu, invalid, result) ==
+                    MmseStatus::kUnsupportedConfig,
+                "GPU fixed must reject unsupported DCI CIF");
+    FixedTailBitingDecoder decoder{.decoded_bits = make_si_rnti_dci_format1a_bits()};
+    invalid = valid.request;
+    invalid.config.decoder = {.context = &decoder, .decode = fixed_tail_biting_decoder};
+    expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(gpu, invalid, result) ==
+                        MmseStatus::kUnsupportedConfig &&
+                    decoder.call_count == 0U,
+                "GPU fixed must reject external decoder callback");
+
+    auto generation_case =
+        make_gpu_pdcch_fixed_decode_case(3U, 1U, 1U, 4U, false, 78U, 8U, request_id++, true, 10U);
+    expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(gpu, generation_case.request,
+                                                                  result) == MmseStatus::kOk &&
+                    result.decoded.matched,
+                "GPU fixed generation baseline hit");
+    std::fill(generation_case.buffers.re[0].begin(), generation_case.buffers.re[0].end(), 0.0F);
+    std::fill(generation_case.buffers.im[0].begin(), generation_case.buffers.im[0].end(), 0.0F);
+    generation_case.request.input.grid.generation = 11U;
+    generation_case.request.input.chain.request_id = request_id++;
+    expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(gpu, generation_case.request,
+                                                                  result) == MmseStatus::kOk &&
+                    !result.decoded.matched && result.profile.crc_miss_count == 1U,
+                "GPU fixed generation change must not retain a prior hit");
+
+    std::array<mmse::pdcch::PdcchGpuFixedCandidateDecodeRequest, 2> requests = {valid.request,
+                                                                                valid.request};
+    std::array<mmse::pdcch::PdcchGpuFixedCandidateDecodeResult, 1> short_results{};
+    expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode_batch(
+                    gpu, requests, short_results) == MmseStatus::kInvalidArgument,
+                "GPU fixed batch must require equal spans");
+#endif
+}
+
 void test_pdcch_cpu_common_search_decode_runs_full_one_tx_chain() {
     MmseEqualizerCpuContext context;
     MmseEqualizerCpuConfig cpu_config{};
@@ -5101,23 +5452,6 @@ void test_pdcch_gpu_common_search_decode_matches_cpu_and_rejects_callbacks() {
                         actual.dci.mcs_tbs_index == expected.dci.mcs_tbs_index &&
                         actual.dci.redundancy_version == expected.dci.redundancy_version,
                     "GPU common-search DCI and CRC equivalence");
-        const mmse::handoff::PdcchPdschHandoffConfigV1 handoff_config{
-            .start_symbol = input.control_symbol_count,
-            .n_tx_ports = input.n_tx_ports,
-            .n_layers = 1U,
-            .transmission_mode = input.tx_mode,
-        };
-        mmse::handoff::PdschGrantV1 cpu_grant{};
-        mmse::handoff::PdschGrantV1 gpu_grant{};
-        expect_true(mmse::handoff::make_pdsch_grant_v1(expected, handoff_config, cpu_grant) ==
-                            MmseStatus::kOk &&
-                        mmse::handoff::make_pdsch_grant_v1(actual, handoff_config, gpu_grant) ==
-                            MmseStatus::kOk &&
-                        gpu_grant.physical_prb_bitmap == cpu_grant.physical_prb_bitmap &&
-                        gpu_grant.transport_block_size_bits ==
-                            cpu_grant.transport_block_size_bits &&
-                        gpu_grant.raw_payload_bits == cpu_grant.raw_payload_bits,
-                    "GPU common-search host handoff Grant equivalence");
     }
 
     PdcchMmseInput single_rx_input = input;
@@ -5233,6 +5567,86 @@ void test_pdcch_gpu_common_search_decode_matches_cpu_and_rejects_callbacks() {
 #endif
 }
 
+void test_pdcch_gpu_fixed_candidate_mixed_batch_matches_cpu() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "GPU fixed batch CPU init");
+
+    for (const std::uint32_t stream_count : {1U, 2U, 4U}) {
+        MmseEqualizerGpuContext gpu;
+        MmseEqualizerGpuConfig gpu_config{};
+        gpu_config.backend = MmseGpuBackend::kCuda;
+        gpu_config.stream_count = stream_count;
+        gpu_config.sigma2_min = cpu_config.sigma2_min;
+        expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "GPU fixed batch CUDA init");
+
+        for (const std::uint32_t batch_size : {1U, 2U, 4U, 8U, 16U}) {
+            std::vector<GpuPdcchFixedDecodeCase> cases{};
+            cases.reserve(batch_size);
+            for (std::uint32_t index = 0U; index < batch_size; ++index) {
+                const std::uint8_t n_tx_ports =
+                    index % 5U == 4U ? 4U : static_cast<std::uint8_t>(1U + index % 2U);
+                const std::uint8_t n_rx_ant =
+                    n_tx_ports == 4U ? 1U : static_cast<std::uint8_t>(1U + (index / 2U) % 2U);
+                const std::uint8_t aggregation_level =
+                    std::array<std::uint8_t, 4>{1U, 2U, 4U, 8U}[index % 4U];
+                const std::uint64_t request_id =
+                    93000U + stream_count * 1000U + batch_size * 20U + index;
+                cases.push_back(make_gpu_pdcch_fixed_decode_case(
+                    static_cast<std::uint8_t>(1U + index % 3U), n_rx_ant, n_tx_ports,
+                    aggregation_level, (index & 1U) != 0U, static_cast<std::uint16_t>(70U + index),
+                    static_cast<std::uint32_t>(80U + index), request_id, index % 3U != 1U,
+                    request_id));
+            }
+
+            std::vector<mmse::pdcch::PdcchGpuFixedCandidateDecodeRequest> requests(batch_size);
+            std::vector<mmse::pdcch::PdcchGpuFixedCandidateDecodeResult> results(batch_size);
+            for (std::size_t index = 0U; index < cases.size(); ++index) {
+                requests[index] = cases[index].request;
+            }
+            expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode_batch(
+                            gpu, requests, results) == MmseStatus::kOk,
+                        "GPU fixed mixed batch decode");
+            for (std::size_t index = 0U; index < cases.size(); ++index) {
+                mmse::pdcch::PdcchDciFormat1ADecodeResult cpu_result{};
+                expect_true(mmse::pdcch::run_pdcch_cpu_fixed_candidate_decode(
+                                cpu, requests[index].input, requests[index].config, cpu_result) ==
+                                MmseStatus::kOk,
+                            "GPU fixed mixed batch CPU oracle");
+                expect_pdcch_fixed_results_equal(results[index].decoded, cpu_result,
+                                                 "GPU fixed mixed batch field equivalence");
+                expect_true(results[index].profile.d2h_bytes ==
+                                    sizeof(mmse::detail::CudaPdcchCandidateResult) &&
+                                results[index].decoded.matched == cases[index].expected_hit,
+                            "GPU fixed mixed batch isolation and raw D2H");
+            }
+
+            if (batch_size >= 2U) {
+                auto failing_requests = requests;
+                failing_requests[1].config.aggregation_level = 3U;
+                expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode_batch(
+                                gpu, failing_requests, results) == MmseStatus::kInvalidArgument,
+                            "GPU fixed batch must report partial submission failure");
+                mmse::pdcch::PdcchGpuFixedCandidateDecodeResult recovered{};
+                expect_true(mmse::pdcch::run_pdcch_gpu_fixed_candidate_decode(
+                                gpu, requests[0], recovered) == MmseStatus::kOk,
+                            "GPU fixed context must recover after batch drain");
+                mmse::pdcch::PdcchDciFormat1ADecodeResult cpu_result{};
+                expect_true(mmse::pdcch::run_pdcch_cpu_fixed_candidate_decode(
+                                cpu, requests[0].input, requests[0].config, cpu_result) ==
+                                MmseStatus::kOk,
+                            "GPU fixed recovery CPU oracle");
+                expect_pdcch_fixed_results_equal(recovered.decoded, cpu_result,
+                                                 "GPU fixed post-drain recovery");
+            }
+        }
+    }
+#endif
+}
+
 void test_pdcch_gpu_common_search_two_tx_matches_cpu() {
 #if MMSE_CUDA_ENABLED
     MmseEqualizerCpuContext cpu;
@@ -5309,22 +5723,6 @@ void test_pdcch_gpu_common_search_two_tx_matches_cpu() {
                     actual.dci.n_prb_1a == expected.dci.n_prb_1a &&
                     actual.dci.n_prb_1a_is_three == expected.dci.n_prb_1a_is_three,
                 "two-tx GPU common-search DCI and CRC equivalence");
-    const mmse::handoff::PdcchPdschHandoffConfigV1 handoff_config{
-        .start_symbol = input.control_symbol_count,
-        .n_tx_ports = input.n_tx_ports,
-        .n_layers = 1U,
-        .transmission_mode = input.tx_mode,
-    };
-    mmse::handoff::PdschGrantV1 cpu_grant{};
-    mmse::handoff::PdschGrantV1 gpu_grant{};
-    expect_true(mmse::handoff::make_pdsch_grant_v1(expected, handoff_config, cpu_grant) ==
-                        MmseStatus::kOk &&
-                    mmse::handoff::make_pdsch_grant_v1(actual, handoff_config, gpu_grant) ==
-                        MmseStatus::kOk &&
-                    gpu_grant.n_tx_ports == 2U && gpu_grant.transmission_mode == 2U &&
-                    gpu_grant.physical_prb_bitmap == cpu_grant.physical_prb_bitmap &&
-                    gpu_grant.transport_block_size_bits == cpu_grant.transport_block_size_bits,
-                "two-tx GPU common-search host handoff Grant equivalence");
     const std::uint64_t expected_h2d_bytes =
         2U * static_cast<std::uint64_t>(input.grid.n_rx_ant) * mmse::detail::kCudaMaxGridRe *
             sizeof(float) +
@@ -5338,6 +5736,85 @@ void test_pdcch_gpu_common_search_two_tx_matches_cpu() {
     expect_true(gpu_result.profile.h2d_bytes == expected_h2d_bytes &&
                     gpu_result.profile.d2h_bytes == expected_d2h_bytes,
                 "two-tx GPU common-search transfer accounting must match memcpy sizes");
+#endif
+}
+
+void test_pdcch_gpu_common_search_four_tx_matches_cpu() {
+#if MMSE_CUDA_ENABLED
+    MmseEqualizerCpuContext cpu;
+    MmseEqualizerCpuConfig cpu_config{};
+    cpu_config.worker_count = 1U;
+    cpu_config.sigma2_min = 1.0e-5F;
+    expect_true(cpu.init(cpu_config) == MmseStatus::kOk, "four-tx GPU reference init");
+
+    MmseEqualizerGpuContext gpu;
+    MmseEqualizerGpuConfig gpu_config{};
+    gpu_config.backend = MmseGpuBackend::kCuda;
+    gpu_config.sigma2_min = cpu_config.sigma2_min;
+    expect_true(gpu.init(gpu_config) == MmseStatus::kOk, "four-tx GPU CUDA init");
+
+    auto desc = make_pdcch_desc();
+    desc.n_tx_ports = 4U;
+    desc.n_rx_ant = 1U;
+    desc.tx_mode = 2U;
+    GridBuffers buffers = make_zero_grid();
+    const std::array<Complex32, 4> channel = {
+        Complex32{1.0F, 0.0F},
+        Complex32{0.0F, 0.0F},
+        Complex32{1.0F, 0.0F},
+        Complex32{0.0F, 0.0F},
+    };
+    fill_td4_crs(buffers, desc, channel);
+    mmse::detail::ReLayout layout{};
+    const std::uint32_t n_source_re = mmse::detail::build_pdcch_re_layout(desc, layout);
+    expect_true(n_source_re != 0U && (n_source_re & 3U) == 0U,
+                "four-tx GPU PDCCH must form complete four-RE blocks");
+    const auto symbols = make_native_si_rnti_qpsk_symbols(
+        n_source_re, 4U, 4U, make_si_rnti_dci_format1a_bits(), desc.cell_id, desc.sfn_subframe);
+    fill_td4_layout(buffers, layout, channel, symbols);
+
+    PdcchMmseInput input{};
+    input.grid = make_single_rx_grid_view(buffers);
+    input.sfn_subframe = desc.sfn_subframe;
+    input.cell_id = desc.cell_id;
+    input.n_tx_ports = 4U;
+    input.tx_mode = 2U;
+    input.control_symbol_count = desc.control_symbol_count;
+    input.n_prb = desc.n_prb;
+    input.prb_bitmap = desc.prb_bitmap;
+    input.control_re_exclusion_masks = desc.control_re_exclusion_masks;
+    input.control_subframe = {.duplex_mode = mmse::pdcch::PhichDuplexMode::kFdd,
+                              .subframe = static_cast<std::uint8_t>(desc.sfn_subframe % 10U),
+                              .kind = mmse::pdcch::LteControlSubframeKind::kRegular};
+    input.chain.request_id = 90504U;
+
+    mmse::pdcch::PdcchCommonSearchDecodeResult cpu_result{};
+    expect_true(mmse::pdcch::run_pdcch_cpu_common_search_decode(cpu, input, {}, cpu_result) ==
+                        MmseStatus::kOk &&
+                    cpu_result.hits.size() == 1U,
+                "four-tx GPU common-search CPU reference decode");
+    mmse::pdcch::PdcchGpuCommonSearchDecodeRequest request{};
+    request.input = input;
+    mmse::pdcch::PdcchGpuCommonSearchDecodeResult gpu_result{};
+    expect_true(mmse::pdcch::run_pdcch_gpu_common_search_decode(gpu, request, gpu_result) ==
+                        MmseStatus::kOk &&
+                    gpu_result.candidate_count == cpu_result.candidate_count &&
+                    gpu_result.hits.size() == cpu_result.hits.size(),
+                "four-tx GPU common-search device decode");
+    const auto& expected = cpu_result.hits.front();
+    const auto& actual = gpu_result.hits.front();
+    expect_true(actual.crc.transmitted_crc == expected.crc.transmitted_crc &&
+                    actual.crc.calculated_crc == expected.crc.calculated_crc &&
+                    actual.crc.unmasked_rnti == expected.crc.unmasked_rnti &&
+                    actual.dci.chain.request_id == expected.dci.chain.request_id &&
+                    actual.dci.chain.first_cce == expected.dci.chain.first_cce &&
+                    actual.dci.chain.aggregation_level == expected.dci.chain.aggregation_level &&
+                    actual.dci.raw_payload_bits == expected.dci.raw_payload_bits &&
+                    actual.dci.start_prb == expected.dci.start_prb &&
+                    actual.dci.n_prb == expected.dci.n_prb,
+                "four-tx GPU common-search DCI equivalence");
+    expect_true(gpu_result.profile.h2d_bytes > 0U && gpu_result.profile.d2h_bytes > 0U,
+                "four-tx GPU common-search transfer accounting");
 #endif
 }
 
@@ -6669,9 +7146,6 @@ int main() {
                   &test_single_rx_single_layer_equalization_and_pdcch},
         std::pair{"sigma2_state_persists", &test_sigma2_state_persists},
         std::pair{"single_layer_path", &test_single_layer_path},
-        std::pair{"pdsch_td_two_crs_joint_equalization_and_contract",
-                  &test_pdsch_td_two_crs_joint_equalization_and_contract},
-        std::pair{"pdcch_td_requires_tm2", &test_pdcch_td_requires_tm2},
         std::pair{"pdcch_layout_excludes_crs_and_reserved_res",
                   &test_pdcch_layout_excludes_crs_and_reserved_res},
         std::pair{"pbch_layout_matches_lte_center_72_subcarriers",
@@ -6701,6 +7175,8 @@ int main() {
                   &test_generation_invalidates_cpu_subframe_cache},
         std::pair{"pbch_and_pcfich_td_cpu_golden_and_dto",
                   &test_pbch_and_pcfich_td_cpu_golden_and_dto},
+        std::pair{"four_port_control_channels_cpu_and_pdcch_decode",
+                  &test_four_port_control_channels_cpu_and_pdcch_decode},
         std::pair{"gpu_cuda_pbch_and_pcfich_td_match_cpu",
                   &test_gpu_cuda_pbch_and_pcfich_td_match_cpu},
         std::pair{"cpu_shared_estimate_reuses_once_per_subframe",
@@ -6736,6 +7212,8 @@ int main() {
                   &test_pdcch_common_search_candidate_llrs_reject_invalid_backend},
         std::pair{"pdcch_common_search_decode_returns_all_hits",
                   &test_pdcch_common_search_decode_returns_all_hits},
+        std::pair{"pdcch_fixed_candidate_decode_validates_and_decodes_once",
+                  &test_pdcch_fixed_candidate_decode_validates_and_decodes_once},
         std::pair{"pdcch_native_si_rnti_search_returns_only_target_candidate",
                   &test_pdcch_native_si_rnti_search_returns_only_target_candidate},
         std::pair{"pdcch_ue_specific_search_decodes_l1_l2_candidates",
@@ -6789,9 +7267,6 @@ int main() {
         std::pair{"pdcch_crc16_and_rnti_mask_check", &test_pdcch_crc16_and_rnti_mask_check},
         std::pair{"pdcch_dci_format1a_fdd_si_rnti_parse",
                   &test_pdcch_dci_format1a_fdd_si_rnti_parse},
-        std::pair{"pdcch_dci_format1a_fdd_c_rnti_parse", &test_pdcch_dci_format1a_fdd_c_rnti_parse},
-        std::pair{"pdcch_pdsch_handoff_v1_grants_and_boundaries",
-                  &test_pdcch_pdsch_handoff_v1_grants_and_boundaries},
         std::pair{"pdcch_dci_format1a_tdd_distributed_parse",
                   &test_pdcch_dci_format1a_tdd_distributed_parse},
         std::pair{"pdcch_dci_format1a_pdcch_order_and_crc_miss",
@@ -6827,12 +7302,20 @@ int main() {
                   &test_pdcch_td_normalization_restores_cce_re_order},
         std::pair{"pdcch_cpu_common_search_decode_runs_full_one_tx_chain",
                   &test_pdcch_cpu_common_search_decode_runs_full_one_tx_chain},
+        std::pair{"pdcch_cpu_fixed_candidate_decode_runs_full_chain_once",
+                  &test_pdcch_cpu_fixed_candidate_decode_runs_full_chain_once},
+        std::pair{"pdcch_gpu_fixed_candidate_decode_matches_cpu_matrix",
+                  &test_pdcch_gpu_fixed_candidate_decode_matches_cpu_matrix},
+        std::pair{"pdcch_gpu_fixed_candidate_mixed_batch_matches_cpu",
+                  &test_pdcch_gpu_fixed_candidate_mixed_batch_matches_cpu},
         std::pair{"pdcch_cpu_common_search_decode_runs_full_two_tx_chain",
                   &test_pdcch_cpu_common_search_decode_runs_full_two_tx_chain},
         std::pair{"pdcch_gpu_common_search_decode_matches_cpu_and_rejects_callbacks",
                   &test_pdcch_gpu_common_search_decode_matches_cpu_and_rejects_callbacks},
         std::pair{"pdcch_gpu_common_search_two_tx_matches_cpu",
                   &test_pdcch_gpu_common_search_two_tx_matches_cpu},
+        std::pair{"pdcch_gpu_common_search_four_tx_matches_cpu",
+                  &test_pdcch_gpu_common_search_four_tx_matches_cpu},
         std::pair{"pdcch_gpu_common_search_cfi_rx_aggregation_matrix",
                   &test_pdcch_gpu_common_search_cfi_rx_aggregation_matrix},
         std::pair{"pdcch_gpu_common_search_mixed_concurrency_matrix",

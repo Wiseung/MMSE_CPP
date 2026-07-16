@@ -212,6 +212,41 @@ struct PcfichTdMmseOutputView {
     std::uint32_t capacity_symbols = 0;
 };
 
+// Four-port transmit diversity emits four recovered symbols per frequency-
+// switched block. Every output slot records the four source REs of its block.
+struct PdcchTd4MmseOutputView {
+    float* x_hat_re = nullptr;
+    float* x_hat_im = nullptr;
+    float* sinr = nullptr;
+    std::uint16_t* re_grid_indices0 = nullptr;
+    std::uint16_t* re_grid_indices1 = nullptr;
+    std::uint16_t* re_grid_indices2 = nullptr;
+    std::uint16_t* re_grid_indices3 = nullptr;
+    std::uint32_t capacity_symbols = 0;
+};
+
+struct PbchTd4MmseOutputView {
+    float* x_hat_re = nullptr;
+    float* x_hat_im = nullptr;
+    float* sinr = nullptr;
+    std::uint16_t* re_grid_indices0 = nullptr;
+    std::uint16_t* re_grid_indices1 = nullptr;
+    std::uint16_t* re_grid_indices2 = nullptr;
+    std::uint16_t* re_grid_indices3 = nullptr;
+    std::uint32_t capacity_symbols = 0;
+};
+
+struct PcfichTd4MmseOutputView {
+    float* x_hat_re = nullptr;
+    float* x_hat_im = nullptr;
+    float* sinr = nullptr;
+    std::uint16_t* re_grid_indices0 = nullptr;
+    std::uint16_t* re_grid_indices1 = nullptr;
+    std::uint16_t* re_grid_indices2 = nullptr;
+    std::uint16_t* re_grid_indices3 = nullptr;
+    std::uint32_t capacity_symbols = 0;
+};
+
 // One transmit-diversity output sequence. Adjacent symbols are recovered from
 // the paired source REs referenced by re_grid_indices0/re_grid_indices1.
 struct PdschTdMmseOutputView {
@@ -316,6 +351,63 @@ struct PbchTdMmseResult {
 };
 
 struct PcfichTdMmseResult {
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_source_re = 0;
+    std::uint32_t sfn_subframe = 0;
+    std::uint32_t grid_symbol_count = 0;
+    std::uint32_t grid_subcarrier_count = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t start_symbol = 0;
+    std::uint8_t reg_count = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t mod_order = 0;
+    float sigma2 = 0.0F;
+    PcfichChainMetadata chain{};
+};
+
+struct PdcchTd4MmseResult {
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_source_re = 0;
+    std::uint32_t sfn_subframe = 0;
+    std::uint32_t grid_symbol_count = 0;
+    std::uint32_t grid_subcarrier_count = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t control_symbol_count = 0;
+    std::uint8_t mod_order = 0;
+    float sigma2 = 0.0F;
+    std::array<std::uint16_t, 7> prb_bitmap{};
+    PdcchChainMetadata chain{};
+};
+
+struct PbchTd4MmseResult {
+    std::uint32_t n_symbols = 0;
+    std::uint32_t n_source_re = 0;
+    std::uint32_t sfn_subframe = 0;
+    std::uint32_t grid_symbol_count = 0;
+    std::uint32_t grid_subcarrier_count = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t start_prb = 0;
+    std::uint16_t n_prb = 0;
+    std::uint8_t start_symbol = 0;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t mod_order = 0;
+    float sigma2 = 0.0F;
+    PbchChainMetadata chain{};
+};
+
+struct PcfichTd4MmseResult {
     std::uint32_t n_symbols = 0;
     std::uint32_t n_source_re = 0;
     std::uint32_t sfn_subframe = 0;

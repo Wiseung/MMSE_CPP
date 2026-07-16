@@ -1,6 +1,7 @@
 # 4G LTE 下行 MMSE 信道均衡模块 — 技术设计文档 (TDD)
 
-> 适用范围：FDD LTE / 20 MHz（2048-FFT, 1200 子载波, 100 PRB, Normal CP）/ 1 或 2Rx、最多 2 个 CRS 发射端口 / 1 ms TTI 硬实时。
+> 适用范围：FDD LTE / 20 MHz（2048-FFT, 1200 子载波, 100 PRB, Normal CP）/ 1 或 2Rx；
+> 通用路径支持 1/2 个 CRS 发射端口，PBCH/PCFICH/PDCCH 另支持 `4Tx x 1Rx` Td4 / 1 ms TTI 硬实时。
 > 设计目标：在 x86 CPU 与 NVIDIA GPU 上实现「FFT 输出 → 软解调 LLR 输入」之间的 DSP 段（CRS 插值 + MMSE 均衡），输出星座点 X̂ 与后验 SINR。
 > 对齐标准：3GPP TS 36.211（物理信道与调制）、3GPP TS 36.212（复用与信道编码）。
 
@@ -10,7 +11,7 @@
 
 ## 0. 系统定位与数据流总览
 
-```
+```text
             ┌─────────────────────────── 本模块 (PHY DSP 段) ───────────────────────────┐
  FFT 输出     │  ① CRS 提取 → ② LS 估计 → ③ 2D 插值(得 H) → ④ σ² 估计                      │
  资源栅格 Y ─►│                                          ↓                                │──► LLR 生成
@@ -28,55 +29,45 @@
 
 ### 1.1 输入 (Inputs)
 
-| 名称   | 类型                      | 布局                         | 说明                                              |
-| ------ | ------------------------- | ---------------------------- | ------------------------------------------------- |
-| `grid` | 复数 `int16_t` 或 `float` | **SoA**: `re[]`, `im[]` 分离 | 频域资源栅格，按 `[ant][symbol][subcarrier]` 排列 |
-| `desc` | `extract_descriptor_t`    | 结构体                       | ARM 下发的提取描述符                              |
+| 名称   | 类型                                        | 布局                         | 说明                                                      |
+| ------ | ------------------------------------------- | ---------------------------- | --------------------------------------------------------- |
+| `grid` | `PlanarGridViewF32`                         | **SoA**: `re[]`, `im[]` 分离 | float32 频域资源栅格，按 `[ant][symbol][subcarrier]` 排列 |
+| `desc` | `ExtractDescriptor` 或控制信道 `*MmseInput` | 结构体                       | 描述信道、端口、带宽、控制区和 RE 选择                    |
 
-前级 FFT 通常给出 **block-floating-point 的 int16**（带共享指数）。建议输入侧保留 int16 以省 PCIe/内存带宽（见 §5.1），在均衡核内部转 float32。
+当前公开入口接收 planar float32 网格；若前级 FFT 产生定点或 block-floating-point 数据，
+量化缩放与 float32 转换必须在进入本 SDK 前完成。
 
 **资源栅格的复数布局**：强制 **planar / SoA**（`re` 与 `im` 两个独立数组），不要用 `std::complex` 的交织布局。理由见 §3.1，对 SIMD 与 CUDA coalescing 都是硬要求。
 
 **提取描述符**（一份 PDSCH 分配对应一份描述符；被动监测系统中由 ARM 盲解 PCFICH/PDCCH 后产出）：
 
-```c
-typedef struct {
-    uint32_t sfn_subframe;   // SFN*10 + subframe，时间戳/对齐用
-    uint16_t cell_id;        // 物理小区 ID → 决定 v_shift 与 CRS 序列
-    uint8_t  n_tx_ports;     // CRS 端口数 {1,2}（v1 实现上限，不是 LTE 协议上限）
-    uint8_t  n_rx_ant;       // 接收天线数 {1,2}（v1 实现上限为 2）
-    uint8_t  n_layers;       // 传输层数 (1 或 2)
-    uint8_t  tx_mode;        // 传输模式 TM2/3/4 (决定是否需解预编码)
-    uint8_t  start_symbol;   // PDSCH 起始 OFDM 符号 (跨过控制区, 1~4)
-    uint8_t  mod_order;      // 2=QPSK 4=16QAM 6=64QAM 8=256QAM (传给 LLR)
-    uint16_t n_prb;          // 分配的 PRB 数
-    uint16_t prb_bitmap[7];  // 100-bit RBG/PRB 位图 (比 list 更省, 利于向量化掩码)
-    int8_t   pmi;            // 预编码矩阵索引 (TM4); -1 表示无
-} extract_descriptor_t;
+```cpp
+mmse::PlanarGridViewF32 grid{};
+mmse::ExtractDescriptor desc{};
+desc.n_tx_ports = 1;   // 通用路径支持 1Tx 或 2Tx；控制信道 Td4 使用专用入口
+desc.n_rx_ant = 2;
+desc.n_layers = 1;
+desc.tx_mode = 1;      // 当前支持 TM1 或 TM2 语义
+desc.start_symbol = 3; // 必须小于 14
+desc.mod_order = 2;    // QPSK；通用 PDSCH 还支持 4/6/8
+desc.pmi = -1;
 ```
 
-> 设计要点：用 **位图** 而非 `prb_list[]`。位图天然映射成 SIMD/CUDA 的 RE 有效性掩码，避免分支化的「这个 RE 要不要处理」判断。`1Rx` 仅支持单层检测；`2Tx/2-layer` 空间复用至少需要两个接收观测。`1Rx/2Tx` 的单层发射分集仍受支持。
+> 设计要点：用 **位图** 而非 `prb_list[]`。位图天然映射成 SIMD/CUDA 的 RE 有效性掩码，避免分支化的「这个 RE 要不要处理」判断。`1Rx` 仅支持单层检测；`2Tx/2-layer` 空间复用至少需要两个接收观测。`1Rx/2Tx` 的单层发射分集仍受支持；PBCH/PCFICH/PDCCH 的 Td4 固定为 `4Tx x 1Rx`、单层、`tx_mode=2`、QPSK。
 
 ### 1.2 输出 (Outputs) — 含 SINR 的传递契约
 
-```c
-typedef struct {
-    float    re, im;         // 去偏后的均衡符号 X̂ (单位功率归一)
-} cplx_f;
-
-typedef struct {
-    cplx_f*  x_hat;          // [layer][re_idx] 均衡星座点 (SoA)
-    float*   sinr;           // [layer][re_idx] 后验 SINR γ_k  (线性值, 非 dB)
-    // 或等价地传 noise_var = 1/γ_k；二选一并写入契约文档
-    uint32_t n_re_per_layer;
-    uint8_t  n_layers;
-    uint8_t  mod_order;      // 透传给 LLR
-} equalizer_output_t;
+```cpp
+mmse::EqualizerOutputView out{};
+out.x_hat_re = caller_owned_re;
+out.x_hat_im = caller_owned_im;
+out.sinr = caller_owned_sinr;
+out.re_grid_indices = caller_owned_grid_indices;
 ```
 
 **为什么必须输出 SINR / 噪声方差**：MMSE 均衡是有偏估计。下游 LLR 的高斯近似为
 
-```
+```text
 LLR(b) ≈ (1/σ²_eff,k) · ( min_{x∈X⁰_b} |x̂_k - x|²  -  min_{x∈X¹_b} |x̂_k - x|² )
 其中  σ²_eff,k = 1 / γ_k
 ```
@@ -92,11 +83,12 @@ LLR(b) ≈ (1/σ²_eff,k) · ( min_{x∈X⁰_b} |x̂_k - x|²  -  min_{x∈X¹_b
 CRS 频域位置：`k = 6m + (v + v_shift) mod 6`，其中 `v_shift = N_ID_cell mod 6`。
 
 - Normal CP、端口 0/1：CRS 落在子帧符号 **{0, 4, 7, 11}**。
+- Normal CP、端口 2/3：CRS 落在子帧符号 **{1, 8}**。
 - 同一符号内端口 0 与端口 1 在频率上错开 3 个子载波（v：端口0 在 l=0 用 v=0、l=4 用 v=3；端口1 相反）。
 
 参考序列（Gold 序列 → QPSK）：
 
-```
+```text
 r_{l,ns}(m) = (1/√2)(1 - 2c(2m)) + j(1/√2)(1 - 2c(2m+1))
 c_init = 2^10 · (7(ns+1) + l + 1)(2·N_ID_cell + 1) + 2·N_ID_cell + N_CP
 ```
@@ -107,34 +99,38 @@ c_init = 2^10 · (7(ns+1) + l + 1)(2·N_ID_cell + 1) + 2·N_ID_cell + N_CP
 
 导频处的最小二乘估计（CRS 已归一化 |X_p|=1）：
 
-```
+```text
 Ĥ_LS(p) = Y(p) · X_p*  =  Y(p) · conj(r(p))
 ```
 
-即一次复乘。得到稀疏（频率每 6 个、时间 4 个符号）的信道样点 Ĥ_LS，对每个已启用的 `(tx_port, rx_ant)` 对各一份；v1 最多保留 2×2 的信道缓冲区。
+即一次复乘。得到稀疏信道样点 Ĥ_LS，对每个已启用的 `(tx_port, rx_ant)` 对各一份。
+port 0/1 各有 4 个 CRS symbol，port 2/3 各有 2 个；Td4 控制信道路径为四个端口保留估计。
 
 ### 2.3 时频二维信道插值引擎
 
 采用 **可分离（separable）2D 插值**，对延迟与吞吐都友好：
 
-**Step A — 频率插值**（在 4 个 CRS 符号上各自做一次，把每 6 个子载波的样点补满 1200 个）：
+**Step A — 频率插值**（在该端口的 CRS 符号上分别执行，把每 6 个子载波的样点补满 1200 个）：
 
 - 默认：**线性 / 三次样条**（低时延、无需信道统计）。
 - 高性能可选：**Wiener / MMSE 插值** `Ĥ = R_hp · R_pp⁻¹ · Ĥ_LS`，其中 `R_pp = R_hh + σ²I`。按假设的延迟扩展/多普勒**离线预算滤波抽头**，运行时只做 FIR 卷积。
 
-**Step B — 时间插值**（对每个子载波，在符号 {0,4,7,11} 之间线性内插、两端外插补满 14 个符号）。
+**Step B — 时间插值**（对每个子载波，port 0/1 在 `{0,4,7,11}`、port 2/3 在
+`{1,8}` 之间线性内插，并在两端外插补满 14 个符号）。
 
 ```text
-estimate_channel(grid, crs_tab, desc) -> H[2][2][nsym][nsc]:
+estimate_channel(grid, crs_tab, desc) -> H[tx_port][rx][nsym][nsc]:
     for tx in 0..n_tx_ports-1, rx in 0..1:
-      for l in {0,4,7,11}:                      # CRS 符号
+      crs_symbols = tx < 2 ? {0,4,7,11} : {1,8}
+      for l in crs_symbols:                     # 当前端口 CRS 符号
           H_ls[l] = gather(grid[rx], crs_pos(tx,l)) * conj(crs_tab[tx,l])   # §2.2
           H_freq[l][:] = freq_interp(H_ls[l])   # 每6→满1200  (Step A)
       for k in 0..1199:
-          H[tx][rx][:][k] = time_interp(H_freq[{0,4,7,11}][k])              # Step B
+          H[tx][rx][:][k] = time_interp(H_freq[crs_symbols][k])             # Step B
 ```
 
-> LTE 的端口 2/3 场景不属于当前 v1 支持范围；扩展到 4 个 CRS 端口需要同时扩展 CRS 表、信道存储、接口校验、CPU/CUDA 核和控制信道映射。
+当前 port 2/3 仅由 PBCH/PCFICH/PDCCH 的 Td4 专用入口使用。每四个 source RE 分解为
+两个 Alamouti 对并恢复四个连续软符号；该专用能力不扩展到 4Tx PDSCH 或四层空间复用。
 
 ### 2.4 噪声方差 σ² 实时估算
 
@@ -285,8 +281,8 @@ inline void mmse_inv_8re(const __m256 a11, const __m256 a22,
 ### 4.1 内存流转：Pinned Ring Buffer
 
 ```text
-        ┌────────── Host Pinned Ring Buffer (N 槽, 三缓冲) ──────────┐
- FFT ──►│ slot0 │ slot1 │ slot2 │ ...   (cudaHostAlloc, 锁页)        │
+         ┌──────── Host Pinned Ring Buffer (16 槽) ─────────┐
+     FFT ──►│ slot0 │ slot1 │ ... │ slot15 │  (锁页内存)       │
         └───┬────────────────────────────────────────────────────┘
             │ cudaMemcpyAsync H2D (stream)            ▲ cudaMemcpyAsync D2H
             ▼                                         │
@@ -296,8 +292,8 @@ inline void mmse_inv_8re(const __m256 a11, const __m256 a22,
 ```
 
 - **必须用锁页内存**（`cudaHostAlloc`/`cudaMallocHost`），否则 `cudaMemcpyAsync` 退化为同步、无法与计算重叠。
-- **Ring Buffer + 三缓冲（triple buffering）**：FFT 写槽 N+1、PCIe 搬槽 N、GPU 算槽 N-1 互不阻塞。
-- 输入用 **int16** 过 PCIe（带宽减半，§5.1），上 GPU 后再转 float32。268 KB/子帧的 H2D 在 PCIe Gen3 x16（~13 GB/s）下约 20 µs，**配合流水线后被完全隐藏**。
+- **16-slot ring buffer**：调用按 slot 轮转，避免热路径重复分配 pinned host/device workspace。
+- H2D 输入与公开网格一致，使用 planar float32；实际传输量由端口模式和 compact metadata 决定。
 
 ### 4.2 并行策略：Grid/Block 划分
 

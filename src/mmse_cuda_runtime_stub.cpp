@@ -174,6 +174,11 @@ MmseStatus cuda_launch_pdcch_viterbi(const CudaDeviceBuffers&, std::uint32_t, st
     return MmseStatus::kUnsupportedConfig;
 }
 
+MmseStatus cuda_launch_pdcch_crc(const CudaDeviceBuffers&, std::uint32_t, std::uint16_t,
+                                 std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
 MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers&, std::uint32_t, std::uint16_t,
                                          std::uintptr_t) {
     return MmseStatus::kUnsupportedConfig;
@@ -181,6 +186,11 @@ MmseStatus cuda_launch_pdcch_crc_compact(const CudaDeviceBuffers&, std::uint32_t
 
 MmseStatus cuda_copy_pdcch_results_d2h_async(const CudaDeviceBuffers&, CudaPdcchCandidateResult*,
                                              std::uint32_t&, std::uintptr_t) {
+    return MmseStatus::kUnsupportedConfig;
+}
+
+MmseStatus cuda_copy_pdcch_candidate_result_d2h_async(const CudaDeviceBuffers&,
+                                                      CudaPdcchCandidateResult&, std::uintptr_t) {
     return MmseStatus::kUnsupportedConfig;
 }
 

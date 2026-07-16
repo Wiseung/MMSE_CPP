@@ -40,12 +40,14 @@ SDK 当前覆盖：
 - MMSE 均衡
 - 按 RE 输出软符号和 SINR
 - 通过新增的 `run_pdcch_td(...)` 接口支持 2Tx 发射分集去映射
+- 通过 `run_pdcch_td4(...)` 支持 `4Tx x 1Rx` 发射分集 raw equalized output
+- 通过 `normalize_pdcch_td4_cce_order(...)` 将四源 RE 输出归一化为标准 CCE 顺序
 - `REG / CCE` 恢复 helper
 - `common search` 候选构造与候选 LLR 切片 helper
 - UE-specific 候选构造，按目标 RNTI 和子帧枚举 `L=1/2/4/8`
 - 候选级速率恢复、`CRC-RNTI` 校验和 `DCI 1A` 解析 helper
 - 默认内建尾咬卷积码译码的正式 CPU common-search 与 UE-specific `DCI 1A` 链路，可由外部回调覆盖
-- 1Tx 与 2Tx TD 的 GPU common-search / `DCI 1A` 一站式入口及 batch 入口
+- 1Tx、2Tx TD 与 `4Tx x 1Rx` TD 的 GPU common-search / `DCI 1A` 一站式入口及 batch 入口
 - 当前 20 MHz/FDD 边界内的 SI-RNTI 未知控制区几何搜索与调用方持有的锁定缓存
 
 SDK 当前不覆盖：
@@ -55,9 +57,10 @@ SDK 当前不覆盖：
 - 非 `DCI 1A` 的通用 `DCI` 译码
 - GPU UE-specific、SI-RNTI geometry search、其它 DCI format 或外部 decoder callback
 
-GPU common-search 当前固定为 `20 MHz / FDD / normal CP / regular control subframe`。2Tx 请求
-自动复用 TD 去映射并保持连续 CCE 顺序；设备到主机只返回 compact candidate hits，不返回完整
-equalized grid、SINR 或 LLR。
+GPU common-search 当前固定为 `100 RB / FDD / normal CP / regular control subframe`，仅使用
+native decoder，且不接受 CIF 或外部回调。2Tx 与 `4Tx x 1Rx` 请求自动复用对应 TD 去映射并
+保持连续 CCE 顺序；设备到主机只返回 compact candidate hits，不返回完整 equalized grid、
+SINR 或 LLR。
 
 ## 页面摘要
 
