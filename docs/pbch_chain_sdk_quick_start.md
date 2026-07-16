@@ -24,6 +24,7 @@
 - MMSE 均衡
 - 由调用方持有的输出 view 填充
 - 面向下游透传的后端 DTO 打包
+- `4Tx x 1Rx`、单层、`tx_mode == 2` 的 Td4 raw equalized output
 
 当前 PBCH 接口面不提供：
 
@@ -32,6 +33,7 @@
 - 尾咬卷积译码
 - CRC 检查
 - MIB 重建
+- 4Tx owning backend DTO
 
 ## 最小流程
 
@@ -85,6 +87,30 @@ mmse::pbch::BackendPbchEqualizedIndication backend =
     mmse::pbch::make_backend_pbch_equalized_indication(meta, out);
 ```
 
+## 4Tx x 1Rx Td4 示例
+
+Td4 使用相同的 `PbchMmseInput`，但要求 FFT 网格只有一个接收天线，并改用四源 RE 输出面：
+
+```cpp
+frontend.n_tx_ports = 4;
+frontend.tx_mode = 2;
+mmse::PbchMmseInput in = mmse::pbch::make_pbch_mmse_input(grid, frontend);
+
+constexpr std::uint32_t capacity = 240;
+std::vector<float> xhat_re(capacity), xhat_im(capacity), sinr(capacity);
+std::vector<std::uint16_t> re0(capacity), re1(capacity), re2(capacity), re3(capacity);
+mmse::PbchTd4MmseOutputView out{xhat_re.data(), xhat_im.data(), sinr.data(),
+                re0.data(), re1.data(), re2.data(), re3.data(), capacity};
+mmse::PbchTd4MmseResult meta{};
+
+const mmse::MmseStatus status = ctx.run_pbch_td4(in, out, meta);
+```
+
+成功时 `meta.n_symbols == meta.n_source_re == 240`。对每个 `q = 0, 4, 8, ...`，
+`re_grid_indices0..3[q..q+3]` 重复记录该 Td4 块的同一组四个 source RE；四个连续
+`x_hat`/`sinr` 槽位是对应的 raw equalized QPSK 软符号。当前没有
+`BackendPbchTd4EqualizedIndication` 或 MIB 最终译码入口，调用方应直接消费有效前缀或自行复制。
+
 ## 上游要求
 
 上游必须提供：
@@ -130,6 +156,7 @@ mmse::pbch::BackendPbchEqualizedIndication backend =
 在当前 LTE 支持边界下：
 
 - `expected_pbch_re == 240`
+- `run_pbch_td4(...)` 使用 `capacity_symbols >= 240`，且 `meta.n_symbols == 240`
 
 ## 支持边界
 
@@ -138,13 +165,14 @@ mmse::pbch::BackendPbchEqualizedIndication backend =
 - 仅 LTE
 - 仅 20 MHz
 - 仅 normal CP
-- `n_rx_ant == 1 or 2`
+- 普通 `run_pbch(...)`：`n_rx_ant == 1 or 2`，`n_tx_ports == 1`，`tx_mode == 1`
+- TD2 `run_pbch_td(...)`：`n_rx_ant == 1 or 2`，`n_tx_ports == 2`，`tx_mode == 2`
+- Td4 `run_pbch_td4(...)`：`n_rx_ant == 1`，`n_tx_ports == 4`
 - `n_symbols == 14`
 - `n_subcarriers == 1200`
 - `n_layers == 1`
 - `mod_order == 2`
-- `tx_mode == 1 or 2`
-- `n_tx_ports == 1 or 2`
+- Td4 额外要求 `tx_mode == 2`
 
 ## 状态码
 

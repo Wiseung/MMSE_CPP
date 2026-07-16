@@ -439,6 +439,9 @@ validate_lte_control_subframe_context(const LteControlSubframeContext& control_s
 }
 
 inline MmseStatus validate_pdcch_mmse_input(const PdcchMmseInput& in) {
+    if (in.cell_id >= kLteNumCellIds) {
+        return MmseStatus::kInvalidArgument;
+    }
     if (in.grid.n_rx_ant == 0U || in.grid.n_rx_ant > kMmseV1MaxNumRxAntennas ||
         in.grid.n_symbols != kLteNumSymbolsNormalCp ||
         !is_supported_lte_downlink_bandwidth(in.n_prb) ||
@@ -617,6 +620,82 @@ normalize_pdcch_td_cce_order(const BackendPdcchTdEqualizedIndication& td_backend
     return MmseStatus::kOk;
 }
 
+inline BackendPdcchTd4EqualizedIndication
+make_backend_pdcch_td4_equalized_indication(const PdcchTd4MmseResult& meta,
+                                            const PdcchTd4MmseOutputView& out) {
+    BackendPdcchTd4EqualizedIndication backend{};
+    backend.sfn_subframe = meta.sfn_subframe;
+    backend.cell_id = meta.cell_id;
+    backend.n_prb = meta.n_prb;
+    backend.n_tx_ports = meta.n_tx_ports;
+    backend.n_rx_ant = meta.n_rx_ant;
+    backend.n_layers = meta.n_layers;
+    backend.tx_mode = meta.tx_mode;
+    backend.control_symbol_count = meta.control_symbol_count;
+    backend.mod_order = meta.mod_order;
+    backend.sigma2 = meta.sigma2;
+    backend.chain = meta.chain;
+    backend.x_hat_re.assign(out.x_hat_re, out.x_hat_re + meta.n_symbols);
+    backend.x_hat_im.assign(out.x_hat_im, out.x_hat_im + meta.n_symbols);
+    backend.sinr.assign(out.sinr, out.sinr + meta.n_symbols);
+    backend.re_grid_indices0.assign(out.re_grid_indices0, out.re_grid_indices0 + meta.n_symbols);
+    backend.re_grid_indices1.assign(out.re_grid_indices1, out.re_grid_indices1 + meta.n_symbols);
+    backend.re_grid_indices2.assign(out.re_grid_indices2, out.re_grid_indices2 + meta.n_symbols);
+    backend.re_grid_indices3.assign(out.re_grid_indices3, out.re_grid_indices3 + meta.n_symbols);
+    return backend;
+}
+
+inline MmseStatus
+normalize_pdcch_td4_cce_order(const BackendPdcchTd4EqualizedIndication& td_backend,
+                              BackendPdcchEqualizedIndication& cce_ordered_backend) {
+    cce_ordered_backend = {};
+    const std::size_t symbol_count = td_backend.x_hat_re.size();
+    if (td_backend.n_tx_ports != 4U || td_backend.n_rx_ant != 1U || td_backend.n_layers != 1U ||
+        td_backend.tx_mode != 2U || td_backend.mod_order != 2U || (symbol_count & 3U) != 0U ||
+        td_backend.x_hat_im.size() != symbol_count || td_backend.sinr.size() != symbol_count ||
+        td_backend.re_grid_indices0.size() != symbol_count ||
+        td_backend.re_grid_indices1.size() != symbol_count ||
+        td_backend.re_grid_indices2.size() != symbol_count ||
+        td_backend.re_grid_indices3.size() != symbol_count) {
+        return MmseStatus::kInvalidArgument;
+    }
+    cce_ordered_backend.sfn_subframe = td_backend.sfn_subframe;
+    cce_ordered_backend.cell_id = td_backend.cell_id;
+    cce_ordered_backend.n_prb = td_backend.n_prb;
+    cce_ordered_backend.n_tx_ports = td_backend.n_tx_ports;
+    cce_ordered_backend.n_rx_ant = td_backend.n_rx_ant;
+    cce_ordered_backend.n_layers = td_backend.n_layers;
+    cce_ordered_backend.tx_mode = td_backend.tx_mode;
+    cce_ordered_backend.control_symbol_count = td_backend.control_symbol_count;
+    cce_ordered_backend.mod_order = td_backend.mod_order;
+    cce_ordered_backend.sigma2 = td_backend.sigma2;
+    cce_ordered_backend.chain = td_backend.chain;
+    cce_ordered_backend.x_hat_re = td_backend.x_hat_re;
+    cce_ordered_backend.x_hat_im = td_backend.x_hat_im;
+    cce_ordered_backend.sinr = td_backend.sinr;
+    cce_ordered_backend.re_grid_indices.resize(symbol_count);
+    for (std::size_t symbol = 0U; symbol < symbol_count; symbol += 4U) {
+        for (std::size_t offset = 1U; offset < 4U; ++offset) {
+            if (td_backend.re_grid_indices0[symbol] !=
+                    td_backend.re_grid_indices0[symbol + offset] ||
+                td_backend.re_grid_indices1[symbol] !=
+                    td_backend.re_grid_indices1[symbol + offset] ||
+                td_backend.re_grid_indices2[symbol] !=
+                    td_backend.re_grid_indices2[symbol + offset] ||
+                td_backend.re_grid_indices3[symbol] !=
+                    td_backend.re_grid_indices3[symbol + offset]) {
+                cce_ordered_backend = {};
+                return MmseStatus::kInvalidArgument;
+            }
+        }
+        cce_ordered_backend.re_grid_indices[symbol] = td_backend.re_grid_indices0[symbol];
+        cce_ordered_backend.re_grid_indices[symbol + 1U] = td_backend.re_grid_indices1[symbol];
+        cce_ordered_backend.re_grid_indices[symbol + 2U] = td_backend.re_grid_indices2[symbol];
+        cce_ordered_backend.re_grid_indices[symbol + 3U] = td_backend.re_grid_indices3[symbol];
+    }
+    return MmseStatus::kOk;
+}
+
 inline BackendPdcchTdDescrambledLlrIndication
 make_backend_pdcch_td_descrambled_llr_indication(const BackendPdcchTdEqualizedIndication& backend) {
     BackendPdcchTdDescrambledLlrIndication llr_backend{};
@@ -741,8 +820,16 @@ make_pdcch_search_candidate(const PdcchCommonSearchCandidate& candidate) noexcep
     };
 }
 
+inline bool is_valid_pdcch_aggregation_level(std::uint8_t aggregation_level) noexcept {
+    return aggregation_level == 1U || aggregation_level == 2U || aggregation_level == 4U ||
+           aggregation_level == 8U;
+}
+
 inline bool pdcch_aggregation_level_enabled(std::uint8_t aggregation_level,
                                             std::uint8_t aggregation_level_mask) noexcept {
+    if (!is_valid_pdcch_aggregation_level(aggregation_level)) {
+        return false;
+    }
     switch (aggregation_level) {
     case 1U:
         return (aggregation_level_mask & kPdcchAggregationLevelMaskL1) != 0U;
@@ -1414,6 +1501,44 @@ decode_pdcch_common_search_dci_format1a(const BackendPdcchEqualizedIndication& b
         }
     }
     return MmseStatus::kOk;
+}
+
+inline MmseStatus
+decode_pdcch_fixed_candidate_dci_format1a(const BackendPdcchEqualizedIndication& backend,
+                                          const PdcchFixedCandidateDecodeConfig& config,
+                                          PdcchDciFormat1ADecodeResult& result) {
+    result = {};
+    const std::uint32_t payload_bit_count =
+        pdcch_dci_format1a_payload_bit_count(config.dci_format1a);
+    if (!is_valid_pdcch_aggregation_level(config.aggregation_level) || config.expected_rnti == 0U ||
+        payload_bit_count == 0U || backend.n_prb != config.dci_format1a.n_prb) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    const std::vector<PdcchSearchCandidate> search_candidates = {{
+        .candidate_id = 0U,
+        .first_cce = config.first_cce,
+        .aggregation_level = config.aggregation_level,
+        .encoded_bit_count = 72U * config.aggregation_level,
+    }};
+    std::vector<PdcchCandidateLlr> candidates{};
+    if (const MmseStatus status =
+            build_pdcch_search_candidate_llrs(backend, search_candidates, candidates);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    if (candidates.size() != 1U) {
+        return MmseStatus::kInternalError;
+    }
+
+    PdcchRateRecoveredLlr recovered{};
+    if (const MmseStatus status = recover_pdcch_convolutional_rate_matched_llrs(
+            candidates.front(), payload_bit_count, recovered);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    return decode_pdcch_dci_format1a(recovered, config.decoder, config.expected_rnti,
+                                     config.dci_format1a, result);
 }
 
 inline MmseStatus

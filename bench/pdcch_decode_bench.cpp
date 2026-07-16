@@ -36,6 +36,10 @@ struct PdcchBuffers {
     std::vector<std::uint16_t> re_grid_indices = std::vector<std::uint16_t>(kPdcchCapacity);
     std::vector<std::uint16_t> td_re_grid_indices0 = std::vector<std::uint16_t>(kPdcchCapacity);
     std::vector<std::uint16_t> td_re_grid_indices1 = std::vector<std::uint16_t>(kPdcchCapacity);
+    std::vector<std::uint16_t> td4_re_grid_indices0 = std::vector<std::uint16_t>(kPdcchCapacity);
+    std::vector<std::uint16_t> td4_re_grid_indices1 = std::vector<std::uint16_t>(kPdcchCapacity);
+    std::vector<std::uint16_t> td4_re_grid_indices2 = std::vector<std::uint16_t>(kPdcchCapacity);
+    std::vector<std::uint16_t> td4_re_grid_indices3 = std::vector<std::uint16_t>(kPdcchCapacity);
     PdcchMmseOutputView output{
         .x_hat_re = x_hat_re.data(),
         .x_hat_im = x_hat_im.data(),
@@ -54,6 +58,17 @@ struct PdcchBuffers {
         .capacity_symbols = kPdcchCapacity,
     };
     PdcchTdMmseResult td_metadata{};
+    PdcchTd4MmseOutputView td4_output{
+        .x_hat_re = x_hat_re.data(),
+        .x_hat_im = x_hat_im.data(),
+        .sinr = sinr.data(),
+        .re_grid_indices0 = td4_re_grid_indices0.data(),
+        .re_grid_indices1 = td4_re_grid_indices1.data(),
+        .re_grid_indices2 = td4_re_grid_indices2.data(),
+        .re_grid_indices3 = td4_re_grid_indices3.data(),
+        .capacity_symbols = kPdcchCapacity,
+    };
+    PdcchTd4MmseResult td4_metadata{};
 };
 
 struct StageTimes {
@@ -90,11 +105,11 @@ GridBuffers make_random_grid(std::uint32_t seed, std::uint16_t n_prb) {
     return buffers;
 }
 
-PlanarGridViewF32 make_grid_view(const GridBuffers& buffers) {
+PlanarGridViewF32 make_grid_view(const GridBuffers& buffers, std::uint32_t n_rx_ant) {
     return {
-        .re = {buffers.re[0].data(), buffers.re[1].data()},
-        .im = {buffers.im[0].data(), buffers.im[1].data()},
-        .n_rx_ant = kMmseV1MaxNumRxAntennas,
+        .re = {buffers.re[0].data(), n_rx_ant > 1U ? buffers.re[1].data() : nullptr},
+        .im = {buffers.im[0].data(), n_rx_ant > 1U ? buffers.im[1].data() : nullptr},
+        .n_rx_ant = n_rx_ant,
         .n_symbols = kLteNumSymbolsNormalCp,
         .n_subcarriers = static_cast<std::uint32_t>(buffers.re[0].size() / kLteNumSymbolsNormalCp),
     };
@@ -128,10 +143,22 @@ PdcchMmseInput make_pdcch_input(const PlanarGridViewF32& grid, std::uint16_t n_p
 bool gather_common_search_candidates(const pdcch::BackendPdcchEqualizedIndication& backend,
                                      const pdcch::PdcchControlRegion& control_region,
                                      const std::vector<float>& full_llrs,
-                                     std::vector<pdcch::PdcchCandidateLlr>& candidates) {
+                                     std::vector<pdcch::PdcchCandidateLlr>& candidates,
+                                     fixture::Workload workload) {
     candidates.clear();
     std::vector<pdcch::PdcchCommonSearchCandidate> descriptors{};
     pdcch::build_pdcch_common_search_candidates(control_region, descriptors);
+    if (workload == fixture::Workload::kFixed) {
+        const auto fixed =
+            std::find_if(descriptors.begin(), descriptors.end(), [](const auto& value) {
+                return value.aggregation_level == fixture::kFixedAggregationLevel &&
+                       value.first_cce == fixture::kFixedFirstCce;
+            });
+        if (fixed == descriptors.end()) {
+            return false;
+        }
+        descriptors = {*fixed};
+    }
     candidates.reserve(descriptors.size());
     for (const auto& descriptor : descriptors) {
         const std::uint32_t llr_offset = static_cast<std::uint32_t>(descriptor.first_cce) * 72U;
@@ -156,12 +183,30 @@ bool gather_common_search_candidates(const pdcch::BackendPdcchEqualizedIndicatio
 }
 
 bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchBuffers& buffers,
-                  StageTimes& times, std::uint32_t subframe_index,
+                  StageTimes& times, std::uint32_t subframe_index, fixture::Workload workload,
                   const fixture::Case* expected_case = nullptr) {
     using Clock = std::chrono::steady_clock;
     if (expected_case == nullptr) {
         input.sfn_subframe = subframe_index;
         input.control_subframe.subframe = static_cast<std::uint8_t>(subframe_index % 10U);
+    }
+
+    double fixed_e2e_us = 0.0;
+    if (workload == fixture::Workload::kFixed) {
+        if (expected_case == nullptr) {
+            return false;
+        }
+        const auto fixed_request = fixture::make_fixed_request(*expected_case);
+        pdcch::PdcchDciFormat1ADecodeResult fixed_result{};
+        const auto fixed_start = Clock::now();
+        const MmseStatus fixed_status = pdcch::run_pdcch_cpu_fixed_candidate_decode(
+            context, fixed_request.input, fixed_request.config, fixed_result);
+        fixed_e2e_us =
+            std::chrono::duration<double, std::micro>(Clock::now() - fixed_start).count();
+        if (fixed_status != MmseStatus::kOk ||
+            !fixture::validate_fixed_result(fixed_result, *expected_case)) {
+            return false;
+        }
     }
 
     const auto total_start = Clock::now();
@@ -172,6 +217,8 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
         ce_mmse_status = context.run_pdcch(input, buffers.output, buffers.metadata);
     } else if (input.n_tx_ports == 2U) {
         ce_mmse_status = context.run_pdcch_td(input, buffers.td_output, buffers.td_metadata);
+    } else if (input.n_tx_ports == 4U) {
+        ce_mmse_status = context.run_pdcch_td4(input, buffers.td4_output, buffers.td4_metadata);
     }
     auto end = Clock::now();
     times.ce_mmse_us = std::chrono::duration<double, std::micro>(end - start).count();
@@ -180,11 +227,18 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
     }
     if (input.n_tx_ports == 1U) {
         backend = pdcch::make_backend_pdcch_equalized_indication(buffers.metadata, buffers.output);
-    } else {
+    } else if (input.n_tx_ports == 2U) {
         const pdcch::BackendPdcchTdEqualizedIndication td_backend =
             pdcch::make_backend_pdcch_td_equalized_indication(buffers.td_metadata,
                                                               buffers.td_output);
         if (pdcch::normalize_pdcch_td_cce_order(td_backend, backend) != MmseStatus::kOk) {
+            return false;
+        }
+    } else {
+        const pdcch::BackendPdcchTd4EqualizedIndication td4_backend =
+            pdcch::make_backend_pdcch_td4_equalized_indication(buffers.td4_metadata,
+                                                               buffers.td4_output);
+        if (pdcch::normalize_pdcch_td4_cce_order(td4_backend, backend) != MmseStatus::kOk) {
             return false;
         }
     }
@@ -215,7 +269,8 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
 
     std::vector<pdcch::PdcchCandidateLlr> candidates{};
     start = Clock::now();
-    if (!gather_common_search_candidates(backend, control_region, full_llrs, candidates)) {
+    if (!gather_common_search_candidates(backend, control_region, full_llrs, candidates,
+                                         workload)) {
         return false;
     }
     end = Clock::now();
@@ -283,14 +338,27 @@ bool run_subframe(MmseEqualizerCpuContext& context, PdcchMmseInput input, PdcchB
         }
     }
     if (expected_case != nullptr) {
-        pdcch::PdcchCommonSearchDecodeResult result{};
-        result.candidate_count = times.candidate_count;
-        result.hits = std::move(hits);
-        if (!fixture::validate_result(result, *expected_case)) {
-            return false;
+        if (workload == fixture::Workload::kFixed) {
+            pdcch::PdcchDciFormat1ADecodeResult result{};
+            if (!hits.empty()) {
+                result = std::move(hits.front());
+            }
+            if (!fixture::validate_fixed_result(result, *expected_case)) {
+                return false;
+            }
+        } else {
+            pdcch::PdcchCommonSearchDecodeResult result{};
+            result.candidate_count = times.candidate_count;
+            result.hits = std::move(hits);
+            if (!fixture::validate_result(result, *expected_case)) {
+                return false;
+            }
         }
     }
-    times.total_us = std::chrono::duration<double, std::micro>(Clock::now() - total_start).count();
+    times.total_us =
+        workload == fixture::Workload::kFixed
+            ? fixed_e2e_us
+            : std::chrono::duration<double, std::micro>(Clock::now() - total_start).count();
     return true;
 }
 
@@ -442,12 +510,15 @@ bool parse_arguments(int argc, char** argv, std::uint16_t& n_prb, std::uint8_t& 
         }
         return false;
     }
-    return is_supported_lte_downlink_bandwidth(n_prb) && (n_tx_ports == 1U || n_tx_ports == 2U);
+    return is_supported_lte_downlink_bandwidth(n_prb) &&
+           (n_tx_ports == 1U || n_tx_ports == 2U || n_tx_ports == 4U) &&
+           (workload != fixture::Workload::kFixed ||
+            (n_prb == kLteNumPrb20MHz && n_tx_ports == 1U));
 }
 
 void print_usage() {
     std::cerr << "usage: pdcch_decode_bench [--n-prb 6|15|25|50|75|100] "
-                 "[--n-tx-ports 1|2] [--workload mixed|random]\n";
+                 "[--n-tx-ports 1|2|4] [--workload fixed|mixed|random]\n";
 }
 
 int main(int argc, char** argv) {
@@ -460,7 +531,7 @@ int main(int argc, char** argv) {
     }
 
     GridBuffers grid_buffers = make_random_grid(42U, n_prb);
-    const PlanarGridViewF32 grid = make_grid_view(grid_buffers);
+    const PlanarGridViewF32 grid = make_grid_view(grid_buffers, n_tx_ports == 4U ? 1U : 2U);
     const PdcchMmseInput input = make_pdcch_input(grid, n_prb, n_tx_ports);
 
     MmseEqualizerCpuContext context;
@@ -472,28 +543,31 @@ int main(int argc, char** argv) {
     }
 
     fixture::MixedWorkload mixed_workload{};
-    if (workload_kind == fixture::Workload::kMixed) {
+    if (workload_kind != fixture::Workload::kRandom) {
         if (!fixture::make_mixed_workload(n_prb, n_tx_ports, mixed_workload)) {
-            std::cerr << "failed to construct mixed workload\n";
+            std::cerr << "failed to construct deterministic workload\n";
             return 1;
         }
         for (std::size_t case_index = 0U; case_index < mixed_workload.cases.size(); ++case_index) {
             const fixture::Case& benchmark_case = mixed_workload.cases[case_index];
-            pdcch::PdcchCommonSearchDecodeResult smoke_result{};
-            if (pdcch::run_pdcch_cpu_common_search_decode(context, benchmark_case.request.input,
-                                                          benchmark_case.request.config,
-                                                          smoke_result) != MmseStatus::kOk ||
-                !fixture::validate_result(smoke_result, benchmark_case)) {
-                std::cerr << "mixed workload smoke check failed case=" << case_index
-                          << " expected_hits=" << benchmark_case.expected_hits.size()
-                          << " actual_hits=" << smoke_result.hits.size();
-                for (const auto& hit : smoke_result.hits) {
-                    std::cerr << " [cce=" << hit.dci.chain.first_cce
-                              << ",L=" << static_cast<unsigned>(hit.dci.chain.aggregation_level)
-                              << "]";
+            if (workload_kind == fixture::Workload::kFixed) {
+                const auto request = fixture::make_fixed_request(benchmark_case);
+                pdcch::PdcchDciFormat1ADecodeResult smoke_result{};
+                if (pdcch::run_pdcch_cpu_fixed_candidate_decode(
+                        context, request.input, request.config, smoke_result) != MmseStatus::kOk ||
+                    !fixture::validate_fixed_result(smoke_result, benchmark_case)) {
+                    std::cerr << "fixed workload smoke check failed case=" << case_index << '\n';
+                    return 1;
                 }
-                std::cerr << '\n';
-                return 1;
+            } else {
+                pdcch::PdcchCommonSearchDecodeResult smoke_result{};
+                if (pdcch::run_pdcch_cpu_common_search_decode(context, benchmark_case.request.input,
+                                                              benchmark_case.request.config,
+                                                              smoke_result) != MmseStatus::kOk ||
+                    !fixture::validate_result(smoke_result, benchmark_case)) {
+                    std::cerr << "mixed workload smoke check failed case=" << case_index << '\n';
+                    return 1;
+                }
             }
         }
     }
@@ -501,7 +575,7 @@ int main(int argc, char** argv) {
     const auto select_input = [&](std::uint32_t iteration,
                                   const fixture::Case*& expected_case) -> PdcchMmseInput {
         expected_case = nullptr;
-        if (workload_kind == fixture::Workload::kMixed) {
+        if (workload_kind != fixture::Workload::kRandom) {
             expected_case = &mixed_workload.cases[iteration % mixed_workload.cases.size()];
             return expected_case->request.input;
         }
@@ -513,7 +587,8 @@ int main(int argc, char** argv) {
     for (std::uint32_t subframe = 0U; subframe < kWarmupSubframes; ++subframe) {
         const fixture::Case* expected_case = nullptr;
         const PdcchMmseInput selected_input = select_input(subframe, expected_case);
-        if (!run_subframe(context, selected_input, buffers, ignored, subframe, expected_case)) {
+        if (!run_subframe(context, selected_input, buffers, ignored, subframe, workload_kind,
+                          expected_case)) {
             std::cerr << "warmup failed\n";
             return 1;
         }
@@ -527,7 +602,7 @@ int main(int argc, char** argv) {
         const PdcchMmseInput selected_input =
             select_input(kWarmupSubframes + subframe, expected_case);
         if (!run_subframe(context, selected_input, buffers, times, kWarmupSubframes + subframe,
-                          expected_case)) {
+                          workload_kind, expected_case)) {
             std::cerr << "measurement failed\n";
             return 1;
         }
@@ -548,18 +623,32 @@ int main(int argc, char** argv) {
               << '\n';
     std::cout << "pdcch_decode_bench.tx_mode=" << static_cast<unsigned>(input.tx_mode) << '\n';
     std::cout << "pdcch_decode_bench.decoder=native_tail_biting_viterbi\n";
-    std::cout << "pdcch_decode_bench.schema=mmse.pdcch.benchmark.v2\n";
+    std::cout << "pdcch_decode_bench.schema=mmse.pdcch.benchmark."
+              << (workload_kind == fixture::Workload::kFixed ? "v3" : "v2") << '\n';
     std::cout << "pdcch_decode_bench.measurement_source=native\n";
     std::cout << "pdcch_decode_bench.workload=" << fixture::workload_name(workload_kind) << '\n';
     std::cout << "pdcch_decode_bench.e2e.clock_domain=host_steady\n";
     std::cout << "pdcch_decode_bench.e2e.scope=single_request_wall\n";
     std::cout << "pdcch_decode_bench.stage.clock_domain=host_steady\n";
     std::cout << "pdcch_decode_bench.stage.composable=false\n";
+    if (workload_kind == fixture::Workload::kFixed) {
+        std::cout << "pdcch_decode_bench.stage.scope=diagnostic_replay_after_e2e\n";
+        std::cout << "pdcch_decode_bench.fixed.aggregation_level="
+                  << static_cast<unsigned>(fixture::kFixedAggregationLevel) << '\n';
+        std::cout << "pdcch_decode_bench.fixed.first_cce=" << fixture::kFixedFirstCce << '\n';
+        std::cout << "pdcch_decode_bench.fixed.expected_rnti=" << pdcch::kSiRnti << '\n';
+        std::cout << "pdcch_decode_bench.preflight.fixed_crc_dci_chain_validated=1\n";
+    }
     print_summaries("subframe_1ms", per_subframe);
     print_summaries("window_10ms", per_window);
 
+    if (n_tx_ports == 4U || workload_kind == fixture::Workload::kFixed) {
+        std::cout << "pdcch_decode_bench.geometry.supported=0\n";
+        return 0;
+    }
+
     pdcch::PdcchSiRntiGeometrySearchRequest geometry_request{};
-    const PdcchMmseInput geometry_input = workload_kind == fixture::Workload::kMixed
+    const PdcchMmseInput geometry_input = workload_kind != fixture::Workload::kRandom
                                               ? mixed_workload.cases.front().request.input
                                               : input;
     geometry_request.grid = geometry_input.grid;

@@ -141,6 +141,8 @@
   - caller-owned `LLR` 输出面
 - `PDCCH` 场景下对 `PCFICH / PHICH` 占用资源的排除
 - `PDCCH 2Tx` 发射分集去映射
+- `PBCH / PCFICH / PDCCH` 的 `4Tx x 1Rx` Td4 raw equalized output
+- PDCCH Td4 四源 RE 归一化与 CPU/GPU common-search `DCI 1A` 复用
 - `PDSCH 2Tx + 1 layer + TM2` 发射分集去映射
 - `PDCCH` 的 `REG / CCE` 恢复 helper
 - `PDCCH common search` 与 UE-specific 候选构造、`L=1/2/4/8` 速率恢复、`CRC-RNTI` 与 `DCI 1A` 解析 helper
@@ -288,6 +290,19 @@ downstream context。
 
 这个输出面中，每个软符号都带有一对来源 `RE` 索引，用来表示发射分集去映射后的来源关系。
 
+### 3.1 PDCCH 4Tx x 1Rx Td4 输出面
+
+输入为 `PdcchMmseInput`，固定 `n_tx_ports=4`、`n_rx_ant=1`、`n_layers=1`、
+`tx_mode=2`、QPSK。输出为 `PdcchTd4MmseOutputView + PdcchTd4MmseResult`，并可打包为
+`BackendPdcchTd4EqualizedIndication`。
+
+每四个 source RE 分解为两个 Alamouti 对；`re_grid_indices0..3` 在四个连续输出槽位中
+重复同一组四元组。调用 `normalize_pdcch_td4_cce_order(...)` 后，可复用标准
+`BackendPdcchEqualizedIndication` 的 REG/CCE、common-search、UE-specific 和 SI-RNTI 链路。
+
+PBCH 与 PCFICH 同样提供 `run_pbch_td4(...)` 和 `run_pcfich_td4(...)` raw output，固定容量
+分别为 `240` 和 `16`，但当前没有 4Tx owning DTO，也不提供 MIB/CFI 最终译码。
+
 ### 4. PDCCH `DCI 1A` CPU 输出面
 
 输入：
@@ -348,6 +363,9 @@ localized DCI 1A、100 PRB PDSCH 网格、单层单码字 TM1/TM2；distributed 
 - `run(...)`
 - `run_pdcch(...)`
 - `run_pdcch_td(...)`
+- `run_pbch_td4(...)`
+- `run_pcfich_td4(...)`
+- `run_pdcch_td4(...)`
 
 ### 3. GPU 路径
 
@@ -364,7 +382,7 @@ localized DCI 1A、100 PRB PDSCH 网格、单层单码字 TM1/TM2；distributed 
 - H2D 传输
 - CUDA 信道估计 kernel
 - CUDA 均衡 kernel
-- `PDCCH + 2Tx` strict CUDA TD 分支
+- `PDCCH + 2Tx` 与 `4Tx x 1Rx` strict CUDA TD 分支
 - D2H 输出回传
 - 可选 CPU/GPU 结果一致性验证
 

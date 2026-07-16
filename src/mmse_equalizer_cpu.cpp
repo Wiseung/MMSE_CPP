@@ -73,6 +73,18 @@ inline bool control_re_excluded(const ExtractDescriptor& desc, std::uint32_t sym
            0U;
 }
 
+inline bool crs_symbol_used_by_descriptor(const ExtractDescriptor& desc, std::uint32_t symbol) {
+    for (std::uint32_t port = 0U; port < desc.n_tx_ports; ++port) {
+        const CrsPortPattern& pattern = crs_port_pattern(static_cast<std::uint8_t>(port));
+        for (std::uint32_t cs = 0U; cs < pattern.count; ++cs) {
+            if (pattern.symbols[cs] == symbol) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 inline void reset_layout(ReLayout& layout) {
     layout.n_re = 0U;
     layout.n_segments = 0U;
@@ -195,7 +207,7 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
             return false;
         }
         if ((desc.n_tx_ports == 1U && (desc.n_layers != 1U || desc.tx_mode != 1U)) ||
-            (desc.n_tx_ports == 2U && desc.tx_mode != 2U)) {
+            (desc.n_tx_ports == 2U && desc.tx_mode != 2U) || desc.n_tx_ports > 2U) {
             return false;
         }
         break;
@@ -213,7 +225,9 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
         if (desc.n_layers != 1U) {
             return false;
         }
-        if (desc.n_tx_ports != 1U || desc.tx_mode != 1U) {
+        if (!((desc.n_tx_ports == 1U && desc.tx_mode == 1U) ||
+              (desc.n_tx_ports == 2U && desc.tx_mode == 2U) ||
+              (desc.n_tx_ports == 4U && desc.n_rx_ant == 1U && desc.tx_mode == 2U))) {
             return false;
         }
         for (std::uint32_t prb = 0U; prb < kLteNumPrb20MHz; ++prb) {
@@ -235,7 +249,9 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
         if (desc.n_layers != 1U) {
             return false;
         }
-        if (desc.n_tx_ports != 1U || desc.tx_mode != 1U) {
+        if (!((desc.n_tx_ports == 1U && desc.tx_mode == 1U) ||
+              (desc.n_tx_ports == 2U && desc.tx_mode == 2U) ||
+              (desc.n_tx_ports == 4U && desc.n_rx_ant == 1U && desc.tx_mode == 2U))) {
             return false;
         }
         if (desc.n_prb != kLtePbchNumPrb) {
@@ -262,7 +278,9 @@ bool descriptor_supported(const ExtractDescriptor& desc) {
         if (desc.n_layers != 1U) {
             return false;
         }
-        if (desc.n_tx_ports != 1U || desc.tx_mode != 1U) {
+        if (!((desc.n_tx_ports == 1U && desc.tx_mode == 1U) ||
+              (desc.n_tx_ports == 2U && desc.tx_mode == 2U) ||
+              (desc.n_tx_ports == 4U && desc.n_rx_ant == 1U && desc.tx_mode == 2U))) {
             return false;
         }
         if (desc.n_prb != kLteNumPrb20MHz) {
@@ -288,6 +306,9 @@ MmseStatus validate_grid(const PlanarGridViewF32& grid, const ExtractDescriptor*
     }
     if (grid.n_rx_ant == 0U || grid.n_rx_ant > kMmseV1MaxNumRxAntennas ||
         grid.n_symbols != kLteNumSymbolsNormalCp || grid.n_subcarriers != expected_subcarriers) {
+        return MmseStatus::kInvalidArgument;
+    }
+    if (desc != nullptr && grid.n_rx_ant != desc->n_rx_ant) {
         return MmseStatus::kInvalidArgument;
     }
     for (std::uint32_t rx = 0; rx < grid.n_rx_ant; ++rx) {
@@ -351,10 +372,21 @@ std::uint32_t subframe_from_descriptor(const ExtractDescriptor& desc) {
 std::uint32_t crs_frequency_offset(std::uint16_t cell_id, std::uint8_t port, std::uint8_t symbol) {
     const std::uint32_t v_shift = cell_id % 6U;
     std::uint32_t v = 0U;
-    if (symbol == 0U || symbol == 7U) {
-        v = (port == 0U) ? 0U : 3U;
-    } else {
-        v = (port == 0U) ? 3U : 0U;
+    switch (port) {
+    case 0U:
+        v = (symbol == 0U || symbol == 7U) ? 0U : 3U;
+        break;
+    case 1U:
+        v = (symbol == 0U || symbol == 7U) ? 3U : 0U;
+        break;
+    case 2U:
+        v = 3U;
+        break;
+    case 3U:
+        v = 0U;
+        break;
+    default:
+        return v_shift;
     }
     return (v + v_shift) % 6U;
 }
@@ -365,21 +397,29 @@ std::uint32_t crs_subcarrier(std::uint16_t cell_id, std::uint8_t port, std::uint
 }
 
 bool is_crs_re(std::uint16_t cell_id, std::uint8_t symbol, std::uint32_t sc) {
-    if (symbol != 0U && symbol != 4U && symbol != 7U && symbol != 11U) {
-        return false;
+    for (std::uint32_t port = 0U; port < 2U; ++port) {
+        const CrsPortPattern& pattern = crs_port_pattern(static_cast<std::uint8_t>(port));
+        for (std::uint32_t cs = 0U; cs < pattern.count; ++cs) {
+            if (symbol == pattern.symbols[cs] &&
+                sc % 6U ==
+                    crs_frequency_offset(cell_id, static_cast<std::uint8_t>(port), symbol) % 6U) {
+                return true;
+            }
+        }
     }
-    return sc % 6U == crs_frequency_offset(cell_id, 0U, symbol) % 6U ||
-           sc % 6U == crs_frequency_offset(cell_id, 1U, symbol) % 6U;
+    return false;
 }
 
 bool is_crs_re(const ExtractDescriptor& desc, std::uint8_t symbol, std::uint32_t sc) {
-    if (symbol != 0U && symbol != 4U && symbol != 7U && symbol != 11U) {
-        return false;
-    }
     for (std::uint32_t port = 0; port < desc.n_tx_ports; ++port) {
-        if (sc % 6U ==
-            crs_frequency_offset(desc.cell_id, static_cast<std::uint8_t>(port), symbol) % 6U) {
-            return true;
+        const CrsPortPattern& pattern = crs_port_pattern(static_cast<std::uint8_t>(port));
+        for (std::uint32_t cs = 0U; cs < pattern.count; ++cs) {
+            if (symbol == pattern.symbols[cs] &&
+                sc % 6U ==
+                    crs_frequency_offset(desc.cell_id, static_cast<std::uint8_t>(port), symbol) %
+                        6U) {
+                return true;
+            }
         }
     }
     return false;
@@ -398,9 +438,9 @@ void ensure_crs_tables() {
         for (std::uint16_t cell_id = 0; cell_id < kLteNumCellIds; ++cell_id) {
             for (std::uint8_t subframe = 0; subframe < 10U; ++subframe) {
                 for (std::uint8_t port = 0; port < kMmseV1MaxNumCrsTxPorts; ++port) {
-                    for (std::uint8_t symbol_idx = 0; symbol_idx < kLteNumCrsSymbols;
-                         ++symbol_idx) {
-                        const std::uint8_t symbol = kCrsSymbols[symbol_idx];
+                    const CrsPortPattern& pattern = crs_port_pattern(port);
+                    for (std::uint8_t symbol_idx = 0; symbol_idx < pattern.count; ++symbol_idx) {
+                        const std::uint8_t symbol = pattern.symbols[symbol_idx];
                         const std::uint32_t slot = 2U * subframe + (symbol >= 7U ? 1U : 0U);
                         const std::uint32_t slot_symbol = symbol % 7U;
                         const std::uint32_t c_init = (1U << 10U) *
@@ -487,9 +527,9 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
     std::uint32_t n_physical_regs = 0U;
     const std::uint32_t n_subcarriers = lte_downlink_subcarrier_count(desc.n_prb);
 
-    // Build physical REGs first. Symbol 0 has CRS holes; later symbols use the
-    // three fixed six-tone REG patterns. Reserved PCFICH/PHICH REs are rejected
-    // before the REG enters the interleaver.
+    // Build physical REGs first. Symbols carrying CRS retain two four-RE REGs;
+    // the remaining control symbols use three four-RE REGs. Reserved PCFICH/
+    // PHICH REs are rejected before the REG enters the interleaver.
     const auto append_reg = [&](std::uint32_t symbol, std::uint32_t prb,
                                 const PdcchRegIndices& tones) {
         PdcchRegIndices grid_indices{};
@@ -524,12 +564,18 @@ std::uint32_t build_pdcch_re_layout(const ExtractDescriptor& desc, ReLayout& lay
         append_reg(0U, prb, symbol0_reg0);
         for (std::uint32_t reg = 0U; reg < 2U; ++reg) {
             for (std::uint32_t symbol = 1U; symbol < desc.control_symbol_count; ++symbol) {
-                append_reg(symbol, prb, kLaterSymbolRegs[reg]);
+                if (crs_symbol_used_by_descriptor(desc, symbol)) {
+                    append_reg(symbol, prb, reg == 0U ? symbol0_reg0 : symbol0_reg1);
+                } else {
+                    append_reg(symbol, prb, kLaterSymbolRegs[reg]);
+                }
             }
         }
         append_reg(0U, prb, symbol0_reg1);
         for (std::uint32_t symbol = 1U; symbol < desc.control_symbol_count; ++symbol) {
-            append_reg(symbol, prb, kLaterSymbolRegs[2]);
+            if (!crs_symbol_used_by_descriptor(desc, symbol)) {
+                append_reg(symbol, prb, kLaterSymbolRegs[2]);
+            }
         }
     }
 
@@ -586,13 +632,25 @@ std::uint32_t build_pbch_re_layout(const ExtractDescriptor& desc, ReLayout& layo
         for (std::uint32_t prb = pbch_prb_begin(); prb < pbch_prb_end(); ++prb) {
             for (std::uint32_t tone = 0; tone < kLteNumSubcarriersPerPrb; ++tone) {
                 const std::uint32_t sc = prb * kLteNumSubcarriersPerPrb + tone;
-                const bool pbch_symbol_uses_crs_holes = symbol == kLtePbchStartSymbolNormalCp ||
-                                                        symbol == kLtePbchStartSymbolNormalCp + 1U;
-                const std::uint32_t v_shift = desc.cell_id % 6U;
-                const bool pbch_reserved_for_crs =
-                    pbch_symbol_uses_crs_holes &&
-                    (sc % 6U == v_shift || sc % 6U == ((v_shift + 3U) % 6U));
-                if (pbch_reserved_for_crs) {
+                bool reserved_for_pbch_crs = false;
+                for (std::uint32_t port = 0U; port < kMmseV1MaxNumCrsTxPorts; ++port) {
+                    const CrsPortPattern& pattern =
+                        crs_port_pattern(static_cast<std::uint8_t>(port));
+                    for (std::uint32_t cs = 0U; cs < pattern.count; ++cs) {
+                        if (symbol == pattern.symbols[cs] &&
+                            sc % 6U == crs_frequency_offset(desc.cell_id,
+                                                            static_cast<std::uint8_t>(port),
+                                                            static_cast<std::uint8_t>(symbol)) %
+                                           6U) {
+                            reserved_for_pbch_crs = true;
+                            break;
+                        }
+                    }
+                    if (reserved_for_pbch_crs) {
+                        break;
+                    }
+                }
+                if (reserved_for_pbch_crs) {
                     continue;
                 }
                 const std::uint32_t grid_idx = symbol * kLteNumSubcarriers20MHz + sc;
@@ -721,9 +779,10 @@ void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& de
             std::array<std::array<Complex32, kLteNumPilotTonesPerCrsSymbol>, kLteNumCrsSymbols>
                 ls{};
             std::array<std::array<Complex32, kLteNumSubcarriers20MHz>, kLteNumCrsSymbols> freq{};
+            const CrsPortPattern& pattern = crs_port_pattern(static_cast<std::uint8_t>(tx));
 
-            for (std::uint32_t cs = 0; cs < kLteNumCrsSymbols; ++cs) {
-                const std::uint8_t symbol = kCrsSymbols[cs];
+            for (std::uint32_t cs = 0; cs < pattern.count; ++cs) {
+                const std::uint8_t symbol = pattern.symbols[cs];
                 CrsTableKey key{
                     .cell_id = desc.cell_id,
                     .subframe = static_cast<std::uint8_t>(subframe),
@@ -779,18 +838,18 @@ void estimate_channel(const PlanarGridViewF32& grid, const ExtractDescriptor& de
 
             for (std::uint32_t symbol = 0; symbol < kLteNumSymbolsNormalCp; ++symbol) {
                 std::uint32_t upper = 0U;
-                while (upper < kLteNumCrsSymbols && kCrsSymbols[upper] < symbol) {
+                while (upper < pattern.count && pattern.symbols[upper] < symbol) {
                     ++upper;
                 }
                 std::uint32_t lower = (upper == 0U) ? 0U : upper - 1U;
-                if (upper >= kLteNumCrsSymbols) {
-                    lower = kLteNumCrsSymbols - 2U;
-                    upper = kLteNumCrsSymbols - 1U;
+                if (upper >= pattern.count) {
+                    lower = pattern.count - 2U;
+                    upper = pattern.count - 1U;
                 }
                 for (std::uint32_t sc = 0; sc < n_subcarriers; ++sc) {
                     h_full[h_index(tx, rx, symbol, sc)] =
-                        lerp_symbol(symbol, kCrsSymbols[lower], freq[lower][sc], kCrsSymbols[upper],
-                                    freq[upper][sc]);
+                        lerp_symbol(symbol, pattern.symbols[lower], freq[lower][sc],
+                                    pattern.symbols[upper], freq[upper][sc]);
                 }
             }
         }
@@ -1016,6 +1075,13 @@ struct TransmitDiversityRePair {
     std::uint16_t grid_index1 = 0;
 };
 
+struct TransmitDiversityReQuad {
+    std::uint16_t grid_index0 = 0;
+    std::uint16_t grid_index1 = 0;
+    std::uint16_t grid_index2 = 0;
+    std::uint16_t grid_index3 = 0;
+};
+
 inline float td_clampf(float value, float lo, float hi) {
     if (!std::isfinite(value)) {
         return lo;
@@ -1049,6 +1115,20 @@ bool build_transmit_diversity_re_pairs(const ReLayout& layout,
         const std::uint16_t grid0 = layout.grid_indices[i];
         const std::uint16_t grid1 = layout.grid_indices[i + 1U];
         pairs.push_back({grid0, grid1});
+    }
+    return true;
+}
+
+bool build_transmit_diversity_re_quads(const ReLayout& layout,
+                                       std::vector<TransmitDiversityReQuad>& quads) {
+    quads.clear();
+    if ((layout.n_re & 3U) != 0U) {
+        return false;
+    }
+    quads.reserve(layout.n_re / 4U);
+    for (std::uint32_t i = 0U; i < layout.n_re; i += 4U) {
+        quads.push_back({layout.grid_indices[i], layout.grid_indices[i + 1U],
+                         layout.grid_indices[i + 2U], layout.grid_indices[i + 3U]});
     }
     return true;
 }
@@ -1187,6 +1267,67 @@ equalize_transmit_diversity_pairs(const HGridStorage& h_full, const PlanarGridVi
         sinr[base + 1U] = eq.symbol1.gamma;
         indices0[base + 1U] = pair.grid_index0;
         indices1[base + 1U] = pair.grid_index1;
+    }
+    return MmseStatus::kOk;
+}
+
+detail::TransmitDiversityEqualizePair
+demap_transmit_diversity_quad_pair(const HGridStorage& h_full, const PlanarGridViewF32& grid,
+                                   std::uint16_t grid_index0, std::uint16_t grid_index1,
+                                   std::uint32_t first_tx_port, float sigma2, float det_floor,
+                                   float g_min, float gamma_max) {
+    const std::uint32_t symbol0 = grid_index0 / grid.n_subcarriers;
+    const std::uint32_t sc0 = grid_index0 % grid.n_subcarriers;
+    const std::uint32_t symbol1 = grid_index1 / grid.n_subcarriers;
+    const std::uint32_t sc1 = grid_index1 % grid.n_subcarriers;
+    return detail::demap_transmit_diversity_mmse_scalar(
+        h_full[td_h_index(first_tx_port, 0U, symbol0, sc0)],
+        h_full[td_h_index(first_tx_port + 1U, 0U, symbol0, sc0)], Complex32{}, Complex32{},
+        h_full[td_h_index(first_tx_port, 0U, symbol1, sc1)],
+        h_full[td_h_index(first_tx_port + 1U, 0U, symbol1, sc1)], Complex32{}, Complex32{},
+        td_grid_at(grid, 0U, symbol0, sc0), Complex32{}, td_grid_at(grid, 0U, symbol1, sc1),
+        Complex32{}, sigma2, det_floor, g_min, gamma_max);
+}
+
+MmseStatus
+equalize_transmit_diversity_quads(const HGridStorage& h_full, const PlanarGridViewF32& grid,
+                                  const std::vector<TransmitDiversityReQuad>& quads, float sigma2,
+                                  float det_floor, float g_min, float gamma_max, float* x_hat_re,
+                                  float* x_hat_im, float* sinr, std::uint16_t* indices0,
+                                  std::uint16_t* indices1, std::uint16_t* indices2,
+                                  std::uint16_t* indices3, std::uint32_t capacity_symbols) {
+    const std::uint32_t n_symbols = static_cast<std::uint32_t>(quads.size() * 4U);
+    if (x_hat_re == nullptr || x_hat_im == nullptr || sinr == nullptr || indices0 == nullptr ||
+        indices1 == nullptr || indices2 == nullptr || indices3 == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+    if (capacity_symbols < n_symbols) {
+        return MmseStatus::kBufferTooSmall;
+    }
+    for (std::uint32_t i = 0U; i < quads.size(); ++i) {
+        const TransmitDiversityReQuad& quad = quads[i];
+        const detail::TransmitDiversityEqualizePair first =
+            demap_transmit_diversity_quad_pair(h_full, grid, quad.grid_index0, quad.grid_index1, 0U,
+                                               sigma2, det_floor, g_min, gamma_max);
+        const detail::TransmitDiversityEqualizePair second =
+            demap_transmit_diversity_quad_pair(h_full, grid, quad.grid_index2, quad.grid_index3, 2U,
+                                               sigma2, det_floor, g_min, gamma_max);
+        const std::uint32_t base = i * 4U;
+        const std::array<detail::EqualizedSymbol, 4> symbols = {
+            first.symbol0,
+            first.symbol1,
+            second.symbol0,
+            second.symbol1,
+        };
+        for (std::uint32_t symbol = 0U; symbol < symbols.size(); ++symbol) {
+            x_hat_re[base + symbol] = symbols[symbol].xhat.re;
+            x_hat_im[base + symbol] = symbols[symbol].xhat.im;
+            sinr[base + symbol] = symbols[symbol].gamma;
+            indices0[base + symbol] = quad.grid_index0;
+            indices1[base + symbol] = quad.grid_index1;
+            indices2[base + symbol] = quad.grid_index2;
+            indices3[base + symbol] = quad.grid_index3;
+        }
     }
     return MmseStatus::kOk;
 }
@@ -1371,7 +1512,7 @@ MmseStatus MmseEqualizerCpuContext::run(const PlanarGridViewF32& grid,
     if (!detail::descriptor_supported(desc)) {
         return MmseStatus::kUnsupportedConfig;
     }
-    if (is_pdsch_transmit_diversity_descriptor(desc)) {
+    if (desc.channel_type != MmseChannelType::kPdsch && desc.n_tx_ports != 1U) {
         return MmseStatus::kUnsupportedConfig;
     }
 
@@ -1448,6 +1589,9 @@ MmseStatus MmseEqualizerCpuContext::run_pbch(const PbchMmseInput& in, PbchMmseOu
     if (const MmseStatus status = mmse::pbch::validate_pbch_mmse_input(in);
         status != MmseStatus::kOk) {
         return status;
+    }
+    if (in.n_tx_ports != 1U || in.tx_mode != 1U) {
+        return MmseStatus::kUnsupportedConfig;
     }
 
     ExtractDescriptor desc{};
@@ -1577,11 +1721,86 @@ MmseStatus MmseEqualizerCpuContext::run_pbch_td(const PbchMmseInput& in, PbchTdM
     return MmseStatus::kOk;
 }
 
+MmseStatus MmseEqualizerCpuContext::run_pbch_td4(const PbchMmseInput& in,
+                                                 PbchTd4MmseOutputView& out,
+                                                 PbchTd4MmseResult& meta) {
+    if (!impl_->initialized) {
+        return MmseStatus::kNotInitialized;
+    }
+    if (const MmseStatus status = mmse::pbch::validate_pbch_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    if (in.n_tx_ports != 4U || in.tx_mode != 2U || in.grid.n_rx_ant != 1U) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = 4U;
+    desc.n_rx_ant = 1U;
+    desc.n_layers = 1U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPbch;
+    desc.start_symbol = kLtePbchStartSymbolNormalCp;
+    desc.mod_order = 2U;
+    desc.n_prb = kLtePbchNumPrb;
+    for (std::uint32_t prb = kLtePbchStartPrb; prb < kLtePbchStartPrb + kLtePbchNumPrb; ++prb) {
+        desc.prb_bitmap[prb / 16U] |= static_cast<std::uint16_t>(1U << (prb % 16U));
+    }
+    if (const MmseStatus status = detail::validate_grid(in.grid, &desc);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    float sigma2 = 0.0F;
+    if (const MmseStatus status = impl_->prepare_subframe_if_needed(in.grid, desc, sigma2);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    const std::uint32_t n_source_re = detail::build_pbch_re_layout(desc, impl_->layout);
+    std::vector<TransmitDiversityReQuad> quads{};
+    if (!build_transmit_diversity_re_quads(impl_->layout, quads)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (const MmseStatus status = equalize_transmit_diversity_quads(
+            impl_->h_full, in.grid, quads, sigma2, impl_->config.det_floor, impl_->config.g_min,
+            impl_->config.gamma_max, out.x_hat_re, out.x_hat_im, out.sinr, out.re_grid_indices0,
+            out.re_grid_indices1, out.re_grid_indices2, out.re_grid_indices3, out.capacity_symbols);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    meta = {};
+    meta.n_symbols = n_source_re;
+    meta.n_source_re = n_source_re;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.grid_symbol_count = in.grid.n_symbols;
+    meta.grid_subcarrier_count = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.start_prb = kLtePbchStartPrb;
+    meta.n_prb = kLtePbchNumPrb;
+    meta.start_symbol = kLtePbchStartSymbolNormalCp;
+    meta.n_tx_ports = 4U;
+    meta.n_rx_ant = 1U;
+    meta.n_layers = 1U;
+    meta.tx_mode = 2U;
+    meta.mod_order = 2U;
+    meta.sigma2 =
+        detail::peek_sigma2_state(impl_->sigma2_by_cell[in.cell_id], impl_->config.sigma2_min);
+    meta.chain = in.chain;
+    return MmseStatus::kOk;
+}
+
 MmseStatus MmseEqualizerCpuContext::run_pcfich(const PcfichMmseInput& in, PcfichMmseOutputView& out,
                                                PcfichMmseResult& meta) {
     if (const MmseStatus status = mmse::pcfich::validate_pcfich_mmse_input(in);
         status != MmseStatus::kOk) {
         return status;
+    }
+    if (in.n_tx_ports != 1U || in.tx_mode != 1U) {
+        return MmseStatus::kUnsupportedConfig;
     }
 
     ExtractDescriptor desc{};
@@ -1702,6 +1921,77 @@ MmseStatus MmseEqualizerCpuContext::run_pcfich_td(const PcfichMmseInput& in,
     meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
     meta.n_layers = 1U;
     meta.tx_mode = in.tx_mode;
+    meta.mod_order = 2U;
+    meta.sigma2 =
+        detail::peek_sigma2_state(impl_->sigma2_by_cell[in.cell_id], impl_->config.sigma2_min);
+    meta.chain = in.chain;
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerCpuContext::run_pcfich_td4(const PcfichMmseInput& in,
+                                                   PcfichTd4MmseOutputView& out,
+                                                   PcfichTd4MmseResult& meta) {
+    if (!impl_->initialized) {
+        return MmseStatus::kNotInitialized;
+    }
+    if (const MmseStatus status = mmse::pcfich::validate_pcfich_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    if (in.n_tx_ports != 4U || in.tx_mode != 2U || in.grid.n_rx_ant != 1U) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = 4U;
+    desc.n_rx_ant = 1U;
+    desc.n_layers = 1U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPcfich;
+    desc.control_symbol_count = 1U;
+    desc.mod_order = 2U;
+    desc.n_prb = kLteNumPrb20MHz;
+    desc.prb_bitmap.fill(0xFFFFU);
+    desc.prb_bitmap.back() = 0x000FU;
+    if (const MmseStatus status = detail::validate_grid(in.grid, &desc);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    float sigma2 = 0.0F;
+    if (const MmseStatus status = impl_->prepare_subframe_if_needed(in.grid, desc, sigma2);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    const std::uint32_t n_source_re = detail::build_pcfich_re_layout(desc, impl_->layout);
+    std::vector<TransmitDiversityReQuad> quads{};
+    if (!build_transmit_diversity_re_quads(impl_->layout, quads)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (const MmseStatus status = equalize_transmit_diversity_quads(
+            impl_->h_full, in.grid, quads, sigma2, impl_->config.det_floor, impl_->config.g_min,
+            impl_->config.gamma_max, out.x_hat_re, out.x_hat_im, out.sinr, out.re_grid_indices0,
+            out.re_grid_indices1, out.re_grid_indices2, out.re_grid_indices3, out.capacity_symbols);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    meta = {};
+    meta.n_symbols = n_source_re;
+    meta.n_source_re = n_source_re;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.grid_symbol_count = in.grid.n_symbols;
+    meta.grid_subcarrier_count = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.n_prb = kLteNumPrb20MHz;
+    meta.start_symbol = 0U;
+    meta.reg_count = static_cast<std::uint8_t>(kLtePcfichNumRegs);
+    meta.n_tx_ports = 4U;
+    meta.n_rx_ant = 1U;
+    meta.n_layers = 1U;
+    meta.tx_mode = 2U;
     meta.mod_order = 2U;
     meta.sigma2 =
         detail::peek_sigma2_state(impl_->sigma2_by_cell[in.cell_id], impl_->config.sigma2_min);
@@ -1844,6 +2134,84 @@ MmseStatus MmseEqualizerCpuContext::run_pdcch_td(const PdcchMmseInput& in,
     meta.n_rx_ant = static_cast<std::uint8_t>(in.grid.n_rx_ant);
     meta.n_layers = 1U;
     meta.tx_mode = in.tx_mode;
+    meta.control_symbol_count = in.control_symbol_count;
+    meta.mod_order = 2U;
+    meta.sigma2 =
+        detail::peek_sigma2_state(impl_->sigma2_by_cell[in.cell_id], impl_->config.sigma2_min);
+    meta.prb_bitmap = in.prb_bitmap;
+    meta.chain = in.chain;
+    return MmseStatus::kOk;
+}
+
+MmseStatus MmseEqualizerCpuContext::run_pdcch_td4(const PdcchMmseInput& in,
+                                                  PdcchTd4MmseOutputView& out,
+                                                  PdcchTd4MmseResult& meta) {
+    if (!impl_->initialized) {
+        return MmseStatus::kNotInitialized;
+    }
+    if (const MmseStatus status = mmse::pdcch::validate_pdcch_mmse_input(in);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    if (in.n_tx_ports != 4U || in.tx_mode != 2U || in.grid.n_rx_ant != 1U) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (out.x_hat_re == nullptr || out.x_hat_im == nullptr || out.sinr == nullptr ||
+        out.re_grid_indices0 == nullptr || out.re_grid_indices1 == nullptr ||
+        out.re_grid_indices2 == nullptr || out.re_grid_indices3 == nullptr) {
+        return MmseStatus::kInvalidArgument;
+    }
+
+    ExtractDescriptor desc{};
+    desc.sfn_subframe = in.sfn_subframe;
+    desc.cell_id = in.cell_id;
+    desc.n_tx_ports = 4U;
+    desc.n_rx_ant = 1U;
+    desc.n_layers = 1U;
+    desc.tx_mode = 2U;
+    desc.channel_type = MmseChannelType::kPdcch;
+    desc.start_symbol = 0U;
+    desc.control_symbol_count = in.control_symbol_count;
+    desc.mod_order = 2U;
+    desc.n_prb = in.n_prb;
+    desc.prb_bitmap = in.prb_bitmap;
+    desc.control_re_exclusion_masks = in.control_re_exclusion_masks;
+    desc.pmi = -1;
+    if (const MmseStatus status = detail::validate_grid(in.grid, &desc);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    float sigma2 = 0.0F;
+    if (const MmseStatus status = impl_->prepare_subframe_if_needed(in.grid, desc, sigma2);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    const std::uint32_t n_source_re = detail::build_pdcch_re_layout(desc, impl_->layout);
+    std::vector<TransmitDiversityReQuad> quads{};
+    if (!build_transmit_diversity_re_quads(impl_->layout, quads)) {
+        return MmseStatus::kUnsupportedConfig;
+    }
+    if (const MmseStatus status = equalize_transmit_diversity_quads(
+            impl_->h_full, in.grid, quads, sigma2, impl_->config.det_floor, impl_->config.g_min,
+            impl_->config.gamma_max, out.x_hat_re, out.x_hat_im, out.sinr, out.re_grid_indices0,
+            out.re_grid_indices1, out.re_grid_indices2, out.re_grid_indices3, out.capacity_symbols);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+
+    meta = {};
+    meta.n_symbols = n_source_re;
+    meta.n_source_re = n_source_re;
+    meta.sfn_subframe = in.sfn_subframe;
+    meta.grid_symbol_count = in.grid.n_symbols;
+    meta.grid_subcarrier_count = in.grid.n_subcarriers;
+    meta.cell_id = in.cell_id;
+    meta.n_prb = in.n_prb;
+    meta.n_tx_ports = 4U;
+    meta.n_rx_ant = 1U;
+    meta.n_layers = 1U;
+    meta.tx_mode = 2U;
     meta.control_symbol_count = in.control_symbol_count;
     meta.mod_order = 2U;
     meta.sigma2 =

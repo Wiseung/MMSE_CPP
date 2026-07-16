@@ -2,13 +2,19 @@
 
 本页定义 `PDCCH Chain SDK v1` 的兼容性边界。
 
-本仓库还额外提供了一套并行的可加式 TD 接口，用于 `2 Tx port` LTE PDCCH：
+本仓库还额外提供并行的可加式 TD2/Td4 接口，用于 `2 Tx port` 和 `4Tx x 1Rx` LTE PDCCH：
 
 - `MmseEqualizerCpuContext::run_pdcch_td`
 - `MmseEqualizerGpuContext::run_pdcch_td`
 - `PdcchTdMmseOutputView`
 - `PdcchTdMmseResult`
 - `BackendPdcchTdEqualizedIndication`
+- `MmseEqualizerCpuContext::run_pdcch_td4`
+- `MmseEqualizerGpuContext::run_pdcch_td4`
+- `PdcchTd4MmseOutputView`
+- `PdcchTd4MmseResult`
+- `BackendPdcchTd4EqualizedIndication`
+- `normalize_pdcch_td4_cce_order`
 
 以及一组可加式的 blind-decode helper：
 
@@ -23,7 +29,7 @@
 - `run_pdcch_cpu_ue_specific_search(...)`
 - `run_pdcch_cpu_si_rnti_geometry_search(...)`
 
-这些符号不属于下面定义的冻结 `v1` 单 RE 契约。`v1` 边界仍然专门约束
+这些 TD 符号不属于下面定义的冻结 `v1` 单 RE 契约。`v1` 边界仍然专门约束
 `run_pdcch(...)` 及其 per-RE DTO 语义；新增 helper 维持向后兼容，但不改变冻结 core 的解释方式。
 
 相关页面：
@@ -79,7 +85,7 @@
 - 修改 `control_re_exclusion_masks` 的 bit 布局
 - 修改文档中已有 `MmseStatus` 的成功/失败语义
 - 用会改变当前已验证行为的方式静默扩展支持边界
-  - 例如没有版本升级和新契约说明，就宣称支持 `2 Tx port` PDCCH
+  - 例如让 `run_pdcch(...)` 静默接受 TD2/Td4 并改变其 per-RE 语义
 
 ## v1 内允许的变更
 
@@ -107,7 +113,11 @@
 - 修改输出索引语义
 - 修改支持的 PHY 范围
   - 例如把 NR 语义直接塞进同一套 DTO 契约
-- 引入一种对输入要求或输出解释不同的 `2 Tx port` PDCCH 支持方式
+- 改变冻结 `run_pdcch(...)` 的输入要求或 per-RE 输出解释
+
+新增独立命名、独立 output view/result 的 TD 能力可以保持 additive。Td4 的四源索引和
+`4Tx x 1Rx / 1 layer / tx_mode == 2 / QPSK` 边界属于该新增接口自身的契约，不改变冻结的
+`run_pdcch(...)` v1 语义。
 
 ## 推荐迁移规则
 

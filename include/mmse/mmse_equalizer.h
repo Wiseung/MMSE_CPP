@@ -10,6 +10,8 @@ namespace mmse {
 namespace pdcch {
 struct PdcchGpuCommonSearchDecodeRequest;
 struct PdcchGpuCommonSearchDecodeResult;
+struct PdcchGpuFixedCandidateDecodeRequest;
+struct PdcchGpuFixedCandidateDecodeResult;
 } // namespace pdcch
 
 class MmseEqualizerCpuContext {
@@ -30,13 +32,19 @@ class MmseEqualizerCpuContext {
     MmseStatus run_pbch(const PbchMmseInput& in, PbchMmseOutputView& out, PbchMmseResult& meta);
     MmseStatus run_pbch_td(const PbchMmseInput& in, PbchTdMmseOutputView& out,
                            PbchTdMmseResult& meta);
+    MmseStatus run_pbch_td4(const PbchMmseInput& in, PbchTd4MmseOutputView& out,
+                            PbchTd4MmseResult& meta);
     MmseStatus run_pcfich(const PcfichMmseInput& in, PcfichMmseOutputView& out,
                           PcfichMmseResult& meta);
     MmseStatus run_pcfich_td(const PcfichMmseInput& in, PcfichTdMmseOutputView& out,
                              PcfichTdMmseResult& meta);
+    MmseStatus run_pcfich_td4(const PcfichMmseInput& in, PcfichTd4MmseOutputView& out,
+                              PcfichTd4MmseResult& meta);
     MmseStatus run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out, PdcchMmseResult& meta);
     MmseStatus run_pdcch_td(const PdcchMmseInput& in, PdcchTdMmseOutputView& out,
                             PdcchTdMmseResult& meta);
+    MmseStatus run_pdcch_td4(const PdcchMmseInput& in, PdcchTd4MmseOutputView& out,
+                             PdcchTd4MmseResult& meta);
 
   private:
     struct Impl;
@@ -61,13 +69,19 @@ class MmseEqualizerGpuContext {
     MmseStatus run_pbch(const PbchMmseInput& in, PbchMmseOutputView& out, PbchMmseResult& meta);
     MmseStatus run_pbch_td(const PbchMmseInput& in, PbchTdMmseOutputView& out,
                            PbchTdMmseResult& meta);
+    MmseStatus run_pbch_td4(const PbchMmseInput& in, PbchTd4MmseOutputView& out,
+                            PbchTd4MmseResult& meta);
     MmseStatus run_pcfich(const PcfichMmseInput& in, PcfichMmseOutputView& out,
                           PcfichMmseResult& meta);
     MmseStatus run_pcfich_td(const PcfichMmseInput& in, PcfichTdMmseOutputView& out,
                              PcfichTdMmseResult& meta);
+    MmseStatus run_pcfich_td4(const PcfichMmseInput& in, PcfichTd4MmseOutputView& out,
+                              PcfichTd4MmseResult& meta);
     MmseStatus run_pdcch(const PdcchMmseInput& in, PdcchMmseOutputView& out, PdcchMmseResult& meta);
     MmseStatus run_pdcch_td(const PdcchMmseInput& in, PdcchTdMmseOutputView& out,
                             PdcchTdMmseResult& meta);
+    MmseStatus run_pdcch_td4(const PdcchMmseInput& in, PdcchTd4MmseOutputView& out,
+                             PdcchTd4MmseResult& meta);
     // GPU common-search decode is split internally into submit/collect so the
     // caller can batch work across streams through the batch overload.
     MmseStatus
@@ -76,6 +90,12 @@ class MmseEqualizerGpuContext {
     MmseStatus run_pdcch_gpu_common_search_decode_batch(
         std::span<const pdcch::PdcchGpuCommonSearchDecodeRequest> requests,
         std::span<pdcch::PdcchGpuCommonSearchDecodeResult> results);
+    MmseStatus
+    run_pdcch_gpu_fixed_candidate_decode(const pdcch::PdcchGpuFixedCandidateDecodeRequest& request,
+                                         pdcch::PdcchGpuFixedCandidateDecodeResult& result);
+    MmseStatus run_pdcch_gpu_fixed_candidate_decode_batch(
+        std::span<const pdcch::PdcchGpuFixedCandidateDecodeRequest> requests,
+        std::span<pdcch::PdcchGpuFixedCandidateDecodeResult> results);
     MmseGpuHostProfileSnapshot last_host_profile() const;
 
   private:

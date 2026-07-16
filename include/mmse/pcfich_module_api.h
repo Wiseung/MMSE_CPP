@@ -7,6 +7,9 @@
 namespace mmse::pcfich {
 
 inline MmseStatus validate_pcfich_mmse_input(const PcfichMmseInput& in) {
+    if (in.cell_id >= kLteNumCellIds) {
+        return MmseStatus::kInvalidArgument;
+    }
     if (in.grid.n_rx_ant == 0U || in.grid.n_rx_ant > kMmseV1MaxNumRxAntennas ||
         in.grid.n_symbols != kLteNumSymbolsNormalCp ||
         in.grid.n_subcarriers != kLteNumSubcarriers20MHz) {

@@ -16,6 +16,14 @@ MmseStatus run_pdcch_gpu_common_search_decode_batch(
     MmseEqualizerGpuContext& context, std::span<const PdcchGpuCommonSearchDecodeRequest> requests,
     std::span<PdcchGpuCommonSearchDecodeResult> results);
 
+MmseStatus run_pdcch_gpu_fixed_candidate_decode(MmseEqualizerGpuContext& context,
+                                                const PdcchGpuFixedCandidateDecodeRequest& request,
+                                                PdcchGpuFixedCandidateDecodeResult& result);
+
+MmseStatus run_pdcch_gpu_fixed_candidate_decode_batch(
+    MmseEqualizerGpuContext& context, std::span<const PdcchGpuFixedCandidateDecodeRequest> requests,
+    std::span<PdcchGpuFixedCandidateDecodeResult> results);
+
 namespace detail {
 
 inline MmseStatus build_pdcch_cpu_backend(MmseEqualizerCpuContext& context,
@@ -66,6 +74,30 @@ inline MmseStatus build_pdcch_cpu_backend(MmseEqualizerCpuContext& context,
             make_backend_pdcch_td_equalized_indication(metadata, output);
         return normalize_pdcch_td_cce_order(td_backend, backend);
     }
+    if (input.n_tx_ports == 4U) {
+        std::vector<std::uint16_t> re_grid_indices0(kMaxPdcchRe);
+        std::vector<std::uint16_t> re_grid_indices1(kMaxPdcchRe);
+        std::vector<std::uint16_t> re_grid_indices2(kMaxPdcchRe);
+        std::vector<std::uint16_t> re_grid_indices3(kMaxPdcchRe);
+        PdcchTd4MmseOutputView output{
+            .x_hat_re = x_hat_re.data(),
+            .x_hat_im = x_hat_im.data(),
+            .sinr = sinr.data(),
+            .re_grid_indices0 = re_grid_indices0.data(),
+            .re_grid_indices1 = re_grid_indices1.data(),
+            .re_grid_indices2 = re_grid_indices2.data(),
+            .re_grid_indices3 = re_grid_indices3.data(),
+            .capacity_symbols = kMaxPdcchRe,
+        };
+        PdcchTd4MmseResult metadata{};
+        if (const MmseStatus status = context.run_pdcch_td4(input, output, metadata);
+            status != MmseStatus::kOk) {
+            return status;
+        }
+        const BackendPdcchTd4EqualizedIndication td_backend =
+            make_backend_pdcch_td4_equalized_indication(metadata, output);
+        return normalize_pdcch_td4_cce_order(td_backend, backend);
+    }
     return MmseStatus::kUnsupportedConfig;
 }
 
@@ -87,6 +119,22 @@ inline MmseStatus run_pdcch_gpu_common_search_decode_batch(
     return context.run_pdcch_gpu_common_search_decode_batch(requests, results);
 }
 
+inline MmseStatus
+run_pdcch_gpu_fixed_candidate_decode(MmseEqualizerGpuContext& context,
+                                     const PdcchGpuFixedCandidateDecodeRequest& request,
+                                     PdcchGpuFixedCandidateDecodeResult& result) {
+    return context.run_pdcch_gpu_fixed_candidate_decode(request, result);
+}
+
+inline MmseStatus run_pdcch_gpu_fixed_candidate_decode_batch(
+    MmseEqualizerGpuContext& context, std::span<const PdcchGpuFixedCandidateDecodeRequest> requests,
+    std::span<PdcchGpuFixedCandidateDecodeResult> results) {
+    if (requests.size() != results.size()) {
+        return MmseStatus::kInvalidArgument;
+    }
+    return context.run_pdcch_gpu_fixed_candidate_decode_batch(requests, results);
+}
+
 inline MmseStatus run_pdcch_cpu_common_search_decode(MmseEqualizerCpuContext& context,
                                                      const PdcchMmseInput& input,
                                                      const PdcchCommonSearchDecodeConfig& config,
@@ -99,6 +147,22 @@ inline MmseStatus run_pdcch_cpu_common_search_decode(MmseEqualizerCpuContext& co
     }
 
     return decode_pdcch_common_search_dci_format1a(backend, config, result);
+}
+
+inline MmseStatus
+run_pdcch_cpu_fixed_candidate_decode(MmseEqualizerCpuContext& context, const PdcchMmseInput& input,
+                                     const PdcchFixedCandidateDecodeConfig& config,
+                                     PdcchDciFormat1ADecodeResult& result) {
+    result = {};
+    if (!is_valid_pdcch_aggregation_level(config.aggregation_level) || config.expected_rnti == 0U) {
+        return MmseStatus::kInvalidArgument;
+    }
+    BackendPdcchEqualizedIndication backend{};
+    if (const MmseStatus status = detail::build_pdcch_cpu_backend(context, input, backend);
+        status != MmseStatus::kOk) {
+        return status;
+    }
+    return decode_pdcch_fixed_candidate_dci_format1a(backend, config, result);
 }
 
 inline MmseStatus run_pdcch_cpu_si_rnti_search(MmseEqualizerCpuContext& context,

@@ -21,10 +21,14 @@ constexpr float kQpskAxis = 0.7071067811865475F;
 enum class Workload {
     kRandom,
     kMixed,
+    kFixed,
 };
 
 inline std::string_view workload_name(Workload workload) noexcept {
-    return workload == Workload::kMixed ? "mixed" : "random";
+    if (workload == Workload::kMixed) {
+        return "mixed";
+    }
+    return workload == Workload::kFixed ? "fixed" : "random";
 }
 
 inline bool parse_workload(std::string_view text, Workload& workload) noexcept {
@@ -34,6 +38,10 @@ inline bool parse_workload(std::string_view text, Workload& workload) noexcept {
     }
     if (text == "mixed") {
         workload = Workload::kMixed;
+        return true;
+    }
+    if (text == "fixed") {
+        workload = Workload::kFixed;
         return true;
     }
     return false;
@@ -95,6 +103,9 @@ struct HitDistribution {
 struct MixedWorkload {
     std::vector<Case> cases{};
 };
+
+constexpr std::uint8_t kFixedAggregationLevel = 4U;
+constexpr std::uint16_t kFixedFirstCce = 4U;
 
 inline PlanarGridViewF32 make_grid_view(const GridBuffers& buffers, std::uint32_t n_rx_ant,
                                         std::uint64_t generation) noexcept {
@@ -243,6 +254,29 @@ inline void fill_identity_channel(GridBuffers& buffers, const ExtractDescriptor&
     const std::uint32_t subframe = mmse::detail::subframe_from_descriptor(desc);
     const std::uint32_t n_subcarriers =
         static_cast<std::uint32_t>(buffers.re[0].size() / kLteNumSymbolsNormalCp);
+    if (desc.n_tx_ports == 4U) {
+        const std::uint32_t pilot_count = n_subcarriers / 6U;
+        for (std::uint32_t port = 0U; port < 4U; ++port) {
+            const auto& pattern = mmse::detail::crs_port_pattern(static_cast<std::uint8_t>(port));
+            for (std::uint32_t cs = 0U; cs < pattern.count; ++cs) {
+                const std::uint8_t symbol = pattern.symbols[cs];
+                for (std::uint32_t pilot = 0U; pilot < pilot_count; ++pilot) {
+                    const std::uint32_t sc = mmse::detail::crs_subcarrier(
+                        desc.cell_id, static_cast<std::uint8_t>(port), symbol, pilot);
+                    const mmse::detail::Complex32 crs =
+                        mmse::detail::crs_value({.cell_id = desc.cell_id,
+                                                 .subframe = static_cast<std::uint8_t>(subframe),
+                                                 .port = static_cast<std::uint8_t>(port),
+                                                 .crs_symbol_index = static_cast<std::uint8_t>(cs)},
+                                                pilot);
+                    const std::size_t index = static_cast<std::size_t>(symbol) * n_subcarriers + sc;
+                    buffers.re[0][index] = crs.re;
+                    buffers.im[0][index] = crs.im;
+                }
+            }
+        }
+        return;
+    }
     for (std::uint32_t symbol = 0U; symbol < kLteNumSymbolsNormalCp; ++symbol) {
         for (std::uint32_t sc = 0U; sc < n_subcarriers; ++sc) {
             const std::size_t index = static_cast<std::size_t>(symbol) * n_subcarriers + sc;
@@ -304,6 +338,24 @@ inline void fill_td_pair(GridBuffers& buffers, std::uint16_t grid0, std::uint16_
     buffers.im[0][grid1] = conjugate_s1.im;
     buffers.re[1][grid1] = -conjugate_s0.re;
     buffers.im[1][grid1] = -conjugate_s0.im;
+}
+
+inline void fill_td4_quad(GridBuffers& buffers, std::uint16_t grid0, std::uint16_t grid1,
+                          std::uint16_t grid2, std::uint16_t grid3, mmse::detail::Complex32 s0,
+                          mmse::detail::Complex32 s1, mmse::detail::Complex32 s2,
+                          mmse::detail::Complex32 s3) {
+    const mmse::detail::Complex32 y0 = mmse::detail::cadd(s0, s1);
+    const mmse::detail::Complex32 y1 =
+        mmse::detail::csub(mmse::detail::cconj(s1), mmse::detail::cconj(s0));
+    const mmse::detail::Complex32 y2 = mmse::detail::cadd(s2, s3);
+    const mmse::detail::Complex32 y3 =
+        mmse::detail::csub(mmse::detail::cconj(s3), mmse::detail::cconj(s2));
+    const std::array<mmse::detail::Complex32, 4> samples = {y0, y1, y2, y3};
+    const std::array<std::uint16_t, 4> indices = {grid0, grid1, grid2, grid3};
+    for (std::size_t index = 0U; index < samples.size(); ++index) {
+        buffers.re[0][indices[index]] = samples[index].re;
+        buffers.im[0][indices[index]] = samples[index].im;
+    }
 }
 
 inline pdcch::PdcchGpuCommonSearchDecodeRequest
@@ -404,8 +456,8 @@ inline bool make_case(std::uint16_t n_prb, std::uint8_t n_tx_ports, std::uint32_
         benchmark_case.buffers.re[rx].assign(kLteNumSymbolsNormalCp * n_subcarriers, 0.0F);
         benchmark_case.buffers.im[rx].assign(kLteNumSymbolsNormalCp * n_subcarriers, 0.0F);
     }
-    const PlanarGridViewF32 grid =
-        make_grid_view(benchmark_case.buffers, kMmseV1MaxNumRxAntennas, generation);
+    const std::uint32_t n_rx_ant = n_tx_ports == 4U ? 1U : kMmseV1MaxNumRxAntennas;
+    const PlanarGridViewF32 grid = make_grid_view(benchmark_case.buffers, n_rx_ant, generation);
     benchmark_case.request =
         make_request(grid, sfn_subframe, kDefaultCellId, n_prb, n_tx_ports, generation);
     const PdcchMmseInput& input = benchmark_case.request.input;
@@ -459,7 +511,7 @@ inline bool make_case(std::uint16_t n_prb, std::uint8_t n_tx_ports, std::uint32_
             benchmark_case.buffers.re[1][layout.grid_indices[re]] = symbols[re].re;
             benchmark_case.buffers.im[1][layout.grid_indices[re]] = symbols[re].im;
         }
-    } else {
+    } else if (input.n_tx_ports == 2U) {
         if ((layout.n_re & 1U) != 0U) {
             return false;
         }
@@ -467,6 +519,18 @@ inline bool make_case(std::uint16_t n_prb, std::uint8_t n_tx_ports, std::uint32_
             fill_td_pair(benchmark_case.buffers, layout.grid_indices[re],
                          layout.grid_indices[re + 1U], symbols[re], symbols[re + 1U]);
         }
+    } else if (input.n_tx_ports == 4U) {
+        if ((layout.n_re & 3U) != 0U) {
+            return false;
+        }
+        for (std::uint32_t re = 0U; re < layout.n_re; re += 4U) {
+            fill_td4_quad(benchmark_case.buffers, layout.grid_indices[re],
+                          layout.grid_indices[re + 1U], layout.grid_indices[re + 2U],
+                          layout.grid_indices[re + 3U], symbols[re], symbols[re + 1U],
+                          symbols[re + 2U], symbols[re + 3U]);
+        }
+    } else {
+        return false;
     }
     return true;
 }
@@ -531,6 +595,73 @@ inline bool validate_result(const pdcch::PdcchGpuCommonSearchDecodeResult& resul
     cpu_shape.candidate_count = result.candidate_count;
     cpu_shape.hits = result.hits;
     return validate_result(cpu_shape, benchmark_case);
+}
+
+inline pdcch::PdcchGpuFixedCandidateDecodeRequest make_fixed_request(const Case& benchmark_case) {
+    pdcch::PdcchGpuFixedCandidateDecodeRequest request{};
+    request.input = benchmark_case.request.input;
+    request.config = {
+        .aggregation_level = kFixedAggregationLevel,
+        .first_cce = kFixedFirstCce,
+        .expected_rnti = pdcch::kSiRnti,
+        .dci_format1a = benchmark_case.request.config.dci_format1a,
+    };
+    return request;
+}
+
+inline const ExpectedDci* fixed_expected_hit(const Case& benchmark_case) noexcept {
+    const auto found =
+        std::find_if(benchmark_case.expected_hits.begin(), benchmark_case.expected_hits.end(),
+                     [](const ExpectedDci& expected) {
+                         return expected.aggregation_level == kFixedAggregationLevel &&
+                                expected.first_cce == kFixedFirstCce;
+                     });
+    return found == benchmark_case.expected_hits.end() ? nullptr : &*found;
+}
+
+inline bool validate_fixed_result(const pdcch::PdcchDciFormat1ADecodeResult& result,
+                                  const Case& benchmark_case) noexcept {
+    const ExpectedDci* expected = fixed_expected_hit(benchmark_case);
+    return expected == nullptr ? !result.matched : matches_expected_dci(result, *expected);
+}
+
+inline bool fixed_results_equal(const pdcch::PdcchDciFormat1ADecodeResult& actual,
+                                const pdcch::PdcchDciFormat1ADecodeResult& expected) noexcept {
+    const auto& lhs = actual.dci;
+    const auto& rhs = expected.dci;
+    return actual.matched == expected.matched &&
+           actual.crc.transmitted_crc == expected.crc.transmitted_crc &&
+           actual.crc.calculated_crc == expected.crc.calculated_crc &&
+           actual.crc.unmasked_rnti == expected.crc.unmasked_rnti &&
+           actual.crc.matches_expected_rnti == expected.crc.matches_expected_rnti &&
+           lhs.sfn_subframe == rhs.sfn_subframe && lhs.cell_id == rhs.cell_id &&
+           lhs.rnti == rhs.rnti && lhs.downlink_bandwidth_prb == rhs.downlink_bandwidth_prb &&
+           lhs.rnti_type == rhs.rnti_type && lhs.chain.request_id == rhs.chain.request_id &&
+           lhs.chain.candidate_id == rhs.chain.candidate_id &&
+           lhs.chain.first_cce == rhs.chain.first_cce &&
+           lhs.chain.aggregation_level == rhs.chain.aggregation_level &&
+           lhs.cif_present == rhs.cif_present && lhs.carrier_indicator == rhs.carrier_indicator &&
+           lhs.is_pdcch_order == rhs.is_pdcch_order && lhs.preamble_index == rhs.preamble_index &&
+           lhs.prach_mask_index == rhs.prach_mask_index &&
+           lhs.distributed_vrb_assignment == rhs.distributed_vrb_assignment &&
+           lhs.n_gap_is_two == rhs.n_gap_is_two && lhs.n_prb_1a_is_three == rhs.n_prb_1a_is_three &&
+           lhs.n_prb_1a == rhs.n_prb_1a &&
+           lhs.resource_indication_value == rhs.resource_indication_value &&
+           lhs.start_prb == rhs.start_prb && lhs.n_prb == rhs.n_prb &&
+           lhs.mcs_tbs_index == rhs.mcs_tbs_index &&
+           lhs.transport_block_size_index == rhs.transport_block_size_index &&
+           lhs.modulation_and_coding_scheme_valid == rhs.modulation_and_coding_scheme_valid &&
+           lhs.transport_block_size_index_valid == rhs.transport_block_size_index_valid &&
+           lhs.harq_process == rhs.harq_process &&
+           lhs.new_data_indicator == rhs.new_data_indicator &&
+           lhs.new_data_indicator_valid == rhs.new_data_indicator_valid &&
+           lhs.redundancy_version == rhs.redundancy_version &&
+           lhs.transmit_power_control == rhs.transmit_power_control &&
+           lhs.transmit_power_control_valid == rhs.transmit_power_control_valid &&
+           lhs.n_prb_1a_valid == rhs.n_prb_1a_valid &&
+           lhs.downlink_assignment_index == rhs.downlink_assignment_index &&
+           lhs.downlink_assignment_index_valid == rhs.downlink_assignment_index_valid &&
+           lhs.raw_payload_bits == rhs.raw_payload_bits;
 }
 
 } // namespace mmse::benchmark::pdcch_fixture

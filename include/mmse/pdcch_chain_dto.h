@@ -125,6 +125,27 @@ struct BackendPdcchTdDescrambledLlrIndication {
     std::vector<std::uint16_t> re_grid_indices1{};
 };
 
+struct BackendPdcchTd4EqualizedIndication {
+    std::uint32_t sfn_subframe = 0;
+    std::uint16_t cell_id = 0;
+    std::uint16_t n_prb = kLteNumPrb20MHz;
+    std::uint8_t n_tx_ports = 0;
+    std::uint8_t n_rx_ant = 0;
+    std::uint8_t n_layers = 0;
+    std::uint8_t tx_mode = 0;
+    std::uint8_t control_symbol_count = 0;
+    std::uint8_t mod_order = 0;
+    float sigma2 = 0.0F;
+    PdcchChainMetadata chain{};
+    std::vector<float> x_hat_re{};
+    std::vector<float> x_hat_im{};
+    std::vector<float> sinr{};
+    std::vector<std::uint16_t> re_grid_indices0{};
+    std::vector<std::uint16_t> re_grid_indices1{};
+    std::vector<std::uint16_t> re_grid_indices2{};
+    std::vector<std::uint16_t> re_grid_indices3{};
+};
+
 struct PdcchReg {
     std::array<std::uint32_t, kPdcchRePerReg> source_re_indices{};
     std::array<std::uint16_t, kPdcchRePerReg> grid_indices{};
@@ -279,6 +300,14 @@ struct PdcchCommonSearchDecodeConfig {
     PdcchDciFormat1AConfig dci_format1a{};
 };
 
+struct PdcchFixedCandidateDecodeConfig {
+    std::uint8_t aggregation_level = 0;
+    std::uint16_t first_cce = 0;
+    std::uint16_t expected_rnti = 0;
+    PdcchDciFormat1AConfig dci_format1a{};
+    PdcchTailBitingConvolutionalDecoder decoder{};
+};
+
 struct PdcchCommonSearchDecodeResult {
     std::uint32_t candidate_count = 0;
     std::vector<PdcchDciFormat1ADecodeResult> hits{};
@@ -287,6 +316,11 @@ struct PdcchCommonSearchDecodeResult {
 struct PdcchGpuCommonSearchDecodeRequest {
     PdcchMmseInput input{};
     PdcchCommonSearchDecodeConfig config{};
+};
+
+struct PdcchGpuFixedCandidateDecodeRequest {
+    PdcchMmseInput input{};
+    PdcchFixedCandidateDecodeConfig config{};
 };
 
 struct PdcchGpuCommonSearchDecodeProfile {
@@ -299,7 +333,7 @@ struct PdcchGpuCommonSearchDecodeProfile {
     double d2h_us = 0.0;
     double host_submit_us = 0.0;
     double host_collect_us = 0.0;
-    // D2H contains compact candidate hits rather than the full equalized grid.
+    // D2H contains compact hits or one fixed raw candidate, never the full equalized grid.
     std::uint64_t h2d_bytes = 0U;
     std::uint64_t d2h_bytes = 0U;
     std::uint32_t crc_hit_count = 0U;
@@ -309,6 +343,11 @@ struct PdcchGpuCommonSearchDecodeProfile {
 struct PdcchGpuCommonSearchDecodeResult {
     std::uint32_t candidate_count = 0U;
     std::vector<PdcchDciFormat1ADecodeResult> hits{};
+    PdcchGpuCommonSearchDecodeProfile profile{};
+};
+
+struct PdcchGpuFixedCandidateDecodeResult {
+    PdcchDciFormat1ADecodeResult decoded{};
     PdcchGpuCommonSearchDecodeProfile profile{};
 };
 

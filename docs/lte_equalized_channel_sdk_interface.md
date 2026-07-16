@@ -31,6 +31,7 @@
 - LTE PDCCH 控制区的 equalized RE 提取接口面
 - LTE PDCCH common-search、UE-specific 与 SI-RNTI 几何 `DCI 1A` 的 CPU helper 链路
 - LTE PCFICH 的 equalized RE 提取接口面
+- PBCH、PCFICH、PDCCH 的 `4Tx x 1Rx` Td4 raw equalized output
 - 基于 CRS 的信道估计
 - MMSE 均衡
 - 由调用方持有输出 view，并支持后端 DTO 打包
@@ -67,9 +68,18 @@
   - `PbchMmseInput`
   - `PbchMmseOutputView`
   - `PbchMmseResult`
+  - 4Tx 发射分集输入 / 输出：
+    - `PbchMmseInput`
+    - `PbchTd4MmseOutputView`
+    - `PbchTd4MmseResult`
 - 运行时入口：
   - `MmseEqualizerCpuContext::run_pbch(...)`
   - `MmseEqualizerGpuContext::run_pbch(...)`
+  - `MmseEqualizerCpuContext::run_pbch_td4(...)`
+  - `MmseEqualizerGpuContext::run_pbch_td4(...)`
+- Td4 边界：仅 `4Tx x 1Rx`、单层、`tx_mode == 2`、QPSK；固定输出 `240` 个
+  source RE。当前只提供 caller-owned raw output view/result，不提供 4Tx owning backend DTO，
+  也不负责 PBCH MIB 最终译码。
 
 ### PDSCH
 
@@ -109,14 +119,22 @@
   - 新增 TD 路径：
     - `PdcchTdMmseOutputView`
     - `PdcchTdMmseResult`
+    - `PdcchTd4MmseOutputView`
+    - `PdcchTd4MmseResult`
+    - `mmse::pdcch::BackendPdcchTd4EqualizedIndication`
 - 运行时入口：
   - `MmseEqualizerCpuContext::run_pdcch(...)`
   - `MmseEqualizerGpuContext::run_pdcch(...)`
   - 新增 TD 路径：
     - `MmseEqualizerCpuContext::run_pdcch_td(...)`
     - `MmseEqualizerGpuContext::run_pdcch_td(...)`
+    - `MmseEqualizerCpuContext::run_pdcch_td4(...)`
+    - `MmseEqualizerGpuContext::run_pdcch_td4(...)`
   - 新增 CPU helper 路径：
     - `mmse::pdcch::run_pdcch_cpu_common_search_decode(...)`
+    - `mmse::pdcch::normalize_pdcch_td4_cce_order(...)`
+- Td4 边界：仅 `4Tx x 1Rx`、单层、`tx_mode == 2`、QPSK。四源 RE 输出可归一化为
+  标准连续 CCE 顺序，并复用 CPU common-search、UE-specific 和 SI-RNTI 解码链。
 
 ### PCFICH
 
@@ -125,9 +143,26 @@
   - `PcfichMmseInput`
   - `PcfichMmseOutputView`
   - `PcfichMmseResult`
+  - 4Tx 发射分集输入 / 输出：
+    - `PcfichMmseInput`
+    - `PcfichTd4MmseOutputView`
+    - `PcfichTd4MmseResult`
 - 运行时入口：
   - `MmseEqualizerCpuContext::run_pcfich(...)`
   - `MmseEqualizerGpuContext::run_pcfich(...)`
+  - `MmseEqualizerCpuContext::run_pcfich_td4(...)`
+  - `MmseEqualizerGpuContext::run_pcfich_td4(...)`
+- Td4 边界：仅 `4Tx x 1Rx`、单层、`tx_mode == 2`、QPSK；固定输出 `16` 个
+  source RE。当前只提供 caller-owned raw output view/result，不提供 4Tx owning backend DTO，
+  也不负责 PCFICH CFI 最终译码。
+
+### Td4 四源 RE 索引契约
+
+`PbchTd4MmseOutputView`、`PcfichTd4MmseOutputView` 和 `PdcchTd4MmseOutputView` 使用同一
+契约。对每个四元组起点 `q = 0, 4, 8, ...`，槽位 `q..q+3` 都重复记录同一组
+`re_grid_indices0..3`。四个 `x_hat`/`sinr` 槽位按该 source-RE 顺序对应恢复后的 QPSK
+软符号；调用方必须使用 `meta.n_symbols` 作为有效前缀，且容量至少为
+`meta.n_source_re`。该契约不表示四层空间复用。
 
 ## 文档状态
 

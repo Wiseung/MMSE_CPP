@@ -25,12 +25,14 @@
 - MMSE 均衡
 - 由调用方持有的输出 view 填充
 - 面向下游透传的后端 DTO 打包
+- `4Tx x 1Rx`、单层、`tx_mode == 2` 的 Td4 raw equalized output
 
 当前 PCFICH 接口面不提供：
 
 - CFI 比特解扰
 - 调制解映射到最终 CFI 值
 - 除 equalized RE 接口面之外的信道译码
+- 4Tx owning backend DTO
 
 ## 最小流程
 
@@ -84,12 +86,38 @@ mmse::pcfich::BackendPcfichEqualizedIndication backend =
     mmse::pcfich::make_backend_pcfich_equalized_indication(meta, out);
 ```
 
+## 4Tx x 1Rx Td4 快速开始
+
+```cpp
+frontend.n_tx_ports = 4;
+frontend.tx_mode = 2;
+mmse::PcfichMmseInput in = mmse::pcfich::make_pcfich_mmse_input(grid, frontend);
+
+constexpr std::uint32_t capacity = 16;
+std::vector<float> xhat_re(capacity), xhat_im(capacity), sinr(capacity);
+std::vector<std::uint16_t> re0(capacity), re1(capacity), re2(capacity), re3(capacity);
+mmse::PcfichTd4MmseOutputView out{xhat_re.data(), xhat_im.data(), sinr.data(),
+                  re0.data(), re1.data(), re2.data(), re3.data(), capacity};
+mmse::PcfichTd4MmseResult meta{};
+
+const mmse::MmseStatus status = ctx.run_pcfich_td4(in, out, meta);
+```
+
+成功时 `meta.n_symbols == meta.n_source_re == 16`。对每个 `q = 0, 4, 8, 12`，
+四个索引数组在槽位 `q..q+3` 重复记录同一组 source RE，四个连续输出是对应的 raw
+equalized QPSK 软符号。当前没有 `BackendPcfichTd4EqualizedIndication`，也不提供 CFI
+最终判决；调用方直接消费 `meta.n_symbols` 指定的有效前缀。
+
 ## API 摘要
 
 主要运行时调用：
 
 - `MmseEqualizerCpuContext::run_pcfich(...)`
 - `MmseEqualizerGpuContext::run_pcfich(...)`
+- `MmseEqualizerCpuContext::run_pcfich_td(...)`
+- `MmseEqualizerGpuContext::run_pcfich_td(...)`
+- `MmseEqualizerCpuContext::run_pcfich_td4(...)`
+- `MmseEqualizerGpuContext::run_pcfich_td4(...)`
 
 主要 DTO 流程：
 
@@ -152,6 +180,12 @@ mmse::pcfich::BackendPcfichEqualizedIndication backend =
 | `sigma2`        | 运行时噪声估计               |
 | `chain`         | 调用方透传元数据             |
 
+### `mmse::PcfichTd4MmseOutputView / PcfichTd4MmseResult`
+
+Td4 output view 以 `x_hat_re/x_hat_im/sinr` 加 `re_grid_indices0..3` 表示四源 RE 块，
+容量字段为 `capacity_symbols`。result 使用 `n_symbols` 和 `n_source_re` 标记有效长度，
+其余网格、端口、模式和链路元数据字段与 TD 输出语义一致。
+
 ### `mmse::pcfich::BackendPcfichEqualizedIndication`
 
 这个后端 DTO 会复制并持有输出向量，供下游透传使用。
@@ -175,6 +209,7 @@ mmse::pcfich::BackendPcfichEqualizedIndication backend =
 在当前 LTE 支持边界下：
 
 - `expected_pcfich_re == 16`
+- `run_pcfich_td4(...)` 使用 `capacity_symbols >= 16`，且 `meta.n_symbols == 16`
 
 ## 支持边界
 
@@ -183,14 +218,16 @@ mmse::pcfich::BackendPcfichEqualizedIndication backend =
 - 仅 LTE
 - 仅 20 MHz
 - 仅 normal CP
-- `n_rx_ant == 1 or 2`
+- 普通 `run_pcfich(...)`：`n_rx_ant == 1 or 2`，`n_tx_ports == 1`，`tx_mode == 1`
+- TD2 `run_pcfich_td(...)`：`n_rx_ant == 1 or 2`，`n_tx_ports == 2`，`tx_mode == 2`
+- Td4 `run_pcfich_td4(...)`：`n_rx_ant == 1`，`n_tx_ports == 4`
 - `n_symbols == 14`
 - `n_subcarriers == 1200`
 - `n_layers == 1`
 - `mod_order == 2`
 - `start_symbol == 0`
 - `reg_count == 4`
-- `n_tx_ports == 1 or 2`
+- Td4 额外要求 `tx_mode == 2`
 
 ## 状态码
 

@@ -284,6 +284,150 @@ void run_batch(MmseEqualizerGpuContext& context, const PlanarGridViewF32& grid,
     std::cout << "pdcch_gpu_decode_bench.l8_hits=" << hit_distribution.l8_hits << '\n';
 }
 
+void run_fixed_batch(MmseEqualizerGpuContext& context, const fixture::MixedWorkload& mixed_workload,
+                     std::uint32_t stream_count, std::uint32_t batch_size) {
+    std::vector<pdcch::PdcchGpuFixedCandidateDecodeRequest> requests(batch_size);
+    std::vector<pdcch::PdcchGpuFixedCandidateDecodeResult> results(batch_size);
+    const auto populate_requests = [&](std::uint32_t phase) {
+        for (std::uint32_t index = 0U; index < batch_size; ++index) {
+            const fixture::Case& benchmark_case =
+                mixed_workload.cases[(static_cast<std::size_t>(phase) * batch_size + index) %
+                                     mixed_workload.cases.size()];
+            requests[index] = fixture::make_fixed_request(benchmark_case);
+            requests[index].input.chain.request_id =
+                static_cast<std::uint64_t>(phase) * batch_size + index;
+        }
+    };
+    for (std::uint32_t warmup = 0U; warmup < kWarmupIterations; ++warmup) {
+        populate_requests(warmup);
+        if (pdcch::run_pdcch_gpu_fixed_candidate_decode_batch(context, requests, results) !=
+            MmseStatus::kOk) {
+            std::cerr << "pdcch_gpu_decode_bench fixed warmup failed\n";
+            std::exit(1);
+        }
+    }
+
+    std::vector<double> latencies_us{};
+    double total_h2d_bytes = 0.0;
+    double total_d2h_bytes = 0.0;
+    double total_h2d_gpu_us = 0.0;
+    double total_ce_mmse_gpu_us = 0.0;
+    double total_llr_gpu_us = 0.0;
+    double total_rate_recovery_gpu_us = 0.0;
+    double total_viterbi_us = 0.0;
+    double total_crc_gpu_us = 0.0;
+    double total_d2h_gpu_us = 0.0;
+    double total_host_submit_us = 0.0;
+    double total_host_collect_us = 0.0;
+    std::uint32_t total_hits = 0U;
+    std::uint32_t total_misses = 0U;
+    for (std::uint32_t iteration = 0U; iteration < kMeasuredIterations; ++iteration) {
+        const std::uint32_t phase = 1000U + iteration;
+        populate_requests(phase);
+        const auto start = std::chrono::steady_clock::now();
+        const MmseStatus status =
+            pdcch::run_pdcch_gpu_fixed_candidate_decode_batch(context, requests, results);
+        const auto end = std::chrono::steady_clock::now();
+        if (status != MmseStatus::kOk) {
+            std::cerr << "pdcch_gpu_decode_bench fixed measurement failed: " << to_string(status)
+                      << '\n';
+            std::exit(1);
+        }
+        latencies_us.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+        for (std::uint32_t index = 0U; index < batch_size; ++index) {
+            const auto& result = results[index];
+            const fixture::Case& benchmark_case =
+                mixed_workload.cases[(static_cast<std::size_t>(phase) * batch_size + index) %
+                                     mixed_workload.cases.size()];
+            if (!fixture::validate_fixed_result(result.decoded, benchmark_case) ||
+                result.profile.d2h_bytes != 24U) {
+                std::cerr << "pdcch_gpu_decode_bench fixed result or D2H validation failed\n";
+                std::exit(1);
+            }
+            total_h2d_bytes += static_cast<double>(result.profile.h2d_bytes);
+            total_d2h_bytes += static_cast<double>(result.profile.d2h_bytes);
+            total_h2d_gpu_us += result.profile.h2d_us;
+            total_ce_mmse_gpu_us += result.profile.ce_mmse_gpu_us;
+            total_llr_gpu_us += result.profile.llr_gpu_us;
+            total_rate_recovery_gpu_us += result.profile.rate_recovery_gpu_us;
+            total_viterbi_us += result.profile.viterbi_gpu_us;
+            total_crc_gpu_us += result.profile.crc_gpu_us;
+            total_d2h_gpu_us += result.profile.d2h_us;
+            total_host_submit_us += result.profile.host_submit_us;
+            total_host_collect_us += result.profile.host_collect_us;
+            total_hits += result.profile.crc_hit_count;
+            total_misses += result.profile.crc_miss_count;
+        }
+    }
+
+    const double average_us =
+        std::accumulate(latencies_us.begin(), latencies_us.end(), 0.0) / latencies_us.size();
+    const double sample_count = static_cast<double>(batch_size) * kMeasuredIterations;
+    const double subframes_per_second = static_cast<double>(batch_size) * 1.0e6 / average_us;
+    const bool single_request_latency = stream_count == 1U && batch_size == 1U;
+    std::cout << "pdcch_gpu_decode_bench.n_tx_ports=1\n";
+    std::cout << "pdcch_gpu_decode_bench.tx_mode=1\n";
+    std::cout << "pdcch_gpu_decode_bench.n_rx_ant=2\n";
+    std::cout << "pdcch_gpu_decode_bench.stream_count=" << stream_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.batch=" << batch_size << '\n';
+    std::cout << "pdcch_gpu_decode_bench.schema=mmse.pdcch.benchmark.v3\n";
+    std::cout << "pdcch_gpu_decode_bench.measurement_source=native\n";
+    std::cout << "pdcch_gpu_decode_bench.workload=fixed\n";
+    std::cout << "pdcch_gpu_decode_bench.fixed.aggregation_level="
+              << static_cast<unsigned>(fixture::kFixedAggregationLevel) << '\n';
+    std::cout << "pdcch_gpu_decode_bench.fixed.first_cce=" << fixture::kFixedFirstCce << '\n';
+    std::cout << "pdcch_gpu_decode_bench.fixed.expected_rnti=" << pdcch::kSiRnti << '\n';
+    std::cout << "pdcch_gpu_decode_bench.e2e.clock_domain=host_steady\n";
+    std::cout << "pdcch_gpu_decode_bench.e2e.scope="
+              << (single_request_latency ? "single_request_wall" : "batch_wall") << '\n';
+    std::cout << "pdcch_gpu_decode_bench.single_request_latency_valid="
+              << (single_request_latency ? 1 : 0) << '\n';
+    std::cout << "pdcch_gpu_decode_bench.device_interval.clock_domain=cuda_event\n";
+    std::cout << "pdcch_gpu_decode_bench.device_interval.composable=false\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "pdcch_gpu_decode_bench.batch_wall_avg_us=" << average_us << '\n';
+    std::cout << "pdcch_gpu_decode_bench.batch_wall_p50_us=" << percentile(latencies_us, 0.50)
+              << '\n';
+    std::cout << "pdcch_gpu_decode_bench.batch_wall_p95_us=" << percentile(latencies_us, 0.95)
+              << '\n';
+    if (single_request_latency) {
+        std::cout << "pdcch_gpu_decode_bench.single_request_host_wall_avg_us=" << average_us
+                  << '\n';
+        std::cout << "pdcch_gpu_decode_bench.single_request_host_wall_p50_us="
+                  << percentile(latencies_us, 0.50) << '\n';
+        std::cout << "pdcch_gpu_decode_bench.single_request_host_wall_p95_us="
+                  << percentile(latencies_us, 0.95) << '\n';
+    }
+    std::cout << "pdcch_gpu_decode_bench.throughput_equivalent_us=" << average_us / batch_size
+              << '\n';
+    std::cout << "pdcch_gpu_decode_bench.subframes_per_second=" << subframes_per_second << '\n';
+    std::cout << "pdcch_gpu_decode_bench.device.cuda_event.h2d_per_request_mean_us="
+              << total_h2d_gpu_us / sample_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.device.cuda_event.ce_mmse_per_request_mean_us="
+              << total_ce_mmse_gpu_us / sample_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.device.cuda_event.llr_per_request_mean_us="
+              << total_llr_gpu_us / sample_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.device.cuda_event.rate_recovery_per_request_mean_us="
+              << total_rate_recovery_gpu_us / sample_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.device.cuda_event.viterbi_per_request_mean_us="
+              << total_viterbi_us / sample_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.device.cuda_event.crc_per_request_mean_us="
+              << total_crc_gpu_us / sample_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.device.cuda_event.d2h_per_request_mean_us="
+              << total_d2h_gpu_us / sample_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.host_steady.submit_per_request_mean_us="
+              << total_host_submit_us / sample_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.host_steady.collect_per_request_mean_us="
+              << total_host_collect_us / sample_count << '\n';
+    std::cout << "pdcch_gpu_decode_bench.h2d_bytes_per_subframe=" << total_h2d_bytes / sample_count
+              << '\n';
+    std::cout << "pdcch_gpu_decode_bench.d2h_bytes_per_subframe=" << total_d2h_bytes / sample_count
+              << '\n';
+    std::cout << "pdcch_gpu_decode_bench.candidates_per_subframe=1.00\n";
+    std::cout << "pdcch_gpu_decode_bench.crc_hits=" << total_hits << '\n';
+    std::cout << "pdcch_gpu_decode_bench.crc_misses=" << total_misses << '\n';
+}
+
 bool query_memory(std::size_t& free_bytes, std::size_t& total_bytes) {
     if (detail::cuda_query_current_memory_info(free_bytes, total_bytes) != MmseStatus::kOk) {
         std::cerr << "pdcch_gpu_decode_bench CUDA memory query failed\n";
@@ -472,11 +616,17 @@ int main(int argc, char** argv) {
     if (argc == 3 && std::string_view(argv[1]) == "--workload" &&
         fixture::parse_workload(argv[2], workload)) {
     } else if (argc != 1) {
-        std::cerr << "usage: pdcch_gpu_decode_bench [--workload mixed|random] | --memory-report\n";
+        std::cerr << "usage: pdcch_gpu_decode_bench [--workload fixed|mixed|random] | "
+                     "--memory-report\n";
         return 2;
     }
     const GridBuffers grid_buffers = make_random_grid(42U);
-    const PlanarGridViewF32 grid = make_grid_view(grid_buffers, kMmseV1MaxNumRxAntennas);
+    fixture::MixedWorkload fixed_workload{};
+    if (workload == fixture::Workload::kFixed &&
+        !fixture::make_mixed_workload(kLteNumPrb20MHz, 1U, fixed_workload)) {
+        std::cerr << "pdcch_gpu_decode_bench fixed workload construction failed\n";
+        return 1;
+    }
     for (const std::uint32_t stream_count : {1U, 2U, 4U}) {
         MmseEqualizerGpuContext context;
         MmseEqualizerGpuConfig config{};
@@ -486,8 +636,42 @@ int main(int argc, char** argv) {
             std::cerr << "pdcch_gpu_decode_bench CUDA initialization failed\n";
             return 1;
         }
+        if (workload == fixture::Workload::kFixed) {
+            MmseEqualizerCpuContext cpu;
+            MmseEqualizerCpuConfig cpu_config{};
+            cpu_config.worker_count = 1U;
+            if (cpu.init(cpu_config) != MmseStatus::kOk) {
+                std::cerr << "pdcch_gpu_decode_bench fixed CPU initialization failed\n";
+                return 1;
+            }
+            for (const fixture::Case& benchmark_case : fixed_workload.cases) {
+                const auto request = fixture::make_fixed_request(benchmark_case);
+                pdcch::PdcchDciFormat1ADecodeResult cpu_result{};
+                pdcch::PdcchGpuFixedCandidateDecodeResult gpu_result{};
+                if (pdcch::run_pdcch_cpu_fixed_candidate_decode(cpu, request.input, request.config,
+                                                                cpu_result) != MmseStatus::kOk ||
+                    pdcch::run_pdcch_gpu_fixed_candidate_decode(context, request, gpu_result) !=
+                        MmseStatus::kOk ||
+                    !fixture::validate_fixed_result(cpu_result, benchmark_case) ||
+                    !fixture::validate_fixed_result(gpu_result.decoded, benchmark_case) ||
+                    !fixture::fixed_results_equal(gpu_result.decoded, cpu_result) ||
+                    gpu_result.profile.d2h_bytes != 24U) {
+                    std::cerr << "pdcch_gpu_decode_bench fixed CPU/GPU preflight failed\n";
+                    return 1;
+                }
+            }
+            std::cout << "pdcch_gpu_decode_bench.preflight.stream_count=" << stream_count << '\n';
+            std::cout << "pdcch_gpu_decode_bench.preflight.cpu_gpu_crc_dci_chain_equivalent=1\n";
+            std::cout << "pdcch_gpu_decode_bench.preflight.fixed_d2h_bytes=24\n";
+            for (const std::uint32_t batch_size : {1U, 2U, 4U, 8U, 16U}) {
+                run_fixed_batch(context, fixed_workload, stream_count, batch_size);
+            }
+            continue;
+        }
         for (const auto [n_tx_ports, tx_mode] :
-             {std::pair<std::uint8_t, std::uint8_t>{1U, 1U}, {2U, 2U}}) {
+             {std::pair<std::uint8_t, std::uint8_t>{1U, 1U}, {2U, 2U}, {4U, 2U}}) {
+            const PlanarGridViewF32 grid =
+                make_grid_view(grid_buffers, n_tx_ports == 4U ? 1U : kMmseV1MaxNumRxAntennas);
             fixture::MixedWorkload mixed_workload{};
             if (workload == fixture::Workload::kMixed &&
                 !fixture::make_mixed_workload(kLteNumPrb20MHz, n_tx_ports, mixed_workload)) {
