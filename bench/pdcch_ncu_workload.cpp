@@ -8,7 +8,7 @@ namespace fixture = mmse::benchmark::pdcch_fixture;
 
 int main() {
     fixture::MixedWorkload workload{};
-    if (!fixture::make_mixed_workload(kLteNumPrb20MHz, 1U, workload)) {
+    if (!fixture::make_mixed_workload(kLteNumPrb20MHz, 1U, 2U, workload)) {
         std::cerr << "pdcch_ncu_workload fixture construction failed\n";
         return 1;
     }

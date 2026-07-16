@@ -1,0 +1,3 @@
+"n_tx_ports","n_rx_ant","median_e2e_us","median_throughput","median_ce_mmse_us","median_reg_cce_us","median_llr_us","median_candidate_gather_us","median_rate_recovery_us","median_viterbi_us","median_crc_dci_us","spread_percent"
+"1","1","2026.49","493.464068413858","120.13","9.991","16.476","2.122","18.343","1855.66","1.694","1.01316516983219"
+"2","1","2079.53","480.87789067722","179.093","10.336","16.854","2.278","19.102","1841.74","1.645","2.15407314761434"

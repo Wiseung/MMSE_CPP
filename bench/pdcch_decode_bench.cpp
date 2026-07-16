@@ -478,7 +478,8 @@ bool parse_uint_argument(const char* value_text, unsigned int& value) {
 }
 
 bool parse_arguments(int argc, char** argv, std::uint16_t& n_prb, std::uint8_t& n_tx_ports,
-                     fixture::Workload& workload) {
+                     std::uint8_t& n_rx_ant, fixture::Workload& workload) {
+    bool n_rx_ant_explicit = false;
     for (int index = 1; index < argc; index += 2) {
         if (index + 1 >= argc) {
             return false;
@@ -508,30 +509,46 @@ bool parse_arguments(int argc, char** argv, std::uint16_t& n_prb, std::uint8_t& 
             n_tx_ports = static_cast<std::uint8_t>(value);
             continue;
         }
+        if (option == "--n-rx-ant") {
+            if (value > std::numeric_limits<std::uint8_t>::max()) {
+                return false;
+            }
+            n_rx_ant = static_cast<std::uint8_t>(value);
+            n_rx_ant_explicit = true;
+            continue;
+        }
         return false;
+    }
+    if (!n_rx_ant_explicit) {
+        n_rx_ant = workload == fixture::Workload::kFixed ? 2U : 1U;
     }
     return is_supported_lte_downlink_bandwidth(n_prb) &&
            (n_tx_ports == 1U || n_tx_ports == 2U || n_tx_ports == 4U) &&
+           (n_rx_ant == 1U || n_rx_ant == 2U) && (n_tx_ports != 4U || n_rx_ant == 1U) &&
            (workload != fixture::Workload::kFixed ||
-            (n_prb == kLteNumPrb20MHz && n_tx_ports == 1U));
+            (n_prb == kLteNumPrb20MHz && n_tx_ports == 1U && n_rx_ant == 2U));
 }
 
 void print_usage() {
     std::cerr << "usage: pdcch_decode_bench [--n-prb 6|15|25|50|75|100] "
-                 "[--n-tx-ports 1|2|4] [--workload fixed|mixed|random]\n";
+                 "[--n-tx-ports 1|2|4] [--n-rx-ant 1|2] "
+                 "[--workload fixed|mixed|random]\n"
+                 "       defaults to 1Rx; fixed defaults to its historical 1Tx x 2Rx scope; "
+                 "4Tx requires 1Rx\n";
 }
 
 int main(int argc, char** argv) {
     std::uint16_t n_prb = kLteNumPrb20MHz;
     std::uint8_t n_tx_ports = 1U;
+    std::uint8_t n_rx_ant = 1U;
     fixture::Workload workload_kind = fixture::Workload::kMixed;
-    if (!parse_arguments(argc, argv, n_prb, n_tx_ports, workload_kind)) {
+    if (!parse_arguments(argc, argv, n_prb, n_tx_ports, n_rx_ant, workload_kind)) {
         print_usage();
         return 2;
     }
 
     GridBuffers grid_buffers = make_random_grid(42U, n_prb);
-    const PlanarGridViewF32 grid = make_grid_view(grid_buffers, n_tx_ports == 4U ? 1U : 2U);
+    const PlanarGridViewF32 grid = make_grid_view(grid_buffers, n_rx_ant);
     const PdcchMmseInput input = make_pdcch_input(grid, n_prb, n_tx_ports);
 
     MmseEqualizerCpuContext context;
@@ -544,7 +561,7 @@ int main(int argc, char** argv) {
 
     fixture::MixedWorkload mixed_workload{};
     if (workload_kind != fixture::Workload::kRandom) {
-        if (!fixture::make_mixed_workload(n_prb, n_tx_ports, mixed_workload)) {
+        if (!fixture::make_mixed_workload(n_prb, n_tx_ports, n_rx_ant, mixed_workload)) {
             std::cerr << "failed to construct deterministic workload\n";
             return 1;
         }
@@ -621,6 +638,7 @@ int main(int argc, char** argv) {
     std::cout << "pdcch_decode_bench.n_prb=" << n_prb << '\n';
     std::cout << "pdcch_decode_bench.n_tx_ports=" << static_cast<unsigned>(input.n_tx_ports)
               << '\n';
+    std::cout << "pdcch_decode_bench.n_rx_ant=" << input.grid.n_rx_ant << '\n';
     std::cout << "pdcch_decode_bench.tx_mode=" << static_cast<unsigned>(input.tx_mode) << '\n';
     std::cout << "pdcch_decode_bench.decoder=native_tail_biting_viterbi\n";
     std::cout << "pdcch_decode_bench.schema=mmse.pdcch.benchmark."
